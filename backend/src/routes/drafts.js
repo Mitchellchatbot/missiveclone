@@ -6,6 +6,22 @@ const wrap = require('../util/wrap');
 const router = express.Router();
 router.use(requireAuth);
 
+// List all drafts for the current user, with thread context.
+router.get('/', wrap(async (req, res) => {
+  const { many } = require('../db');
+  const rows = await many(
+    `SELECT d.thread_id, d.body_text, d.body_html, d.subject, d.updated_at,
+            t.subject AS thread_subject, t.participants AS thread_participants,
+            t.team_space_id
+     FROM drafts d
+     JOIN threads t ON t.id = d.thread_id
+     WHERE d.user_id = $1 AND d.workspace_id = $2
+     ORDER BY d.updated_at DESC LIMIT 200`,
+    [req.user.id, req.user.workspace_id]
+  );
+  res.json({ drafts: rows });
+}));
+
 router.get('/:threadId', wrap(async (req, res) => {
   const t = await one(
     'SELECT id FROM threads WHERE id = $1 AND workspace_id = $2',

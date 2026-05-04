@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import Avatar from './Avatar.jsx';
 
 const Icon = ({ d, size = 16 }) => (
@@ -7,7 +7,7 @@ const Icon = ({ d, size = 16 }) => (
     <path d={d} />
   </svg>
 );
-// Minimal icon set, sourced as SVG path data.
+
 const I = {
   inbox:    'M22 12h-6l-2 3h-4l-2-3H2 M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z',
   user:     'M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2 M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
@@ -16,33 +16,53 @@ const I = {
   send:     'M22 2L11 13 M22 2l-7 20-4-9-9-4 20-7z',
   list:     'M8 6h13 M8 12h13 M8 18h13 M3 6h.01 M3 12h.01 M3 18h.01',
   chat:     'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z',
-  plus:     'M12 5v14 M5 12h14',
   refresh:  'M23 4v6h-6 M1 20v-6h6 M3.51 9a9 9 0 0 1 14.85-3.36L23 10 M20.49 15a9 9 0 0 1-14.85 3.36L1 14',
   invite:   'M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2 M8.5 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M20 8v6 M23 11h-6',
   bookmark: 'M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z',
-  out:      'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4 M16 17l5-5-5-5 M21 12H9'
+  out:      'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4 M16 17l5-5-5-5 M21 12H9',
+  chevDn:   'M6 9l6 6 6-6',
+  chevRt:   'M9 18l6-6-6-6',
+  plus:     'M12 5v14 M5 12h14',
+  layers:   'M12 2L2 7l10 5 10-5-10-5z M2 17l10 5 10-5 M2 12l10 5 10-5',
+  draft:    'M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7 M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z',
+  check:    'M9 11l3 3L22 4 M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11'
 };
 
 export default function Sidebar({
-  me, workspace, filter, setFilter, view, setView,
+  me, workspace,
+  view, setView,
+  filter, setFilter,
   search, setSearch,
   accounts, onAddAccount, onSync,
+  teamSpaces, currentTeamSpaceId, setCurrentTeamSpaceId,
+  onManageTeamSpaces,
   onInvite, onCanned,
   onLogout
 }) {
-  const matches = (key) =>
+  const [openSpaces, setOpenSpaces] = useState(() => new Set(teamSpaces.map(t => t.id)));
+
+  function toggleSpace(id) {
+    setOpenSpaces(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
+
+  const matches = (key, tsId) =>
     view === 'mail' &&
+    currentTeamSpaceId === tsId &&
     filter.status === key.status &&
     (filter.assignee || null) === (key.assignee || null) &&
     (filter.folder || null) === (key.folder || null);
 
-  const item = (label, iconKey, key) => (
+  const inboxItem = (label, iconKey, key, tsId) => (
     <div
-      key={label}
-      className={'side-item ' + (matches(key) ? 'active' : '')}
-      onClick={() => { setView('mail'); setFilter(key); }}
+      key={`${tsId || 'all'}-${label}`}
+      className={'side-item nested ' + (matches(key, tsId) ? 'active' : '')}
+      onClick={() => { setView('mail'); setCurrentTeamSpaceId(tsId); setFilter(key); }}
     >
-      <Icon d={I[iconKey]} />
+      <Icon d={I[iconKey]} size={14} />
       <span>{label}</span>
     </div>
   );
@@ -66,15 +86,50 @@ export default function Sidebar({
         />
       </div>
 
-      <div className="side-section-title">Mail</div>
-      {item('Inbox',          'inbox',    { status: 'open',    assignee: null, folder: null })}
-      {item('Assigned to me', 'user',     { status: 'open',    assignee: 'me', folder: null })}
-      {item('Pending',        'clock',    { status: 'pending', assignee: null, folder: null })}
-      {item('Closed',         'archive',  { status: 'closed',  assignee: null, folder: null })}
-      {item('Sent',           'send',     { status: '',        assignee: null, folder: 'SENT' })}
-      {item('All',            'list',     { status: '',        assignee: null, folder: null })}
+      <div className="side-section-title">Team spaces
+        <button className="link" onClick={onManageTeamSpaces}>Manage</button>
+      </div>
 
-      <div className="side-section-title">Team</div>
+      {teamSpaces.length === 0 && <div className="muted small pad-h">No team spaces</div>}
+
+      {teamSpaces.map(ts => {
+        const isOpen = openSpaces.has(ts.id);
+        return (
+          <div key={ts.id} className="space-block">
+            <div className="space-header" onClick={() => toggleSpace(ts.id)}>
+              <Icon d={isOpen ? I.chevDn : I.chevRt} size={12} />
+              <Avatar name={ts.name} size={20} />
+              <span className="space-name">{ts.name}</span>
+              {ts.account_count > 0 && <span className="muted xs">{ts.account_count}</span>}
+            </div>
+            {isOpen && (
+              <div className="space-children">
+                {inboxItem('Inbox',          'inbox',   { status: 'open',    assignee: null, folder: null }, ts.id)}
+                {inboxItem('Assigned to me', 'user',    { status: 'open',    assignee: 'me', folder: null }, ts.id)}
+                {inboxItem('Pending',        'clock',   { status: 'pending', assignee: null, folder: null }, ts.id)}
+                {inboxItem('Closed',         'archive', { status: 'closed',  assignee: null, folder: null }, ts.id)}
+                {inboxItem('Sent',           'send',    { status: '',        assignee: null, folder: 'SENT' }, ts.id)}
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      <div className="side-section-title">All workspaces</div>
+      <div
+        className={'side-item ' + (view === 'mail' && !currentTeamSpaceId ? 'active' : '')}
+        onClick={() => { setView('mail'); setCurrentTeamSpaceId(null); setFilter({ status: '', assignee: null, folder: null }); }}
+      >
+        <Icon d={I.list} /><span>All conversations</span>
+      </div>
+
+      <div className="side-section-title">Workspace</div>
+      <div className={'side-item ' + (view === 'tasks' ? 'active' : '')} onClick={() => setView('tasks')}>
+        <Icon d={I.check} /><span>Tasks</span>
+      </div>
+      <div className={'side-item ' + (view === 'drafts' ? 'active' : '')} onClick={() => setView('drafts')}>
+        <Icon d={I.draft} /><span>Drafts</span>
+      </div>
       <div className={'side-item ' + (view === 'chat' ? 'active' : '')} onClick={() => setView('chat')}>
         <Icon d={I.chat} /><span>Team chat</span>
       </div>
@@ -95,7 +150,7 @@ export default function Sidebar({
           <Avatar name={a.email} size={22} />
           <div style={{ overflow: 'hidden' }}>
             <div className="ellipsis">{a.email}</div>
-            <div className="muted xs">
+            <div className="muted xs ellipsis">
               {a.last_synced_at
                 ? 'Synced ' + new Date(Number(a.last_synced_at)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
                 : 'Never synced'}

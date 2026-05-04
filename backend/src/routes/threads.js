@@ -16,12 +16,13 @@ const upload = multer({
 });
 
 router.get('/', wrap(async (req, res) => {
-  const { status, assignee, q, folder } = req.query;
+  const { status, assignee, q, folder, team_space_id } = req.query;
   const params = [req.user.workspace_id];
   let sql = `SELECT t.*, u.name AS assignee_name
              FROM threads t
              LEFT JOIN users u ON u.id = t.assignee_id
              WHERE t.workspace_id = $1`;
+  if (team_space_id) { params.push(team_space_id); sql += ` AND t.team_space_id = $${params.length}`; }
   if (status) { params.push(status); sql += ` AND t.status = $${params.length}`; }
   if (assignee === 'me') { params.push(req.user.id); sql += ` AND t.assignee_id = $${params.length}`; }
   else if (assignee) { params.push(assignee); sql += ` AND t.assignee_id = $${params.length}`; }

@@ -20,11 +20,12 @@ const presets = {
   }
 };
 
-export default function ConnectAccount({ onClose, onCreated }) {
+export default function ConnectAccount({ teamSpaces, defaultTeamSpaceId, onClose, onCreated }) {
   const [preset, setPreset] = useState('gmail');
   const [form, setForm] = useState({
     email: '', display_name: '', pass: '', ...presets.gmail
   });
+  const [tsId, setTsId] = useState(defaultTeamSpaceId || (teamSpaces && teamSpaces[0] ? teamSpaces[0].id : ''));
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -42,6 +43,7 @@ export default function ConnectAccount({ onClose, onCreated }) {
         method: 'POST',
         body: JSON.stringify({
           email: form.email, display_name: form.display_name,
+          team_space_id: tsId || null,
           imap_host: form.imap_host, imap_port: Number(form.imap_port), imap_secure: !!form.imap_secure,
           imap_user: form.email, imap_pass: form.pass,
           smtp_host: form.smtp_host, smtp_port: Number(form.smtp_port), smtp_secure: !!form.smtp_secure,
@@ -68,6 +70,11 @@ export default function ConnectAccount({ onClose, onCreated }) {
         <input placeholder="Email address" type="email" value={form.email} onChange={e => set('email', e.target.value)} required />
         <input placeholder="Display name (optional)" value={form.display_name} onChange={e => set('display_name', e.target.value)} />
         <input placeholder="Password / App password" type="password" value={form.pass} onChange={e => set('pass', e.target.value)} required />
+        {teamSpaces && teamSpaces.length > 0 && (
+          <select value={tsId} onChange={e => setTsId(e.target.value)}>
+            {teamSpaces.map(ts => <option key={ts.id} value={ts.id}>Team space: {ts.name}</option>)}
+          </select>
+        )}
 
         <div className="row">
           <input placeholder="IMAP host" value={form.imap_host} onChange={e => set('imap_host', e.target.value)} required />

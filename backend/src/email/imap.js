@@ -27,7 +27,7 @@ function normalizeAddrList(list) {
   return list.text || '';
 }
 
-async function findOrCreateThread(workspace_id, parsed) {
+async function findOrCreateThread(workspace_id, parsed, team_space_id) {
   const inReply = (parsed.inReplyTo || '').replace(/[<>]/g, '').trim() || null;
   const refs = (parsed.references ? (Array.isArray(parsed.references) ? parsed.references : [parsed.references]) : [])
     .map(r => r.replace(/[<>]/g, '').trim()).filter(Boolean);
@@ -61,11 +61,12 @@ async function findOrCreateThread(workspace_id, parsed) {
   ].filter(Boolean).join('; ');
 
   await query(
-    `INSERT INTO threads (id, workspace_id, subject, participants, last_message_at, status,
+    `INSERT INTO threads (id, workspace_id, team_space_id, subject, participants, last_message_at, status,
                           message_id_root, search_text, created_at)
-     VALUES ($1, $2, $3, $4, $5, 'open', $6, $7, $8)`,
+     VALUES ($1, $2, $3, $4, $5, $6, 'open', $7, $8, $9)`,
     [
-      id, workspace_id, cleanSubj || subject || '(no subject)', participants, sentAt,
+      id, workspace_id, team_space_id || null,
+      cleanSubj || subject || '(no subject)', participants, sentAt,
       (parsed.messageId || '').replace(/[<>]/g, '') || null,
       (cleanSubj || subject || '') + ' ' + participants,
       now
@@ -84,7 +85,7 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     if (dup) return false;
   }
 
-  const threadId = await findOrCreateThread(acc.workspace_id, parsed);
+  const threadId = await findOrCreateThread(acc.workspace_id, parsed, acc.team_space_id);
   const id = uuid();
   const sentAt = parsed.date ? new Date(parsed.date).getTime() : Date.now();
   const fromAddr = parsed.from ? parsed.from.text : '';

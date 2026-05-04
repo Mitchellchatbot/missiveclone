@@ -1,26 +1,33 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import Sidebar from '../components/Sidebar.jsx';
+import TopBar from '../components/TopBar.jsx';
 import ThreadList from '../components/ThreadList.jsx';
 import ThreadView from '../components/ThreadView.jsx';
 import ChatView from '../components/ChatView.jsx';
+import TasksView from '../components/TasksView.jsx';
+import DraftsView from '../components/DraftsView.jsx';
 import ConnectAccount from '../components/ConnectAccount.jsx';
 import InviteModal from '../components/InviteModal.jsx';
 import CannedModal from '../components/CannedModal.jsx';
+import TeamSpaceModal from '../components/TeamSpaceModal.jsx';
 import { api } from '../api';
 import { getSocket, disconnectSocket } from '../socket';
 
 export default function Dashboard({ me, onLogout }) {
-  const [view, setView] = useState('mail');  // 'mail' | 'chat'
+  const [view, setView] = useState('mail');  // 'mail' | 'chat' | 'tasks' | 'drafts'
   const [filter, setFilter] = useState({ status: 'open', assignee: null, folder: null });
+  const [currentTeamSpaceId, setCurrentTeamSpaceId] = useState(null);
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [threads, setThreads] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [accounts, setAccounts] = useState([]);
   const [team, setTeam] = useState([]);
+  const [teamSpaces, setTeamSpaces] = useState([]);
   const [showConnect, setShowConnect] = useState(false);
   const [showInvite, setShowInvite] = useState(false);
   const [showCanned, setShowCanned] = useState(false);
+  const [showSpaces, setShowSpaces] = useState(false);
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search), 250);
@@ -32,10 +39,11 @@ export default function Dashboard({ me, onLogout }) {
     if (filter.status) params.set('status', filter.status);
     if (filter.assignee) params.set('assignee', filter.assignee);
     if (filter.folder) params.set('folder', filter.folder);
+    if (currentTeamSpaceId) params.set('team_space_id', currentTeamSpaceId);
     if (debouncedSearch) params.set('q', debouncedSearch);
     const res = await api('/api/threads?' + params.toString());
     setThreads(res.threads);
-  }, [filter, debouncedSearch]);
+  }, [filter, currentTeamSpaceId, debouncedSearch]);
 
   const loadAccounts = useCallback(async () => {
     const r = await api('/api/accounts'); setAccounts(r.accounts);
@@ -43,20 +51,31 @@ export default function Dashboard({ me, onLogout }) {
   const loadTeam = useCallback(async () => {
     const r = await api('/api/auth/team'); setTeam(r.members);
   }, []);
+  const loadTeamSpaces = useCallback(async () => {
+    const r = await api('/api/team_spaces');
+    setTeamSpaces(r.team_spaces || []);
+    // Default current team space to the first one if none chosen.
+    if (r.team_spaces && r.team_spaces.length && currentTeamSpaceId === null) {
+      setCurrentTeamSpaceId(r.team_spaces[0].id);
+    }
+  }, [currentTeamSpaceId]);
 
   useEffect(() => { loadThreads(); }, [loadThreads]);
-  useEffect(() => { loadAccounts(); loadTeam(); }, [loadAccounts, loadTeam]);
+  useEffect(() => { loadAccounts(); loadTeam(); loadTeamSpaces(); }, [loadAccounts, loadTeam, loadTeamSpaces]);
 
   useEffect(() => {
     const s = getSocket();
     const onThread = () => loadThreads();
+    const onTeamSpace = () => loadTeamSpaces();
     s.on('thread:updated', onThread);
     s.on('message:new', onThread);
+    s.on('team_space:updated', onTeamSpace);
     return () => {
       s.off('thread:updated', onThread);
       s.off('message:new', onThread);
+      s.off('team_space:updated', onTeamSpace);
     };
-  }, [loadThreads]);
+  }, [loadThreads, loadTeamSpaces]);
 
   useEffect(() => () => disconnectSocket(), []);
 
@@ -67,6 +86,13 @@ export default function Dashboard({ me, onLogout }) {
     loadThreads();
   }
 
+  function openThreadFromDraft(threadId) {
+    setView('mail');
+    setSelectedId(threadId);
+  }
+
+  const currentTeamSpace = teamSpaces.find(t => t.id === currentTeamSpaceId) || null;
+
   return (
     <div className="app">
       <Sidebar
@@ -75,6 +101,10 @@ export default function Dashboard({ me, onLogout }) {
         filter={filter} setFilter={setFilter}
         search={search} setSearch={setSearch}
         accounts={accounts}
+        teamSpaces={teamSpaces}
+        currentTeamSpaceId={currentTeamSpaceId}
+        setCurrentTeamSpaceId={setCurrentTeamSpaceId}
+        onManageTeamSpaces={() => setShowSpaces(true)}
         onAddAccount={() => setShowConnect(true)}
         onSync={syncAll}
         onInvite={() => setShowInvite(true)}
@@ -82,37 +112,53 @@ export default function Dashboard({ me, onLogout }) {
         onLogout={onLogout}
       />
 
-      {view === 'mail' && (
-        <>
-          <ThreadList
-            threads={threads}
-            selectedId={selectedId}
-            onSelect={setSelectedId}
-          />
-          <ThreadView
-            threadId={selectedId}
+      <div className="main-col">
+        <TopBar
+          me={me.user}
+          view={view} setView={setView}
+          currentTeamSpace={currentTeamSpace}
+        />
+
+        {view === 'mail' && (
+          <div className="mail-grid">
+            <ThreadList
+              threads={threads}
+              selectedId={selectedId}
+              onSelect={setSelectedId}
+            />
+            <ThreadView
+              threadId={selectedId}
+              me={me.user}
+              team={team}
+              accounts={accounts}
+              onChanged={loadThreads}
+            />
+          </div>
+        )}
+
+        {view === 'chat' && <ChatView me={me.user} team={team} />}
+        {view === 'tasks' && (
+          <TasksView
             me={me.user}
             team={team}
-            accounts={accounts}
-            onChanged={loadThreads}
+            teamSpaces={teamSpaces}
+            currentTeamSpace={currentTeamSpace}
           />
-        </>
-      )}
-
-      {view === 'chat' && (
-        <div className="chat-wrap">
-          <ChatView me={me.user} team={team} />
-        </div>
-      )}
+        )}
+        {view === 'drafts' && <DraftsView onOpenThread={openThreadFromDraft} />}
+      </div>
 
       {showConnect && (
         <ConnectAccount
+          teamSpaces={teamSpaces}
+          defaultTeamSpaceId={currentTeamSpaceId}
           onClose={() => setShowConnect(false)}
-          onCreated={() => { setShowConnect(false); loadAccounts(); }}
+          onCreated={() => { setShowConnect(false); loadAccounts(); loadTeamSpaces(); }}
         />
       )}
       {showInvite && <InviteModal onClose={() => setShowInvite(false)} />}
       {showCanned && <CannedModal onClose={() => setShowCanned(false)} />}
+      {showSpaces && <TeamSpaceModal onClose={() => { setShowSpaces(false); loadTeamSpaces(); loadAccounts(); }} />}
     </div>
   );
 }

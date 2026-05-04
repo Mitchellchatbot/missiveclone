@@ -20,11 +20,20 @@ router.post('/signup', wrap(async (req, res) => {
   const wsName = (workspace_name && workspace_name.trim()) || `${name}'s Workspace`;
   const hash = bcrypt.hashSync(password, 10);
 
+  const tsId = uuid();
   await tx(async (c) => {
     await c.query('INSERT INTO workspaces (id, name, created_at) VALUES ($1, $2, $3)', [wsId, wsName, now]);
     await c.query(
       'INSERT INTO users (id, workspace_id, email, password_hash, name, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
       [userId, wsId, email.toLowerCase(), hash, name, now]
+    );
+    await c.query(
+      'INSERT INTO team_spaces (id, workspace_id, name, created_at) VALUES ($1, $2, $3, $4)',
+      [tsId, wsId, 'General', now]
+    );
+    await c.query(
+      'INSERT INTO team_space_members (team_space_id, user_id) VALUES ($1, $2)',
+      [tsId, userId]
     );
   });
 

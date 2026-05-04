@@ -180,12 +180,45 @@ CREATE INDEX IF NOT EXISTS idx_drafts_user ON drafts(user_id);
 CREATE TABLE IF NOT EXISTS chat_messages (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  team_space_id TEXT,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   body TEXT NOT NULL,
   mentions TEXT,
   created_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chat_workspace ON chat_messages(workspace_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS team_spaces (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_team_spaces_workspace ON team_spaces(workspace_id);
+
+CREATE TABLE IF NOT EXISTS team_space_members (
+  team_space_id TEXT NOT NULL REFERENCES team_spaces(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  PRIMARY KEY (team_space_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  team_space_id TEXT REFERENCES team_spaces(id) ON DELETE SET NULL,
+  thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  assignee_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  due_at BIGINT,
+  created_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_workspace ON tasks(workspace_id, status);
+CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_team_space ON tasks(team_space_id);
 `;
 
 const MIGRATIONS = [
@@ -194,7 +227,28 @@ const MIGRATIONS = [
   `ALTER TABLE messages ADD COLUMN IF NOT EXISTS folder TEXT`,
   `ALTER TABLE messages ADD COLUMN IF NOT EXISTS has_attachments INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE threads ADD COLUMN IF NOT EXISTS search_text TEXT`,
-  `ALTER TABLE email_accounts DROP COLUMN IF EXISTS last_sync_uid`
+  `ALTER TABLE email_accounts DROP COLUMN IF EXISTS last_sync_uid`,
+  // Team-space columns:
+  `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS team_space_id TEXT REFERENCES team_spaces(id) ON DELETE SET NULL`,
+  `ALTER TABLE threads ADD COLUMN IF NOT EXISTS team_space_id TEXT REFERENCES team_spaces(id) ON DELETE SET NULL`,
+  `ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS team_space_id TEXT REFERENCES team_spaces(id) ON DELETE SET NULL`,
+  // Auto-create a "Default" team_space for any workspace that lacks one,
+  // and attach existing accounts/threads to it.
+  `INSERT INTO team_spaces (id, workspace_id, name, created_at)
+   SELECT 'ts_' || w.id, w.id, 'Default', extract(epoch from now())::bigint * 1000
+   FROM workspaces w
+   WHERE NOT EXISTS (SELECT 1 FROM team_spaces ts WHERE ts.workspace_id = w.id)`,
+  `INSERT INTO team_space_members (team_space_id, user_id)
+   SELECT 'ts_' || u.workspace_id, u.id FROM users u
+   WHERE EXISTS (SELECT 1 FROM team_spaces ts WHERE ts.id = 'ts_' || u.workspace_id)
+     AND NOT EXISTS (SELECT 1 FROM team_space_members m
+                     WHERE m.team_space_id = 'ts_' || u.workspace_id AND m.user_id = u.id)`,
+  `UPDATE email_accounts SET team_space_id = 'ts_' || workspace_id
+   WHERE team_space_id IS NULL
+     AND EXISTS (SELECT 1 FROM team_spaces ts WHERE ts.id = 'ts_' || email_accounts.workspace_id)`,
+  `UPDATE threads SET team_space_id = 'ts_' || workspace_id
+   WHERE team_space_id IS NULL
+     AND EXISTS (SELECT 1 FROM team_spaces ts WHERE ts.id = 'ts_' || threads.workspace_id)`
 ];
 
 function ensurePool() {

@@ -20,6 +20,8 @@ const inviteRoutes = require('./routes/invites');
 const cannedRoutes = require('./routes/canned');
 const draftRoutes = require('./routes/drafts');
 const chatRoutes = require('./routes/chat');
+const teamSpaceRoutes = require('./routes/team_spaces');
+const taskRoutes = require('./routes/tasks');
 const { initSockets } = require('./sockets');
 const { startAllWatchers, syncAccount } = require('./email/imap');
 
@@ -58,6 +60,8 @@ app.use('/api/invites', inviteRoutes);
 app.use('/api/canned', cannedRoutes);
 app.use('/api/drafts', draftRoutes);
 app.use('/api/chat', chatRoutes);
+app.use('/api/team_spaces', teamSpaceRoutes);
+app.use('/api/tasks', taskRoutes);
 
 // Serve the built frontend (single-service deploy on Railway etc.)
 const distPath = path.join(__dirname, '..', '..', 'frontend', 'dist');
