@@ -1,0 +1,60 @@
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const { v4: uuid } = require('uuid');
+const { one, many, tx } = require('../db');
+const { sign, requireAuth } = require('../auth');
+const wrap = require('../util/wrap');
+
+const router = express.Router();
+
+router.post('/signup', wrap(async (req, res) => {
+  const { email, password, name, workspace_name } = req.body || {};
+  if (!email || !password || !name) return res.status(400).json({ error: 'email, password, name required' });
+
+  const existing = await one('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
+  if (existing) return res.status(409).json({ error: 'email already registered' });
+
+  const now = Date.now();
+  const wsId = uuid();
+  const userId = uuid();
+  const wsName = (workspace_name && workspace_name.trim()) || `${name}'s Workspace`;
+  const hash = bcrypt.hashSync(password, 10);
+
+  await tx(async (c) => {
+    await c.query('INSERT INTO workspaces (id, name, created_at) VALUES ($1, $2, $3)', [wsId, wsName, now]);
+    await c.query(
+      'INSERT INTO users (id, workspace_id, email, password_hash, name, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [userId, wsId, email.toLowerCase(), hash, name, now]
+    );
+  });
+
+  const user = await one('SELECT id, workspace_id, email, name FROM users WHERE id = $1', [userId]);
+  res.json({ token: sign(user), user });
+}));
+
+router.post('/login', wrap(async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+  const row = await one('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+  if (!row) return res.status(401).json({ error: 'invalid credentials' });
+  if (!bcrypt.compareSync(password, row.password_hash)) return res.status(401).json({ error: 'invalid credentials' });
+  const user = { id: row.id, workspace_id: row.workspace_id, email: row.email, name: row.name };
+  res.json({ token: sign(user), user });
+}));
+
+router.get('/me', requireAuth, wrap(async (req, res) => {
+  const u = await one('SELECT id, workspace_id, email, name FROM users WHERE id = $1', [req.user.id]);
+  if (!u) return res.status(404).json({ error: 'not found' });
+  const ws = await one('SELECT id, name FROM workspaces WHERE id = $1', [u.workspace_id]);
+  res.json({ user: u, workspace: ws });
+}));
+
+router.get('/team', requireAuth, wrap(async (req, res) => {
+  const rows = await many(
+    'SELECT id, email, name FROM users WHERE workspace_id = $1 ORDER BY name',
+    [req.user.workspace_id]
+  );
+  res.json({ members: rows });
+}));
+
+module.exports = router;

@@ -1,0 +1,181 @@
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import DOMPurify from 'dompurify';
+import { api, getApiBase } from '../api';
+import { getSocket } from '../socket';
+import ComposeReply from './ComposeReply.jsx';
+import Comments from './Comments.jsx';
+import Avatar from './Avatar.jsx';
+
+function fmtFull(ts) { return new Date(Number(ts)).toLocaleString(); }
+
+function sanitize(html) {
+  return DOMPurify.sanitize(html, {
+    USE_PROFILES: { html: true },
+    FORBID_TAGS: ['style', 'script', 'iframe', 'object', 'embed', 'link', 'meta', 'form', 'input'],
+    FORBID_ATTR: ['style', 'onerror', 'onclick', 'onload', 'onmouseover'],
+    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel|cid):|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$))/i
+  });
+}
+
+function fmtSize(b) {
+  if (!b) return '';
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return Math.round(b / 1024) + ' KB';
+  return (b / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function nameFromAddr(s) {
+  if (!s) return '';
+  const a = s.indexOf('<');
+  return (a > 0 ? s.slice(0, a) : s).trim().replace(/"/g, '');
+}
+
+export default function ThreadView({ threadId, me, team, accounts, onChanged }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [showReply, setShowReply] = useState(false);
+
+  const load = useCallback(async () => {
+    if (!threadId) { setData(null); return; }
+    setLoading(true);
+    try {
+      const r = await api(`/api/threads/${threadId}`);
+      setData(r);
+    } finally { setLoading(false); }
+  }, [threadId]);
+
+  useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    if (!threadId) return;
+    const s = getSocket();
+    const onAny = (p) => { if (p && p.thread_id === threadId) load(); };
+    s.on('message:new', onAny);
+    s.on('comment:new', onAny);
+    s.on('thread:updated', onAny);
+    return () => {
+      s.off('message:new', onAny);
+      s.off('comment:new', onAny);
+      s.off('thread:updated', onAny);
+    };
+  }, [threadId, load]);
+
+  async function setStatus(status) {
+    await api(`/api/threads/${threadId}`, { method: 'PATCH', body: JSON.stringify({ status }) });
+    onChanged && onChanged(); load();
+  }
+  async function setAssignee(id) {
+    await api(`/api/threads/${threadId}`, { method: 'PATCH', body: JSON.stringify({ assignee_id: id || null }) });
+    onChanged && onChanged(); load();
+  }
+
+  if (!threadId) return (
+    <div className="thread-view empty">
+      <div className="empty-illust">📬</div>
+      <div>Select a conversation</div>
+    </div>
+  );
+  if (loading || !data) return <div className="thread-view"><div className="loading">Loading…</div></div>;
+
+  const { thread, messages, comments } = data;
+
+  return (
+    <div className="thread-view">
+      <div className="tv-header">
+        <div className="tv-header-main">
+          <div className="tv-subject">{thread.subject || '(no subject)'}</div>
+          <div className="muted small ellipsis">{thread.participants}</div>
+        </div>
+        <div className="tv-controls">
+          <select value={thread.status} onChange={e => setStatus(e.target.value)} className={'status-select status-' + thread.status}>
+            <option value="open">Open</option>
+            <option value="pending">Pending</option>
+            <option value="closed">Closed</option>
+          </select>
+          <select value={thread.assignee_id || ''} onChange={e => setAssignee(e.target.value)}>
+            <option value="">Unassigned</option>
+            {team.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+          </select>
+          <button onClick={() => setShowReply(s => !s)}>↩ Reply</button>
+        </div>
+      </div>
+
+      <div className="tv-messages">
+        {messages.map(m => <MessageBlock key={m.id} m={m} />)}
+      </div>
+
+      {showReply && (
+        <ComposeReply
+          threadId={threadId}
+          accounts={accounts}
+          onSent={() => { setShowReply(false); load(); onChanged && onChanged(); }}
+          onCancel={() => setShowReply(false)}
+        />
+      )}
+
+      <Comments
+        threadId={threadId}
+        comments={comments}
+        team={team}
+        me={me}
+        onAdded={load}
+      />
+    </div>
+  );
+}
+
+function MessageBlock({ m }) {
+  const safeHtml = useMemo(() => m.body_html ? sanitize(m.body_html) : null, [m.body_html]);
+  const senderName = m.direction === 'outbound' ? (m.from_addr ? nameFromAddr(m.from_addr) : 'You') : nameFromAddr(m.from_addr) || 'Unknown';
+  return (
+    <div className={'msg msg-' + m.direction}>
+      <div className="msg-head">
+        <Avatar name={senderName} size={36} />
+        <div className="msg-head-main">
+          <div><strong>{senderName}</strong> <span className="muted small">to {m.to_addrs}</span></div>
+          <div className="muted xs">{fmtFull(m.sent_at)}</div>
+        </div>
+      </div>
+      {safeHtml
+        ? <div className="msg-body" dangerouslySetInnerHTML={{ __html: safeHtml }} />
+        : <pre className="msg-body">{m.body_text}</pre>}
+      {m.attachments && m.attachments.length > 0 && (
+        <div className="att-list">
+          {m.attachments.map(a => (
+            <a
+              key={a.id}
+              href={getApiBase() + `/api/attachments/${a.id}`}
+              onClick={e => downloadAttachment(e, a)}
+              className="att"
+            >
+              📎 <span>{a.filename}</span> <span className="muted xs">{fmtSize(a.size_bytes)}</span>
+            </a>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+async function downloadAttachment(e, a) {
+  e.preventDefault();
+  try {
+    const { getToken } = await import('../api');
+    const token = getToken();
+    const res = await fetch(getApiBase() + `/api/attachments/${a.id}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {}
+    });
+    if (!res.ok) throw new Error('download failed');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = a.filename || 'attachment';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  } catch (err) {
+    alert(err.message);
+  }
+}

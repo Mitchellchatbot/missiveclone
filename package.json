@@ -1,0 +1,15 @@
+{
+  "name": "missive-clone",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=18 <23"
+  },
+  "scripts": {
+    "postinstall": "npm --prefix backend install && npm --prefix frontend install",
+    "build": "npm --prefix frontend run build",
+    "start": "node backend/src/index.js",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:frontend": "npm --prefix frontend run dev"
+  }
+}

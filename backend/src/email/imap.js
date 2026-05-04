@@ -1,0 +1,287 @@
+const { ImapFlow } = require('imapflow');
+const { simpleParser } = require('mailparser');
+const { v4: uuid } = require('uuid');
+const { one, many, query } = require('../db');
+const { decrypt } = require('../crypto');
+const { emitToWorkspace } = require('../sockets');
+
+const watchers = new Map();
+
+function getAccount(id) {
+  return one('SELECT * FROM email_accounts WHERE id = $1', [id]);
+}
+
+function buildClient(acc) {
+  return new ImapFlow({
+    host: acc.imap_host,
+    port: acc.imap_port,
+    secure: !!acc.imap_secure,
+    auth: { user: acc.imap_user, pass: decrypt(acc.imap_pass) },
+    logger: false
+  });
+}
+
+function normalizeAddrList(list) {
+  if (!list) return '';
+  if (Array.isArray(list)) return list.map(a => a.text || `${a.name || ''} <${a.address || ''}>`).join(', ');
+  return list.text || '';
+}
+
+async function findOrCreateThread(workspace_id, parsed) {
+  const inReply = (parsed.inReplyTo || '').replace(/[<>]/g, '').trim() || null;
+  const refs = (parsed.references ? (Array.isArray(parsed.references) ? parsed.references : [parsed.references]) : [])
+    .map(r => r.replace(/[<>]/g, '').trim()).filter(Boolean);
+
+  const candidates = [inReply, ...refs].filter(Boolean);
+  for (const mid of candidates) {
+    const m = await one(
+      'SELECT thread_id FROM messages WHERE message_id = $1 AND workspace_id = $2',
+      [mid, workspace_id]
+    );
+    if (m) return m.thread_id;
+  }
+
+  const subject = (parsed.subject || '').trim();
+  const cleanSubj = subject.replace(/^(re|fwd|fw)\s*:\s*/i, '').trim();
+  if (cleanSubj) {
+    const t = await one(
+      `SELECT id FROM threads WHERE workspace_id = $1 AND subject = $2
+       ORDER BY last_message_at DESC LIMIT 1`,
+      [workspace_id, cleanSubj]
+    );
+    if (t) return t.id;
+  }
+
+  const id = uuid();
+  const now = Date.now();
+  const sentAt = parsed.date ? new Date(parsed.date).getTime() : now;
+  const participants = [
+    ...(parsed.from ? [parsed.from.text] : []),
+    ...(parsed.to ? [normalizeAddrList(parsed.to)] : []),
+  ].filter(Boolean).join('; ');
+
+  await query(
+    `INSERT INTO threads (id, workspace_id, subject, participants, last_message_at, status,
+                          message_id_root, search_text, created_at)
+     VALUES ($1, $2, $3, $4, $5, 'open', $6, $7, $8)`,
+    [
+      id, workspace_id, cleanSubj || subject || '(no subject)', participants, sentAt,
+      (parsed.messageId || '').replace(/[<>]/g, '') || null,
+      (cleanSubj || subject || '') + ' ' + participants,
+      now
+    ]
+  );
+  return id;
+}
+
+async function ingestMessage(acc, uid, folder, parsed, direction) {
+  const messageId = (parsed.messageId || '').replace(/[<>]/g, '');
+  if (messageId) {
+    const dup = await one(
+      'SELECT id FROM messages WHERE message_id = $1 AND workspace_id = $2',
+      [messageId, acc.workspace_id]
+    );
+    if (dup) return false;
+  }
+
+  const threadId = await findOrCreateThread(acc.workspace_id, parsed);
+  const id = uuid();
+  const sentAt = parsed.date ? new Date(parsed.date).getTime() : Date.now();
+  const fromAddr = parsed.from ? parsed.from.text : '';
+  const fromAddrLower = (parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address || '').toLowerCase();
+  // If caller didn't pre-decide direction, infer from From: header.
+  const dir = direction || (fromAddrLower === acc.email.toLowerCase() ? 'outbound' : 'inbound');
+  const attachments = Array.isArray(parsed.attachments) ? parsed.attachments : [];
+  const hasAtt = attachments.length > 0 ? 1 : 0;
+
+  await query(
+    `INSERT INTO messages
+      (id, thread_id, account_id, workspace_id, direction, folder, message_id, in_reply_to,
+       subject, from_addr, to_addrs, cc_addrs, body_text, body_html, sent_at, imap_uid,
+       has_attachments, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+    [
+      id, threadId, acc.id, acc.workspace_id, dir, folder || null, messageId || null,
+      (parsed.inReplyTo || '').replace(/[<>]/g, '') || null,
+      parsed.subject || '',
+      fromAddr,
+      normalizeAddrList(parsed.to),
+      normalizeAddrList(parsed.cc),
+      parsed.text || '',
+      parsed.html || '',
+      sentAt, uid, hasAtt, Date.now()
+    ]
+  );
+
+  for (const att of attachments) {
+    if (!att.content) continue;
+    const aid = uuid();
+    await query(
+      `INSERT INTO attachments
+        (id, message_id, workspace_id, filename, content_type, size_bytes, content_id, data, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        aid, id, acc.workspace_id,
+        att.filename || 'attachment',
+        att.contentType || 'application/octet-stream',
+        att.size || (att.content && att.content.length) || 0,
+        (att.cid || '').replace(/[<>]/g, '') || null,
+        att.content,
+        Date.now()
+      ]
+    );
+  }
+
+  // Update thread search text + bump last_message_at.
+  const searchAdd = [
+    parsed.subject || '',
+    fromAddr,
+    normalizeAddrList(parsed.to),
+    normalizeAddrList(parsed.cc),
+    (parsed.text || '').slice(0, 4000)
+  ].filter(Boolean).join(' ');
+
+  await query(
+    `UPDATE threads SET last_message_at = $1,
+       status = CASE WHEN status = 'closed' AND $4 = 'inbound' THEN 'open' ELSE status END,
+       search_text = coalesce(search_text, '') || ' ' || $2
+     WHERE id = $3`,
+    [sentAt, searchAdd, threadId, dir]
+  );
+
+  emitToWorkspace(acc.workspace_id, 'thread:updated', { thread_id: threadId });
+  emitToWorkspace(acc.workspace_id, 'message:new', { thread_id: threadId, message_id: id });
+  return true;
+}
+
+async function getFolderState(accountId, folder) {
+  const r = await one(
+    'SELECT last_sync_uid FROM folder_sync_state WHERE account_id = $1 AND folder = $2',
+    [accountId, folder]
+  );
+  return r ? Number(r.last_sync_uid) : 0;
+}
+
+async function setFolderState(accountId, folder, lastUid) {
+  await query(
+    `INSERT INTO folder_sync_state (account_id, folder, last_sync_uid)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (account_id, folder)
+     DO UPDATE SET last_sync_uid = EXCLUDED.last_sync_uid`,
+    [accountId, folder, lastUid]
+  );
+}
+
+async function detectFolders(client) {
+  // Returns a tuple: { inbox, sent } using IMAP SPECIAL-USE flags when available.
+  const list = await client.list();
+  let inbox = 'INBOX';
+  let sent = null;
+  for (const box of list) {
+    const flags = (box.flags && Array.from(box.flags)) || [];
+    const su = (box.specialUse || '').toLowerCase();
+    if (box.path === 'INBOX') inbox = 'INBOX';
+    if (su === '\\sent' || flags.includes('\\Sent')) sent = box.path;
+  }
+  // Common fallbacks if SPECIAL-USE isn't reported.
+  if (!sent) {
+    const candidates = ['Sent', 'Sent Mail', 'Sent Items', '[Gmail]/Sent Mail', 'INBOX.Sent'];
+    for (const c of candidates) {
+      if (list.find(b => b.path === c)) { sent = c; break; }
+    }
+  }
+  return { inbox, sent };
+}
+
+async function syncFolder(client, acc, folder, direction) {
+  const lastUid = await getFolderState(acc.id, folder);
+  let count = 0;
+  let maxUid = lastUid;
+  const range = `${lastUid + 1}:*`;
+  await client.mailboxOpen(folder);
+  for await (const msg of client.fetch(range, { uid: true, source: true })) {
+    if (!msg.source) continue;
+    const parsed = await simpleParser(msg.source);
+    const ok = await ingestMessage(acc, msg.uid, folder, parsed, direction);
+    if (ok) count++;
+    if (msg.uid > maxUid) maxUid = msg.uid;
+  }
+  if (maxUid > lastUid) await setFolderState(acc.id, folder, maxUid);
+  return count;
+}
+
+async function syncAccount(accountId) {
+  const acc = await getAccount(accountId);
+  if (!acc) return 0;
+  const client = buildClient(acc);
+  await client.connect();
+  let count = 0;
+  try {
+    const { inbox, sent } = await detectFolders(client);
+    if (sent && sent !== acc.sent_folder) {
+      await query('UPDATE email_accounts SET sent_folder = $1 WHERE id = $2', [sent, acc.id]);
+      acc.sent_folder = sent;
+    }
+    count += await syncFolder(client, acc, inbox, 'inbound');
+    if (sent) {
+      try { count += await syncFolder(client, acc, sent, 'outbound'); }
+      catch (e) { console.warn('sent folder sync failed for', acc.email, '-', e.message); }
+    }
+    await query('UPDATE email_accounts SET last_synced_at = $1 WHERE id = $2', [Date.now(), acc.id]);
+  } finally {
+    await client.logout().catch(() => {});
+  }
+  return count;
+}
+
+async function appendToSentFolder(acc, raw) {
+  if (!acc.sent_folder) return;
+  const client = buildClient(acc);
+  try {
+    await client.connect();
+    await client.append(acc.sent_folder, raw, ['\\Seen']);
+  } catch (e) {
+    console.warn('append-to-sent failed for', acc.email, '-', e.message);
+  } finally {
+    await client.logout().catch(() => {});
+  }
+}
+
+async function startWatching(accountId) {
+  if (watchers.has(accountId)) return;
+  const acc = await getAccount(accountId);
+  if (!acc) return;
+  const client = buildClient(acc);
+  watchers.set(accountId, client);
+
+  try {
+    await client.connect();
+    await client.mailboxOpen('INBOX');
+    client.on('exists', async () => {
+      try { await syncAccount(accountId); } catch (e) { console.error('idle sync', e.message); }
+    });
+  } catch (e) {
+    console.error('watch error', e.message);
+    watchers.delete(accountId);
+  }
+}
+
+function stopWatching(accountId) {
+  const c = watchers.get(accountId);
+  if (c) {
+    try { c.logout(); } catch {}
+    watchers.delete(accountId);
+  }
+}
+
+async function startAllWatchers() {
+  const rows = await many('SELECT id FROM email_accounts');
+  for (const r of rows) {
+    startWatching(r.id).catch(() => {});
+  }
+}
+
+module.exports = {
+  syncAccount, startWatching, stopWatching, startAllWatchers,
+  appendToSentFolder
+};
