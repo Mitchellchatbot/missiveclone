@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import Avatar from './Avatar.jsx';
 import { getSocket } from '../socket';
 
-export default function TopBar({ me, view, setView, currentTeamSpace }) {
+export default function TopBar({ me, view, setView, currentTeamSpace, onCompose }) {
   const [online, setOnline] = useState([]);
 
   useEffect(() => {
@@ -20,20 +20,24 @@ export default function TopBar({ me, view, setView, currentTeamSpace }) {
           <button className={'tab ' + (view === 'mail' ? 'active' : '')} onClick={() => setView('mail')}>Mail</button>
           <button className={'tab ' + (view === 'tasks' ? 'active' : '')} onClick={() => setView('tasks')}>Tasks</button>
           <button className={'tab ' + (view === 'drafts' ? 'active' : '')} onClick={() => setView('drafts')}>Drafts</button>
+          <button className={'tab ' + (view === 'scheduled' ? 'active' : '')} onClick={() => setView('scheduled')}>Scheduled</button>
           <button className={'tab ' + (view === 'chat' ? 'active' : '')} onClick={() => setView('chat')}>Team chat</button>
         </div>
-        {currentTeamSpace && (
+        {currentTeamSpace && view === 'mail' && (
           <div className="topbar-context muted small">in <strong>{currentTeamSpace.name}</strong></div>
         )}
       </div>
-      <div className="presence">
-        {online.slice(0, 8).map(u => (
-          <div key={u.user_id} className="presence-avatar" title={`${u.name} • online`}>
-            <Avatar name={u.name} size={26} />
-            <span className="dot" />
-          </div>
-        ))}
-        {online.length > 8 && <div className="presence-more muted small">+{online.length - 8}</div>}
+      <div className="topbar-right">
+        <div className="presence">
+          {online.slice(0, 8).map(u => (
+            <div key={u.user_id} className="presence-avatar" title={`${u.name} • online`}>
+              <Avatar name={u.name} size={26} />
+              <span className="dot" />
+            </div>
+          ))}
+          {online.length > 8 && <div className="presence-more muted small">+{online.length - 8}</div>}
+        </div>
+        {onCompose && <button className="compose-top" onClick={onCompose}>+ Compose</button>}
       </div>
     </div>
   );

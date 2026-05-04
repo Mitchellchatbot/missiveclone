@@ -22,6 +22,9 @@ const draftRoutes = require('./routes/drafts');
 const chatRoutes = require('./routes/chat');
 const teamSpaceRoutes = require('./routes/team_spaces');
 const taskRoutes = require('./routes/tasks');
+const composeRoutes = require('./routes/compose');
+const labelRoutes = require('./routes/labels');
+const scheduledRoutes = require('./routes/scheduled');
 const { initSockets } = require('./sockets');
 const { startAllWatchers, syncAccount } = require('./email/imap');
 
@@ -62,6 +65,9 @@ app.use('/api/drafts', draftRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/team_spaces', teamSpaceRoutes);
 app.use('/api/tasks', taskRoutes);
+app.use('/api/compose', composeRoutes);
+app.use('/api/labels', labelRoutes);
+app.use('/api/scheduled', scheduledRoutes);
 
 // Serve the built frontend (single-service deploy on Railway etc.)
 const distPath = path.join(__dirname, '..', '..', 'frontend', 'dist');
@@ -125,6 +131,72 @@ server.listen(PORT, '0.0.0.0', () => {
           console.error('poll loop', e.message);
         }
       }, 2 * 60 * 1000);
+
+      // Scheduled-send dispatcher — every 30s, send any due messages.
+      const { sendEmail } = require('./email/smtp');
+      const { v4: uuid } = require('uuid');
+      const { query, emitToWorkspace } = (() => {
+        const dbm = require('./db');
+        const sock = require('./sockets');
+        return { query: dbm.query, emitToWorkspace: sock.emitToWorkspace };
+      })();
+      setInterval(async () => {
+        try {
+          const due = await many(
+            `SELECT * FROM scheduled_messages WHERE status = 'pending' AND send_at <= $1 LIMIT 20`,
+            [Date.now()]
+          );
+          for (const s of due) {
+            try {
+              await query(`UPDATE scheduled_messages SET status = 'sending' WHERE id = $1`, [s.id]);
+              const sent = await sendEmail(s.account_id, {
+                to: s.to_addrs,
+                cc: s.cc_addrs,
+                subject: s.subject,
+                text: s.body_text || '',
+                html: s.body_html || '',
+                inReplyTo: s.in_reply_to || null
+              });
+
+              // Materialize as a thread/message so it shows up in the inbox.
+              const threadId = uuid();
+              const msgId = uuid();
+              const now = Date.now();
+              await query(
+                `INSERT INTO threads (id, workspace_id, subject, participants,
+                                      last_message_at, status, message_id_root, search_text, created_at)
+                 VALUES ($1, $2, $3, $4, $5, 'open', $6, $7, $8)`,
+                [threadId, s.workspace_id,
+                 s.subject || '', [s.to_addrs, s.cc_addrs].filter(Boolean).join('; '),
+                 now, sent.messageId || null,
+                 (s.subject || '') + ' ' + (s.to_addrs || '') + ' ' + (s.body_text || '').slice(0, 2000),
+                 now]
+              );
+              await query(
+                `INSERT INTO messages (id, thread_id, account_id, workspace_id, direction,
+                  message_id, subject, from_addr, to_addrs, cc_addrs, body_text, body_html,
+                  sent_at, created_at)
+                 VALUES ($1, $2, $3, $4, 'outbound', $5, $6, '', $7, $8, $9, $10, $11, $12)`,
+                [msgId, threadId, s.account_id, s.workspace_id, sent.messageId,
+                 s.subject || '', s.to_addrs || '', s.cc_addrs || '',
+                 s.body_text || '', s.body_html || '', now, now]
+              );
+
+              await query(`UPDATE scheduled_messages SET status = 'sent', thread_id = $1 WHERE id = $2`, [threadId, s.id]);
+              emitToWorkspace(s.workspace_id, 'thread:updated', { thread_id: threadId });
+              emitToWorkspace(s.workspace_id, 'message:new', { thread_id: threadId, message_id: msgId });
+            } catch (e) {
+              console.error('scheduled send failed', s.id, e.message);
+              await query(
+                `UPDATE scheduled_messages SET status = 'failed', error = $1 WHERE id = $2`,
+                [e.message, s.id]
+              );
+            }
+          }
+        } catch (e) {
+          console.error('scheduler tick', e.message);
+        }
+      }, 30 * 1000);
     } catch (e) {
       dbInitError = e.message;
       console.error('[boot] DB init FAILED:', e.message);

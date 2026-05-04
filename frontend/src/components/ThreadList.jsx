@@ -48,6 +48,10 @@ export default function ThreadList({ threads, selectedId, onSelect }) {
                 <div className="thread-tags">
                   {statusBadge(t.status)}
                   {t.assignee_name && <span className="badge badge-assignee">@{t.assignee_name}</span>}
+                  {(t.labels || []).map(l => (
+                    <span key={l.id} className="label-chip" style={{ background: l.color }}>{l.name}</span>
+                  ))}
+                  {t.snoozed_until && Number(t.snoozed_until) > Date.now() && <span className="badge badge-pending">💤</span>}
                 </div>
               </div>
             </div>

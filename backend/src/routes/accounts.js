@@ -86,4 +86,30 @@ router.post('/:id/sync', wrap(async (req, res) => {
   res.json({ ok: true, new_messages: n });
 }));
 
+router.get('/:id/signature', wrap(async (req, res) => {
+  const acc = await one(
+    'SELECT id, signature_text, signature_html FROM email_accounts WHERE id = $1 AND workspace_id = $2',
+    [req.params.id, req.user.workspace_id]
+  );
+  if (!acc) return res.status(404).json({ error: 'not found' });
+  res.json({
+    signature_text: acc.signature_text || '',
+    signature_html: acc.signature_html || ''
+  });
+}));
+
+router.put('/:id/signature', wrap(async (req, res) => {
+  const { signature_text, signature_html } = req.body || {};
+  const acc = await one(
+    'SELECT id FROM email_accounts WHERE id = $1 AND workspace_id = $2',
+    [req.params.id, req.user.workspace_id]
+  );
+  if (!acc) return res.status(404).json({ error: 'not found' });
+  await query(
+    'UPDATE email_accounts SET signature_text = $1, signature_html = $2 WHERE id = $3',
+    [signature_text || null, signature_html || null, acc.id]
+  );
+  res.json({ ok: true });
+}));
+
 module.exports = router;

@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import Avatar from './Avatar.jsx';
+import { api } from '../api';
 
 const Icon = ({ d, size = 16 }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="none"
@@ -22,10 +23,12 @@ const I = {
   out:      'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4 M16 17l5-5-5-5 M21 12H9',
   chevDn:   'M6 9l6 6 6-6',
   chevRt:   'M9 18l6-6-6-6',
-  plus:     'M12 5v14 M5 12h14',
-  layers:   'M12 2L2 7l10 5 10-5-10-5z M2 17l10 5 10-5 M2 12l10 5 10-5',
-  draft:    'M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7 M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z',
-  check:    'M9 11l3 3L22 4 M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11'
+  pen:      'M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7 M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z',
+  check:    'M9 11l3 3L22 4 M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11',
+  zzz:      'M4 4h12l-12 16h12 M14 4l6 0 M14 12l6 0 M14 20l6 0',
+  tag:      'M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z M7 7h.01',
+  pencilSquare: 'M12 20h9 M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z',
+  scheduled: 'M12 8v4l3 3 M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z'
 };
 
 export default function Sidebar({
@@ -35,11 +38,12 @@ export default function Sidebar({
   search, setSearch,
   accounts, onAddAccount, onSync,
   teamSpaces, currentTeamSpaceId, setCurrentTeamSpaceId,
-  onManageTeamSpaces,
+  onManageTeamSpaces, onCompose, onLabels, onSignatures,
   onInvite, onCanned,
   onLogout
 }) {
   const [openSpaces, setOpenSpaces] = useState(() => new Set(teamSpaces.map(t => t.id)));
+  const [labels, setLabels] = useState([]);
 
   function toggleSpace(id) {
     setOpenSpaces(prev => {
@@ -49,12 +53,18 @@ export default function Sidebar({
     });
   }
 
+  useEffect(() => {
+    api('/api/labels').then(r => setLabels(r.labels || [])).catch(() => {});
+  }, []);
+
   const matches = (key, tsId) =>
     view === 'mail' &&
     currentTeamSpaceId === tsId &&
     filter.status === key.status &&
     (filter.assignee || null) === (key.assignee || null) &&
-    (filter.folder || null) === (key.folder || null);
+    (filter.folder || null) === (key.folder || null) &&
+    (filter.snoozed || false) === (key.snoozed || false) &&
+    (filter.label_id || null) === (key.label_id || null);
 
   const inboxItem = (label, iconKey, key, tsId) => (
     <div
@@ -76,6 +86,11 @@ export default function Sidebar({
           <div className="muted small">{me.email}</div>
         </div>
       </div>
+
+      <button className="compose-btn" onClick={onCompose}>
+        <Icon d={I.pencilSquare} size={14} />
+        New email
+      </button>
 
       <div className="search-wrap">
         <input
@@ -107,6 +122,7 @@ export default function Sidebar({
                 {inboxItem('Inbox',          'inbox',   { status: 'open',    assignee: null, folder: null }, ts.id)}
                 {inboxItem('Assigned to me', 'user',    { status: 'open',    assignee: 'me', folder: null }, ts.id)}
                 {inboxItem('Pending',        'clock',   { status: 'pending', assignee: null, folder: null }, ts.id)}
+                {inboxItem('Snoozed',        'zzz',     { status: '',        assignee: null, folder: null, snoozed: true }, ts.id)}
                 {inboxItem('Closed',         'archive', { status: 'closed',  assignee: null, folder: null }, ts.id)}
                 {inboxItem('Sent',           'send',    { status: '',        assignee: null, folder: 'SENT' }, ts.id)}
               </div>
@@ -117,18 +133,43 @@ export default function Sidebar({
 
       <div className="side-section-title">All workspaces</div>
       <div
-        className={'side-item ' + (view === 'mail' && !currentTeamSpaceId ? 'active' : '')}
+        className={'side-item ' + (view === 'mail' && !currentTeamSpaceId && !filter.label_id ? 'active' : '')}
         onClick={() => { setView('mail'); setCurrentTeamSpaceId(null); setFilter({ status: '', assignee: null, folder: null }); }}
       >
         <Icon d={I.list} /><span>All conversations</span>
       </div>
+
+      {labels.length > 0 && (
+        <>
+          <div className="side-section-title">
+            Labels
+            <button className="link" onClick={onLabels}>Manage</button>
+          </div>
+          {labels.map(l => (
+            <div
+              key={l.id}
+              className={'side-item ' + (filter.label_id === l.id ? 'active' : '')}
+              onClick={() => { setView('mail'); setCurrentTeamSpaceId(null); setFilter({ status: '', assignee: null, folder: null, label_id: l.id }); }}
+            >
+              <span className="label-dot" style={{ background: l.color }} />
+              <span>{l.name}</span>
+            </div>
+          ))}
+        </>
+      )}
+      {labels.length === 0 && (
+        <div className="side-item" onClick={onLabels}><Icon d={I.tag} /><span>Labels</span></div>
+      )}
 
       <div className="side-section-title">Workspace</div>
       <div className={'side-item ' + (view === 'tasks' ? 'active' : '')} onClick={() => setView('tasks')}>
         <Icon d={I.check} /><span>Tasks</span>
       </div>
       <div className={'side-item ' + (view === 'drafts' ? 'active' : '')} onClick={() => setView('drafts')}>
-        <Icon d={I.draft} /><span>Drafts</span>
+        <Icon d={I.pen} /><span>Drafts</span>
+      </div>
+      <div className={'side-item ' + (view === 'scheduled' ? 'active' : '')} onClick={() => setView('scheduled')}>
+        <Icon d={I.scheduled} /><span>Scheduled</span>
       </div>
       <div className={'side-item ' + (view === 'chat' ? 'active' : '')} onClick={() => setView('chat')}>
         <Icon d={I.chat} /><span>Team chat</span>
@@ -138,6 +179,9 @@ export default function Sidebar({
       </div>
       <div className="side-item" onClick={onCanned}>
         <Icon d={I.bookmark} /><span>Canned responses</span>
+      </div>
+      <div className="side-item" onClick={onSignatures}>
+        <Icon d={I.pen} /><span>Signatures</span>
       </div>
 
       <div className="side-section-title">

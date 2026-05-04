@@ -20,7 +20,7 @@ function compileRaw(mail) {
   });
 }
 
-async function sendEmail(accountId, { to, cc, subject, text, html, inReplyTo, references, attachments }) {
+async function sendEmail(accountId, { to, cc, bcc, subject, text, html, inReplyTo, references, attachments }) {
   const acc = await one('SELECT * FROM email_accounts WHERE id = $1', [accountId]);
   if (!acc) throw new Error('account not found');
   const tx = buildTransport(acc);
@@ -29,9 +29,20 @@ async function sendEmail(accountId, { to, cc, subject, text, html, inReplyTo, re
   if (inReplyTo) headers['In-Reply-To'] = `<${inReplyTo}>`;
   if (references && references.length) headers['References'] = references.map(r => `<${r}>`).join(' ');
 
+  // Append signature if configured. Skipped if the body already contains the
+  // signature (handles the case where the client pre-rendered it).
+  let outText = text || '';
+  let outHtml = html || '';
+  if (acc.signature_text && outText && !outText.includes(acc.signature_text)) {
+    outText = outText + '\n\n-- \n' + acc.signature_text;
+  }
+  if (acc.signature_html && outHtml && !outHtml.includes(acc.signature_html)) {
+    outHtml = outHtml + '<br/><br/>--<br/>' + acc.signature_html;
+  }
+
   const mail = {
     from: `"${fromName}" <${acc.email}>`,
-    to, cc, subject, text, html, headers,
+    to, cc, bcc, subject, text: outText, html: outHtml, headers,
     attachments: (attachments || []).map(a => ({
       filename: a.filename,
       content: a.content,                 // Buffer

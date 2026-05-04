@@ -219,6 +219,42 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_workspace ON tasks(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_team_space ON tasks(team_space_id);
+
+CREATE TABLE IF NOT EXISTS labels (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  color TEXT NOT NULL DEFAULT '#2f6feb',
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_labels_workspace ON labels(workspace_id);
+
+CREATE TABLE IF NOT EXISTS thread_labels (
+  thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+  label_id TEXT NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+  PRIMARY KEY (thread_id, label_id)
+);
+CREATE INDEX IF NOT EXISTS idx_thread_labels_label ON thread_labels(label_id);
+
+CREATE TABLE IF NOT EXISTS scheduled_messages (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL REFERENCES email_accounts(id) ON DELETE CASCADE,
+  thread_id TEXT REFERENCES threads(id) ON DELETE CASCADE,
+  to_addrs TEXT,
+  cc_addrs TEXT,
+  subject TEXT,
+  body_text TEXT,
+  body_html TEXT,
+  in_reply_to TEXT,
+  send_at BIGINT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  error TEXT,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_pending ON scheduled_messages(status, send_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_workspace ON scheduled_messages(workspace_id, status);
 `;
 
 const MIGRATIONS = [
@@ -248,7 +284,11 @@ const MIGRATIONS = [
      AND EXISTS (SELECT 1 FROM team_spaces ts WHERE ts.id = 'ts_' || email_accounts.workspace_id)`,
   `UPDATE threads SET team_space_id = 'ts_' || workspace_id
    WHERE team_space_id IS NULL
-     AND EXISTS (SELECT 1 FROM team_spaces ts WHERE ts.id = 'ts_' || threads.workspace_id)`
+     AND EXISTS (SELECT 1 FROM team_spaces ts WHERE ts.id = 'ts_' || threads.workspace_id)`,
+  // Snooze + signatures (added later):
+  `ALTER TABLE threads ADD COLUMN IF NOT EXISTS snoozed_until BIGINT`,
+  `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS signature_html TEXT`,
+  `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS signature_text TEXT`
 ];
 
 function ensurePool() {

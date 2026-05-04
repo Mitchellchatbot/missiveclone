@@ -30,10 +30,20 @@ function nameFromAddr(s) {
   return (a > 0 ? s.slice(0, a) : s).trim().replace(/"/g, '');
 }
 
+const SNOOZE_PRESETS = [
+  { label: 'In 1 hour', ms: 60 * 60 * 1000 },
+  { label: 'In 4 hours', ms: 4 * 60 * 60 * 1000 },
+  { label: 'Tomorrow 9 AM', fn: () => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(9, 0, 0, 0); return d.getTime() - Date.now(); } },
+  { label: 'Next Monday 9 AM', fn: () => { const d = new Date(); const days = (8 - d.getDay()) % 7 || 7; d.setDate(d.getDate() + days); d.setHours(9, 0, 0, 0); return d.getTime() - Date.now(); } }
+];
+
 export default function ThreadView({ threadId, me, team, accounts, onChanged }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [showReply, setShowReply] = useState(false);
+  const [showSnooze, setShowSnooze] = useState(false);
+  const [showLabel, setShowLabel] = useState(false);
+  const [allLabels, setAllLabels] = useState([]);
 
   const load = useCallback(async () => {
     if (!threadId) { setData(null); return; }
@@ -45,6 +55,10 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
   }, [threadId]);
 
   useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    api('/api/labels').then(r => setAllLabels(r.labels || [])).catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (!threadId) return;
@@ -68,6 +82,23 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
     await api(`/api/threads/${threadId}`, { method: 'PATCH', body: JSON.stringify({ assignee_id: id || null }) });
     onChanged && onChanged(); load();
   }
+  async function snooze(ms) {
+    await api(`/api/threads/${threadId}`, { method: 'PATCH', body: JSON.stringify({ snoozed_until: Date.now() + ms }) });
+    setShowSnooze(false);
+    onChanged && onChanged(); load();
+  }
+  async function unsnooze() {
+    await api(`/api/threads/${threadId}`, { method: 'PATCH', body: JSON.stringify({ snoozed_until: null }) });
+    onChanged && onChanged(); load();
+  }
+  async function toggleLabel(label, currently) {
+    if (currently) {
+      await api('/api/labels/remove', { method: 'POST', body: JSON.stringify({ thread_id: threadId, label_id: label.id }) });
+    } else {
+      await api('/api/labels/apply', { method: 'POST', body: JSON.stringify({ thread_id: threadId, label_id: label.id }) });
+    }
+    onChanged && onChanged(); load();
+  }
 
   if (!threadId) return (
     <div className="thread-view empty">
@@ -78,6 +109,8 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
   if (loading || !data) return <div className="thread-view"><div className="loading">Loading…</div></div>;
 
   const { thread, messages, comments } = data;
+  const isSnoozed = thread.snoozed_until && Number(thread.snoozed_until) > Date.now();
+  const labelIds = new Set((thread.labels || []).map(l => l.id));
 
   return (
     <div className="thread-view">
@@ -85,6 +118,16 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
         <div className="tv-header-main">
           <div className="tv-subject">{thread.subject || '(no subject)'}</div>
           <div className="muted small ellipsis">{thread.participants}</div>
+          {(thread.labels && thread.labels.length > 0) && (
+            <div className="tv-labels">
+              {thread.labels.map(l => (
+                <span key={l.id} className="label-chip" style={{ background: l.color }}>{l.name}</span>
+              ))}
+            </div>
+          )}
+          {isSnoozed && (
+            <div className="muted small">💤 Snoozed until {new Date(Number(thread.snoozed_until)).toLocaleString()} <button className="link" onClick={unsnooze}>unsnooze</button></div>
+          )}
         </div>
         <div className="tv-controls">
           <select value={thread.status} onChange={e => setStatus(e.target.value)} className={'status-select status-' + thread.status}>
@@ -96,6 +139,32 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
             <option value="">Unassigned</option>
             {team.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
           </select>
+          <div style={{ position: 'relative' }}>
+            <button className="ghost" onClick={() => setShowLabel(s => !s)}>🏷 Label</button>
+            {showLabel && (
+              <div className="schedule-pop" onMouseLeave={() => setShowLabel(false)}>
+                {allLabels.length === 0 && <div className="muted small pad-h">No labels yet — create some via "Labels" in the sidebar.</div>}
+                {allLabels.map(l => (
+                  <div key={l.id} className="schedule-opt" onClick={() => toggleLabel(l, labelIds.has(l.id))}>
+                    <input type="checkbox" checked={labelIds.has(l.id)} readOnly />
+                    <span className="label-chip" style={{ background: l.color }}>{l.name}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <div style={{ position: 'relative' }}>
+            <button className="ghost" onClick={() => setShowSnooze(s => !s)}>💤 Snooze</button>
+            {showSnooze && (
+              <div className="schedule-pop" onMouseLeave={() => setShowSnooze(false)}>
+                {SNOOZE_PRESETS.map(p => (
+                  <div key={p.label} className="schedule-opt" onClick={() => snooze(p.fn ? p.fn() : p.ms)}>
+                    {p.label}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
           <button onClick={() => setShowReply(s => !s)}>↩ Reply</button>
         </div>
       </div>
@@ -142,12 +211,10 @@ function MessageBlock({ m }) {
       {m.attachments && m.attachments.length > 0 && (
         <div className="att-list">
           {m.attachments.map(a => (
-            <a
-              key={a.id}
+            <a key={a.id}
               href={getApiBase() + `/api/attachments/${a.id}`}
               onClick={e => downloadAttachment(e, a)}
-              className="att"
-            >
+              className="att">
               📎 <span>{a.filename}</span> <span className="muted xs">{fmtSize(a.size_bytes)}</span>
             </a>
           ))}

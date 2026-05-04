@@ -16,9 +16,14 @@ const upload = multer({
 });
 
 router.get('/', wrap(async (req, res) => {
-  const { status, assignee, q, folder, team_space_id } = req.query;
+  const { status, assignee, q, folder, team_space_id, snoozed, label_id } = req.query;
   const params = [req.user.workspace_id];
-  let sql = `SELECT t.*, u.name AS assignee_name
+  let sql = `SELECT t.*, u.name AS assignee_name,
+                    coalesce(
+                      (SELECT json_agg(json_build_object('id', l.id, 'name', l.name, 'color', l.color))
+                       FROM thread_labels tl JOIN labels l ON l.id = tl.label_id
+                       WHERE tl.thread_id = t.id), '[]'::json
+                    ) AS labels
              FROM threads t
              LEFT JOIN users u ON u.id = t.assignee_id
              WHERE t.workspace_id = $1`;
@@ -26,6 +31,18 @@ router.get('/', wrap(async (req, res) => {
   if (status) { params.push(status); sql += ` AND t.status = $${params.length}`; }
   if (assignee === 'me') { params.push(req.user.id); sql += ` AND t.assignee_id = $${params.length}`; }
   else if (assignee) { params.push(assignee); sql += ` AND t.assignee_id = $${params.length}`; }
+  if (snoozed === 'true') {
+    params.push(Date.now());
+    sql += ` AND t.snoozed_until IS NOT NULL AND t.snoozed_until > $${params.length}`;
+  } else {
+    // Default: hide currently-snoozed threads from regular views.
+    params.push(Date.now());
+    sql += ` AND (t.snoozed_until IS NULL OR t.snoozed_until <= $${params.length})`;
+  }
+  if (label_id) {
+    params.push(label_id);
+    sql += ` AND EXISTS (SELECT 1 FROM thread_labels tl WHERE tl.thread_id = t.id AND tl.label_id = $${params.length})`;
+  }
   if (folder === 'SENT') {
     sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id AND m.direction = 'outbound')`;
   } else if (folder) {
@@ -44,7 +61,12 @@ router.get('/', wrap(async (req, res) => {
 
 router.get('/:id', wrap(async (req, res) => {
   const t = await one(
-    `SELECT t.*, u.name AS assignee_name
+    `SELECT t.*, u.name AS assignee_name,
+            coalesce(
+              (SELECT json_agg(json_build_object('id', l.id, 'name', l.name, 'color', l.color))
+               FROM thread_labels tl JOIN labels l ON l.id = tl.label_id
+               WHERE tl.thread_id = t.id), '[]'::json
+            ) AS labels
      FROM threads t LEFT JOIN users u ON u.id = t.assignee_id
      WHERE t.id = $1 AND t.workspace_id = $2`,
     [req.params.id, req.user.workspace_id]
@@ -78,7 +100,7 @@ router.get('/:id', wrap(async (req, res) => {
 }));
 
 router.patch('/:id', wrap(async (req, res) => {
-  const { status, assignee_id } = req.body || {};
+  const { status, assignee_id, snoozed_until } = req.body || {};
   const t = await one(
     'SELECT id FROM threads WHERE id = $1 AND workspace_id = $2',
     [req.params.id, req.user.workspace_id]
@@ -93,6 +115,10 @@ router.patch('/:id', wrap(async (req, res) => {
   if (assignee_id !== undefined) {
     params.push(assignee_id || null);
     sets.push(`assignee_id = $${params.length}`);
+  }
+  if (snoozed_until !== undefined) {
+    params.push(snoozed_until ? Number(snoozed_until) : null);
+    sets.push(`snoozed_until = $${params.length}`);
   }
   if (!sets.length) return res.json({ ok: true });
   params.push(t.id);

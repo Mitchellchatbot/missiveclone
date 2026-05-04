@@ -6,15 +6,19 @@ import ThreadView from '../components/ThreadView.jsx';
 import ChatView from '../components/ChatView.jsx';
 import TasksView from '../components/TasksView.jsx';
 import DraftsView from '../components/DraftsView.jsx';
+import ScheduledView from '../components/ScheduledView.jsx';
 import ConnectAccount from '../components/ConnectAccount.jsx';
 import InviteModal from '../components/InviteModal.jsx';
 import CannedModal from '../components/CannedModal.jsx';
 import TeamSpaceModal from '../components/TeamSpaceModal.jsx';
+import LabelsModal from '../components/LabelsModal.jsx';
+import SignaturesModal from '../components/SignaturesModal.jsx';
+import ComposeNew from '../components/ComposeNew.jsx';
 import { api } from '../api';
 import { getSocket, disconnectSocket } from '../socket';
 
 export default function Dashboard({ me, onLogout }) {
-  const [view, setView] = useState('mail');  // 'mail' | 'chat' | 'tasks' | 'drafts'
+  const [view, setView] = useState('mail');  // mail | chat | tasks | drafts | scheduled
   const [filter, setFilter] = useState({ status: 'open', assignee: null, folder: null });
   const [currentTeamSpaceId, setCurrentTeamSpaceId] = useState(null);
   const [search, setSearch] = useState('');
@@ -28,6 +32,9 @@ export default function Dashboard({ me, onLogout }) {
   const [showInvite, setShowInvite] = useState(false);
   const [showCanned, setShowCanned] = useState(false);
   const [showSpaces, setShowSpaces] = useState(false);
+  const [showLabels, setShowLabels] = useState(false);
+  const [showSigs, setShowSigs] = useState(false);
+  const [showCompose, setShowCompose] = useState(false);
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search), 250);
@@ -39,6 +46,8 @@ export default function Dashboard({ me, onLogout }) {
     if (filter.status) params.set('status', filter.status);
     if (filter.assignee) params.set('assignee', filter.assignee);
     if (filter.folder) params.set('folder', filter.folder);
+    if (filter.snoozed) params.set('snoozed', 'true');
+    if (filter.label_id) params.set('label_id', filter.label_id);
     if (currentTeamSpaceId) params.set('team_space_id', currentTeamSpaceId);
     if (debouncedSearch) params.set('q', debouncedSearch);
     const res = await api('/api/threads?' + params.toString());
@@ -54,7 +63,6 @@ export default function Dashboard({ me, onLogout }) {
   const loadTeamSpaces = useCallback(async () => {
     const r = await api('/api/team_spaces');
     setTeamSpaces(r.team_spaces || []);
-    // Default current team space to the first one if none chosen.
     if (r.team_spaces && r.team_spaces.length && currentTeamSpaceId === null) {
       setCurrentTeamSpaceId(r.team_spaces[0].id);
     }
@@ -107,6 +115,9 @@ export default function Dashboard({ me, onLogout }) {
         onManageTeamSpaces={() => setShowSpaces(true)}
         onAddAccount={() => setShowConnect(true)}
         onSync={syncAll}
+        onCompose={() => setShowCompose(true)}
+        onLabels={() => setShowLabels(true)}
+        onSignatures={() => setShowSigs(true)}
         onInvite={() => setShowInvite(true)}
         onCanned={() => setShowCanned(true)}
         onLogout={onLogout}
@@ -117,15 +128,12 @@ export default function Dashboard({ me, onLogout }) {
           me={me.user}
           view={view} setView={setView}
           currentTeamSpace={currentTeamSpace}
+          onCompose={() => setShowCompose(true)}
         />
 
         {view === 'mail' && (
           <div className="mail-grid">
-            <ThreadList
-              threads={threads}
-              selectedId={selectedId}
-              onSelect={setSelectedId}
-            />
+            <ThreadList threads={threads} selectedId={selectedId} onSelect={setSelectedId} />
             <ThreadView
               threadId={selectedId}
               me={me.user}
@@ -138,14 +146,10 @@ export default function Dashboard({ me, onLogout }) {
 
         {view === 'chat' && <ChatView me={me.user} team={team} />}
         {view === 'tasks' && (
-          <TasksView
-            me={me.user}
-            team={team}
-            teamSpaces={teamSpaces}
-            currentTeamSpace={currentTeamSpace}
-          />
+          <TasksView me={me.user} team={team} teamSpaces={teamSpaces} currentTeamSpace={currentTeamSpace} />
         )}
         {view === 'drafts' && <DraftsView onOpenThread={openThreadFromDraft} />}
+        {view === 'scheduled' && <ScheduledView />}
       </div>
 
       {showConnect && (
@@ -159,6 +163,23 @@ export default function Dashboard({ me, onLogout }) {
       {showInvite && <InviteModal onClose={() => setShowInvite(false)} />}
       {showCanned && <CannedModal onClose={() => setShowCanned(false)} />}
       {showSpaces && <TeamSpaceModal onClose={() => { setShowSpaces(false); loadTeamSpaces(); loadAccounts(); }} />}
+      {showLabels && <LabelsModal onClose={() => { setShowLabels(false); loadThreads(); }} />}
+      {showSigs && <SignaturesModal accounts={accounts} onClose={() => setShowSigs(false)} />}
+      {showCompose && (
+        <ComposeNew
+          accounts={accounts}
+          defaultAccountId={accounts[0]?.id}
+          onClose={() => setShowCompose(false)}
+          onSent={(r) => {
+            setShowCompose(false);
+            loadThreads();
+            if (r && r.thread_id) {
+              setView('mail');
+              setSelectedId(r.thread_id);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

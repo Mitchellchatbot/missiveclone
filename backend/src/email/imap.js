@@ -145,6 +145,7 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
   await query(
     `UPDATE threads SET last_message_at = $1,
        status = CASE WHEN status = 'closed' AND $4 = 'inbound' THEN 'open' ELSE status END,
+       snoozed_until = CASE WHEN $4 = 'inbound' THEN NULL ELSE snoozed_until END,
        search_text = coalesce(search_text, '') || ' ' || $2
      WHERE id = $3`,
     [sentAt, searchAdd, threadId, dir]
