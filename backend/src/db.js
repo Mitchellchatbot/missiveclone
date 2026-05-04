@@ -1,8 +1,12 @@
 const { Pool } = require('pg');
 
-if (!process.env.DATABASE_URL) {
-  console.error('FATAL: DATABASE_URL is not set. Point it at a Postgres instance.');
-  process.exit(1);
+const HAS_DB = !!process.env.DATABASE_URL;
+if (!HAS_DB) {
+  console.error('=========================================================');
+  console.error('  WARNING: DATABASE_URL is not set.');
+  console.error('  The HTTP server will start but every DB query will fail.');
+  console.error('  Attach the Postgres plugin in Railway and re-deploy.');
+  console.error('=========================================================');
 }
 
 function shouldUseSsl() {
@@ -12,13 +16,17 @@ function shouldUseSsl() {
   return process.env.NODE_ENV === 'production';
 }
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: shouldUseSsl() ? { rejectUnauthorized: false } : false,
-  max: 10
-});
+const pool = HAS_DB
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: shouldUseSsl() ? { rejectUnauthorized: false } : false,
+      max: 10,
+      // Don't keep retrying forever on a busted DATABASE_URL.
+      connectionTimeoutMillis: 10000
+    })
+  : null;
 
-pool.on('error', (err) => console.error('pg pool error', err));
+if (pool) pool.on('error', (err) => console.error('pg pool error', err));
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -189,7 +197,12 @@ const MIGRATIONS = [
   `ALTER TABLE email_accounts DROP COLUMN IF EXISTS last_sync_uid`
 ];
 
+function ensurePool() {
+  if (!pool) throw new Error('DATABASE_URL is not set; database is unavailable');
+}
+
 async function init() {
+  ensurePool();
   await pool.query(SCHEMA);
   for (const m of MIGRATIONS) {
     try { await pool.query(m); }
@@ -197,10 +210,21 @@ async function init() {
   }
 }
 
-async function query(text, params) { return pool.query(text, params); }
-async function one(text, params)   { const r = await pool.query(text, params); return r.rows[0] || null; }
-async function many(text, params)  { const r = await pool.query(text, params); return r.rows; }
+async function ping() {
+  if (!pool) return { ok: false, error: 'DATABASE_URL not set' };
+  try {
+    await pool.query('SELECT 1');
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+async function query(text, params) { ensurePool(); return pool.query(text, params); }
+async function one(text, params)   { ensurePool(); const r = await pool.query(text, params); return r.rows[0] || null; }
+async function many(text, params)  { ensurePool(); const r = await pool.query(text, params); return r.rows; }
 async function tx(fn) {
+  ensurePool();
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -215,4 +239,4 @@ async function tx(fn) {
   }
 }
 
-module.exports = { pool, init, query, one, many, tx };
+module.exports = { pool, init, ping, query, one, many, tx, HAS_DB };
