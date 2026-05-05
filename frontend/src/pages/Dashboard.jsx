@@ -208,7 +208,7 @@ export default function Dashboard({ me, onLogout }) {
           onCreated={() => { setShowConnect(false); loadAccounts(); loadTeamSpaces(); }}
         />
       )}
-      {showInvite && <InviteModal onClose={() => setShowInvite(false)} />}
+      {showInvite && <InviteModal accounts={accounts} onClose={() => setShowInvite(false)} />}
       {showCanned && <CannedModal onClose={() => setShowCanned(false)} />}
       {showSpaces && <TeamSpaceModal onClose={() => { setShowSpaces(false); loadTeamSpaces(); loadAccounts(); }} />}
       {showLabels && <LabelsModal onClose={() => { setShowLabels(false); loadThreads(); }} />}
