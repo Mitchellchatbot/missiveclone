@@ -27,12 +27,14 @@ function presetTimes() {
   ];
 }
 
-export default function ComposeNew({ accounts, defaultAccountId, onClose, onSent }) {
-  const [accountId, setAccountId] = useState(defaultAccountId || accounts[0]?.id || '');
-  const [to, setTo] = useState('');
-  const [cc, setCc] = useState('');
-  const [subject, setSubject] = useState('');
-  const [html, setHtml] = useState('');
+export default function ComposeNew({ accounts, defaultAccountId, initial, onClose, onSent }) {
+  const [accountId, setAccountId] = useState(
+    (initial && initial.accountId) || defaultAccountId || accounts[0]?.id || ''
+  );
+  const [to, setTo] = useState((initial && initial.to) || '');
+  const [cc, setCc] = useState((initial && initial.cc) || '');
+  const [subject, setSubject] = useState((initial && initial.subject) || '');
+  const [html, setHtml] = useState((initial && initial.bodyHtml) || '');
   const [files, setFiles] = useState([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');

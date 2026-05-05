@@ -18,18 +18,27 @@ function fmtDate(ts) {
 function firstParticipant(s) {
   if (!s) return '';
   const first = s.split(';')[0].trim();
-  // Strip <addr> if "Name <addr>" form
   const angle = first.indexOf('<');
   return angle > 0 ? first.slice(0, angle).trim().replace(/"/g, '') : first;
 }
 
 const statusBadge = (s) => <span className={`badge badge-${s}`}>{s}</span>;
 
-export default function ThreadList({ threads, selectedId, onSelect, onCloseThread, onSnoozeThread }) {
+export default function ThreadList({
+  threads, selectedId, onSelect,
+  onCloseThread, onSnoozeThread, onToggleStar,
+  selectedIds = new Set(), onToggleSelect, onClearSelect
+}) {
   function quick(action, t, e) {
     e.stopPropagation();
     if (action === 'close') onCloseThread && onCloseThread(t);
     if (action === 'snooze') onSnoozeThread && onSnoozeThread(t);
+    if (action === 'star') onToggleStar && onToggleStar(t);
+  }
+
+  function toggleSel(t, e) {
+    e.stopPropagation();
+    onToggleSelect && onToggleSelect(t.id);
   }
 
   return (
@@ -38,13 +47,34 @@ export default function ThreadList({ threads, selectedId, onSelect, onCloseThrea
       {threads.map(t => {
         const fp = firstParticipant(t.participants);
         const isClosed = t.status === 'closed';
+        const isStarred = !!t.starred;
+        const isSelected = selectedIds.has(t.id);
         return (
           <div
             key={t.id}
-            className={'thread-row ' + (selectedId === t.id ? 'selected' : '')}
+            className={'thread-row ' + (selectedId === t.id ? 'selected' : '') + (isSelected ? ' multi-selected' : '')}
             onClick={() => onSelect(t.id)}
           >
-            <Avatar name={fp || t.subject || '?'} size={36} />
+            <div className="thread-row-left">
+              {onToggleSelect && (
+                <input
+                  type="checkbox"
+                  className="thread-select"
+                  checked={isSelected}
+                  onChange={() => {}}
+                  onClick={(e) => toggleSel(t, e)}
+                  title="Select"
+                />
+              )}
+              {onToggleStar && (
+                <button
+                  className={'star-btn ' + (isStarred ? 'on' : '')}
+                  onClick={(e) => quick('star', t, e)}
+                  title={isStarred ? 'Unstar' : 'Star'}
+                >{isStarred ? '★' : '☆'}</button>
+              )}
+              <Avatar name={fp || t.subject || '?'} size={36} />
+            </div>
             <div className="thread-row-main">
               <div className="thread-row-top">
                 <div className="thread-from ellipsis">{fp || '—'}</div>
@@ -59,7 +89,7 @@ export default function ThreadList({ threads, selectedId, onSelect, onCloseThrea
                   {onCloseThread && (
                     <button
                       className="thread-action-btn close-btn"
-                      title={isClosed ? 'Re-open conversation' : 'Close conversation'}
+                      title={isClosed ? 'Re-open' : 'Close'}
                       onClick={(e) => quick('close', t, e)}
                     >{isClosed ? '↺' : '✕'}</button>
                   )}

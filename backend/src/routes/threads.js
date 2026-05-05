@@ -65,7 +65,7 @@ const CATEGORY_CLAUSES = {
 
 router.get('/', wrap(async (req, res) => {
   const { status, assignee, q, folder, team_space_id, snoozed, label_id,
-          mine, mailbox_id, category } = req.query;
+          mine, mailbox_id, category, starred } = req.query;
   const params = [req.user.workspace_id];
   let sql = `SELECT t.*, u.name AS assignee_name,
                     coalesce(
@@ -115,6 +115,10 @@ router.get('/', wrap(async (req, res) => {
   // category: smart filter (codes / newsletters / receipts / etc.)
   if (category && CATEGORY_CLAUSES[category]) {
     sql += ` AND ${CATEGORY_CLAUSES[category]}`;
+  }
+
+  if (starred === 'true') {
+    sql += ` AND t.starred = 1`;
   }
   if (folder === 'SENT') {
     sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id AND m.direction = 'outbound')`;
@@ -181,7 +185,7 @@ router.get('/:id', wrap(async (req, res) => {
 }));
 
 router.patch('/:id', wrap(async (req, res) => {
-  const { status, assignee_id, snoozed_until } = req.body || {};
+  const { status, assignee_id, snoozed_until, starred } = req.body || {};
   const t = await one(
     'SELECT id FROM threads WHERE id = $1 AND workspace_id = $2',
     [req.params.id, req.user.workspace_id]
@@ -201,12 +205,68 @@ router.patch('/:id', wrap(async (req, res) => {
     params.push(snoozed_until ? Number(snoozed_until) : null);
     sets.push(`snoozed_until = $${params.length}`);
   }
+  if (starred !== undefined) {
+    params.push(starred ? 1 : 0);
+    sets.push(`starred = $${params.length}`);
+  }
   if (!sets.length) return res.json({ ok: true });
   params.push(t.id);
   await query(`UPDATE threads SET ${sets.join(', ')} WHERE id = $${params.length}`, params);
 
   emitToWorkspace(req.user.workspace_id, 'thread:updated', { thread_id: t.id });
   res.json({ ok: true });
+}));
+
+// Bulk actions on multiple threads at once.
+router.post('/bulk', wrap(async (req, res) => {
+  const { action, thread_ids, value } = req.body || {};
+  if (!Array.isArray(thread_ids) || thread_ids.length === 0) {
+    return res.status(400).json({ error: 'thread_ids required' });
+  }
+  // Filter to threads actually in this workspace.
+  const rows = await many(
+    'SELECT id FROM threads WHERE workspace_id = $1 AND id = ANY($2::text[])',
+    [req.user.workspace_id, thread_ids]
+  );
+  const ids = rows.map(r => r.id);
+  if (!ids.length) return res.json({ ok: true, affected: 0 });
+
+  switch (action) {
+    case 'close':
+      await query(`UPDATE threads SET status = 'closed' WHERE id = ANY($1::text[])`, [ids]);
+      break;
+    case 'open':
+      await query(`UPDATE threads SET status = 'open' WHERE id = ANY($1::text[])`, [ids]);
+      break;
+    case 'pending':
+      await query(`UPDATE threads SET status = 'pending' WHERE id = ANY($1::text[])`, [ids]);
+      break;
+    case 'star':
+      await query(`UPDATE threads SET starred = 1 WHERE id = ANY($1::text[])`, [ids]);
+      break;
+    case 'unstar':
+      await query(`UPDATE threads SET starred = 0 WHERE id = ANY($1::text[])`, [ids]);
+      break;
+    case 'snooze': {
+      const ms = Number(value) || (60 * 60 * 1000);
+      await query(`UPDATE threads SET snoozed_until = $1 WHERE id = ANY($2::text[])`, [Date.now() + ms, ids]);
+      break;
+    }
+    case 'assign':
+      await query(`UPDATE threads SET assignee_id = $1 WHERE id = ANY($2::text[])`, [value || null, ids]);
+      break;
+    case 'label_add':
+      if (!value) return res.status(400).json({ error: 'value=label_id required' });
+      for (const tid of ids) {
+        await query(`INSERT INTO thread_labels (thread_id, label_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [tid, value]);
+      }
+      break;
+    default:
+      return res.status(400).json({ error: 'unknown action' });
+  }
+
+  for (const id of ids) emitToWorkspace(req.user.workspace_id, 'thread:updated', { thread_id: id });
+  res.json({ ok: true, affected: ids.length });
 }));
 
 // Reply with optional attachments. Multipart form-data:

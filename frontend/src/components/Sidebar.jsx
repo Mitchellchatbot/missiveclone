@@ -46,7 +46,8 @@ export default function Sidebar({
   teamSpaces, currentTeamSpaceId, setCurrentTeamSpaceId,
   onManageTeamSpaces, onCompose, onLabels, onSignatures,
   onInvite, onCanned, onWorkspace,
-  onLogout
+  onLogout,
+  darkMode, onToggleDark
 }) {
   const [openSpaces, setOpenSpaces] = useState(() => new Set(teamSpaces.map(t => t.id)));
   const [labels, setLabels] = useState([]);
@@ -111,10 +112,16 @@ export default function Sidebar({
 
       <div className="side-section-title">Personal</div>
       <div
-        className={'side-item ' + (view === 'mail' && filter.mine && !filter.category ? 'active' : '')}
+        className={'side-item ' + (view === 'mail' && filter.mine && !filter.category && !filter.starred ? 'active' : '')}
         onClick={() => { setView('mail'); setCurrentTeamSpaceId(null); setFilter({ status: '', assignee: null, folder: null, mine: true }); }}
       >
         <Icon d={I.user} /><span>My inbox</span>
+      </div>
+      <div
+        className={'side-item ' + (view === 'mail' && filter.starred ? 'active' : '')}
+        onClick={() => { setView('mail'); setCurrentTeamSpaceId(null); setFilter({ status: '', assignee: null, folder: null, starred: true }); }}
+      >
+        <span style={{ width: 16, color: '#fbbf24', fontSize: 14 }}>★</span><span>Starred</span>
       </div>
 
       <div className="side-section-title">Smart filters</div>
@@ -248,6 +255,11 @@ export default function Sidebar({
           <div className="ellipsis"><strong>{me.name}</strong></div>
           <div className="muted xs ellipsis">{me.email}</div>
         </div>
+        {onToggleDark && (
+          <button className="icon-btn" onClick={onToggleDark} title={darkMode ? 'Light mode' : 'Dark mode'}>
+            {darkMode ? '☀' : '☾'}
+          </button>
+        )}
         <button className="icon-btn" onClick={onLogout} title="Log out">
           <Icon d={I.out} />
         </button>

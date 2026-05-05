@@ -18,6 +18,7 @@ import WorkspaceModal from '../components/WorkspaceModal.jsx';
 import AccountModal from '../components/AccountModal.jsx';
 import OnboardingScreen from '../components/OnboardingScreen.jsx';
 import CategoryBar from '../components/CategoryBar.jsx';
+import BulkActionBar from '../components/BulkActionBar.jsx';
 import { api } from '../api';
 import { getSocket, disconnectSocket } from '../socket';
 
@@ -42,12 +43,24 @@ export default function Dashboard({ me, onLogout }) {
   const [showWorkspace, setShowWorkspace] = useState(false);
   const [editAccountId, setEditAccountId] = useState(null);
   const [accountsLoaded, setAccountsLoaded] = useState(false);
+  const [selectedThreadIds, setSelectedThreadIds] = useState(() => new Set());
+  const [forwardInitial, setForwardInitial] = useState(null);
+  const [labels, setLabels] = useState([]);
   // Dismiss flag is per-user-id so two teammates sharing a browser don't
   // affect each other, and rejoining workspaces re-shows the onboarding.
   const dismissKey = `missive_clone_onboarding_dismissed_${me.user.id}`;
   const [onboardingDismissed, setOnboardingDismissed] = useState(
     () => localStorage.getItem(dismissKey) === '1'
   );
+
+  // Dark mode
+  const [darkMode, setDarkMode] = useState(
+    () => localStorage.getItem('missive_clone_theme') === 'dark'
+  );
+  useEffect(() => {
+    document.documentElement.dataset.theme = darkMode ? 'dark' : 'light';
+    localStorage.setItem('missive_clone_theme', darkMode ? 'dark' : 'light');
+  }, [darkMode]);
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search), 250);
@@ -64,6 +77,7 @@ export default function Dashboard({ me, onLogout }) {
     if (filter.mine) params.set('mine', 'true');
     if (filter.category) params.set('category', filter.category);
     if (filter.mailbox_id) params.set('mailbox_id', filter.mailbox_id);
+    if (filter.starred) params.set('starred', 'true');
     if (currentTeamSpaceId) params.set('team_space_id', currentTeamSpaceId);
     if (debouncedSearch) params.set('q', debouncedSearch);
     const res = await api('/api/threads?' + params.toString());
@@ -88,6 +102,9 @@ export default function Dashboard({ me, onLogout }) {
 
   useEffect(() => { loadThreads(); }, [loadThreads]);
   useEffect(() => { loadAccounts(); loadTeam(); loadTeamSpaces(); }, [loadAccounts, loadTeam, loadTeamSpaces]);
+  useEffect(() => {
+    api('/api/labels').then(r => setLabels(r.labels || [])).catch(() => {});
+  }, []);
 
   useEffect(() => {
     const s = getSocket();
@@ -125,6 +142,76 @@ export default function Dashboard({ me, onLogout }) {
     if (selectedId === t.id) setSelectedId(null);
     loadThreads();
   }
+
+  async function toggleStar(t) {
+    await api(`/api/threads/${t.id}`, { method: 'PATCH', body: JSON.stringify({ starred: !t.starred }) });
+    loadThreads();
+  }
+
+  function toggleSelect(id) {
+    setSelectedThreadIds(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
+  function clearSelection() { setSelectedThreadIds(new Set()); }
+
+  function openForward(args) {
+    setForwardInitial(args);
+    setShowCompose(true);
+  }
+
+  // ----- Keyboard shortcuts -----
+  useEffect(() => {
+    function inEditable(target) {
+      if (!target) return false;
+      const tag = target.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
+    }
+    function onKey(e) {
+      if (inEditable(e.target)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (view !== 'mail') return;
+
+      const idx = threads.findIndex(t => t.id === selectedId);
+
+      if (e.key === 'j') {
+        e.preventDefault();
+        const next = idx < threads.length - 1 ? threads[idx + 1] : threads[0];
+        if (next) setSelectedId(next.id);
+      } else if (e.key === 'k') {
+        e.preventDefault();
+        const prev = idx > 0 ? threads[idx - 1] : threads[threads.length - 1];
+        if (prev) setSelectedId(prev.id);
+      } else if (e.key === 'e' && selectedId) {
+        e.preventDefault();
+        const t = threads.find(x => x.id === selectedId);
+        if (t) closeThread(t);
+      } else if (e.key === 's' && selectedId) {
+        e.preventDefault();
+        const t = threads.find(x => x.id === selectedId);
+        if (t) snoozeThread(t);
+      } else if (e.key === 'l' && selectedId) {
+        e.preventDefault();
+        const t = threads.find(x => x.id === selectedId);
+        if (t) toggleStar(t);
+      } else if (e.key === 'c') {
+        e.preventDefault();
+        setForwardInitial(null);
+        setShowCompose(true);
+      } else if (e.key === '/') {
+        e.preventDefault();
+        const sb = document.querySelector('.sidebar-search');
+        if (sb) sb.focus();
+      } else if (e.key === 'Escape') {
+        if (selectedThreadIds.size > 0) clearSelection();
+        else setSelectedId(null);
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [view, threads, selectedId, selectedThreadIds]);
 
   function openThreadFromDraft(threadId) {
     setView('mail');
@@ -177,6 +264,8 @@ export default function Dashboard({ me, onLogout }) {
         onCanned={() => setShowCanned(true)}
         onWorkspace={() => setShowWorkspace(true)}
         onLogout={onLogout}
+        darkMode={darkMode}
+        onToggleDark={() => setDarkMode(d => !d)}
       />
 
       <div className="main-col">
@@ -204,6 +293,15 @@ export default function Dashboard({ me, onLogout }) {
         {view === 'mail' && (
           <>
             <CategoryBar filter={filter} setFilter={setFilter} />
+            {selectedThreadIds.size > 0 && (
+              <BulkActionBar
+                selectedIds={selectedThreadIds}
+                onClear={clearSelection}
+                onChanged={loadThreads}
+                team={team}
+                labels={labels}
+              />
+            )}
             <div className="mail-grid">
               <ThreadList
                 threads={threads}
@@ -211,6 +309,9 @@ export default function Dashboard({ me, onLogout }) {
                 onSelect={setSelectedId}
                 onCloseThread={closeThread}
                 onSnoozeThread={snoozeThread}
+                onToggleStar={toggleStar}
+                selectedIds={selectedThreadIds}
+                onToggleSelect={toggleSelect}
               />
               <ThreadView
                 threadId={selectedId}
@@ -218,6 +319,7 @@ export default function Dashboard({ me, onLogout }) {
                 team={team}
                 accounts={accounts}
                 onChanged={loadThreads}
+                onForward={openForward}
               />
             </div>
           </>
@@ -247,10 +349,12 @@ export default function Dashboard({ me, onLogout }) {
       {showCompose && (
         <ComposeNew
           accounts={accounts}
-          defaultAccountId={accounts[0]?.id}
-          onClose={() => setShowCompose(false)}
+          defaultAccountId={(forwardInitial && forwardInitial.accountId) || accounts[0]?.id}
+          initial={forwardInitial}
+          onClose={() => { setShowCompose(false); setForwardInitial(null); }}
           onSent={(r) => {
             setShowCompose(false);
+            setForwardInitial(null);
             loadThreads();
             if (r && r.thread_id) {
               setView('mail');

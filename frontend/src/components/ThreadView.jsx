@@ -54,6 +54,10 @@ function nameFromAddr(s) {
   return (a > 0 ? s.slice(0, a) : s).trim().replace(/"/g, '');
 }
 
+function escapeAttr(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
 const SNOOZE_PRESETS = [
   { label: 'In 1 hour', ms: 60 * 60 * 1000 },
   { label: 'In 4 hours', ms: 4 * 60 * 60 * 1000 },
@@ -61,7 +65,7 @@ const SNOOZE_PRESETS = [
   { label: 'Next Monday 9 AM', fn: () => { const d = new Date(); const days = (8 - d.getDay()) % 7 || 7; d.setDate(d.getDate() + days); d.setHours(9, 0, 0, 0); return d.getTime() - Date.now(); } }
 ];
 
-export default function ThreadView({ threadId, me, team, accounts, onChanged }) {
+export default function ThreadView({ threadId, me, team, accounts, onChanged, onForward }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [showReply, setShowReply] = useState(false);
@@ -123,6 +127,29 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
     }
     onChanged && onChanged(); load();
   }
+  async function toggleStar() {
+    if (!data || !data.thread) return;
+    await api(`/api/threads/${threadId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ starred: !data.thread.starred })
+    });
+    onChanged && onChanged(); load();
+  }
+  function forwardLast() {
+    if (!data || !data.messages || !data.messages.length) return;
+    const last = data.messages[data.messages.length - 1];
+    onForward && onForward({
+      subject: 'Fwd: ' + (data.thread.subject || '').replace(/^fwd:\s*/i, ''),
+      bodyHtml:
+        `<br/><br/>---------- Forwarded message ----------<br/>` +
+        `<b>From:</b> ${escapeAttr(last.from_addr || '')}<br/>` +
+        `<b>Date:</b> ${new Date(Number(last.sent_at)).toLocaleString()}<br/>` +
+        `<b>Subject:</b> ${escapeAttr(last.subject || '')}<br/>` +
+        `<b>To:</b> ${escapeAttr(last.to_addrs || '')}<br/><br/>` +
+        (last.body_html || (last.body_text || '').replace(/\n/g, '<br/>')),
+      accountId: last.account_id || undefined
+    });
+  }
 
   if (!threadId) return (
     <div className="thread-view empty">
@@ -140,10 +167,16 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
     <div className="thread-view">
       <div className="tv-header">
         <div className="tv-header-top">
+          <button
+            className={'star-btn-lg ' + (thread.starred ? 'on' : '')}
+            onClick={toggleStar}
+            title={thread.starred ? 'Unstar' : 'Star'}
+          >{thread.starred ? '★' : '☆'}</button>
           <div className="tv-header-main">
             <div className="tv-subject">{thread.subject || '(no subject)'}</div>
             <div className="muted small tv-participants">{thread.participants}</div>
           </div>
+          <button className="ghost" onClick={forwardLast} title="Forward last message">↪ Forward</button>
           <button className="tv-reply-btn" onClick={() => setShowReply(s => !s)}>↩ Reply</button>
         </div>
 

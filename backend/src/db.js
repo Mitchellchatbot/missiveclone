@@ -285,7 +285,8 @@ const MIGRATIONS = [
   `UPDATE threads SET team_space_id = 'ts_' || workspace_id
    WHERE team_space_id IS NULL
      AND EXISTS (SELECT 1 FROM team_spaces ts WHERE ts.id = 'ts_' || threads.workspace_id)`,
-  // Snooze + signatures (added later):
+  // Star + snooze + signatures (added later):
+  `ALTER TABLE threads ADD COLUMN IF NOT EXISTS starred INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE threads ADD COLUMN IF NOT EXISTS snoozed_until BIGINT`,
   `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS signature_html TEXT`,
   `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS signature_text TEXT`,
