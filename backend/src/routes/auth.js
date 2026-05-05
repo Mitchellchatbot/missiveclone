@@ -78,10 +78,20 @@ router.delete('/team/:userId', requireAuth, wrap(async (req, res) => {
   if (req.params.userId === req.user.id) {
     return res.status(400).json({ error: 'You cannot remove yourself' });
   }
-  const { one, query } = require('../db');
+  const { one, query, tx } = require('../db');
   const u = await one('SELECT id FROM users WHERE id = $1 AND workspace_id = $2', [req.params.userId, req.user.workspace_id]);
   if (!u) return res.status(404).json({ error: 'not found' });
-  await query('DELETE FROM users WHERE id = $1', [u.id]);
+
+  // Before deleting the user, transfer ownership of workspace-shared
+  // resources (mailboxes, tasks, canned responses) to the requesting user.
+  // Personal things (drafts, comments, chat messages) cascade out with
+  // the user — those represent that specific person's voice.
+  await tx(async (c) => {
+    await c.query('UPDATE email_accounts SET user_id = $1 WHERE user_id = $2', [req.user.id, u.id]);
+    await c.query('UPDATE tasks SET created_by = $1 WHERE created_by = $2', [req.user.id, u.id]);
+    await c.query('UPDATE canned_responses SET user_id = $1 WHERE user_id = $2', [req.user.id, u.id]);
+    await c.query('DELETE FROM users WHERE id = $1', [u.id]);
+  });
   res.json({ ok: true });
 }));
 

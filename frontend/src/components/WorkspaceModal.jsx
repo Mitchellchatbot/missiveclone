@@ -31,7 +31,14 @@ export default function WorkspaceModal({ me, onClose, onChanged }) {
   }
 
   async function removeMember(userId, name) {
-    if (!confirm(`Remove ${name} from this workspace? They will lose access immediately.`)) return;
+    const ok = confirm(
+      `Remove ${name} from this workspace?\n\n` +
+      `• They lose access immediately.\n` +
+      `• Their drafts, comments, and chat messages are deleted.\n` +
+      `• Mailboxes, tasks, and canned responses they created are transferred to you.\n\n` +
+      `This cannot be undone.`
+    );
+    if (!ok) return;
     try {
       await api(`/api/auth/team/${userId}`, { method: 'DELETE' });
       load();
