@@ -25,7 +25,7 @@ router.get('/', wrap(async (req, res) => {
                        WHERE tl.thread_id = t.id), '[]'::json
                     ) AS labels,
                     coalesce(
-                      (SELECT array_to_json(array_agg(DISTINCT ea.email))
+                      (SELECT json_agg(DISTINCT jsonb_build_object('email', ea.email, 'name', ea.display_name))
                        FROM messages m JOIN email_accounts ea ON ea.id = m.account_id
                        WHERE m.thread_id = t.id), '[]'::json
                     ) AS account_emails
@@ -73,7 +73,7 @@ router.get('/:id', wrap(async (req, res) => {
                WHERE tl.thread_id = t.id), '[]'::json
             ) AS labels,
             coalesce(
-              (SELECT array_to_json(array_agg(DISTINCT ea.email))
+              (SELECT json_agg(DISTINCT jsonb_build_object('email', ea.email, 'name', ea.display_name))
                FROM messages m JOIN email_accounts ea ON ea.id = m.account_id
                WHERE m.thread_id = t.id), '[]'::json
             ) AS account_emails
@@ -83,7 +83,7 @@ router.get('/:id', wrap(async (req, res) => {
   );
   if (!t) return res.status(404).json({ error: 'not found' });
   const messages = await many(
-    `SELECT m.*, ea.email AS account_email
+    `SELECT m.*, ea.email AS account_email, ea.display_name AS account_name
      FROM messages m
      LEFT JOIN email_accounts ea ON ea.id = m.account_id
      WHERE m.thread_id = $1 ORDER BY m.sent_at ASC`,

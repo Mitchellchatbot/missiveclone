@@ -120,9 +120,15 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
           <div className="muted small ellipsis">{thread.participants}</div>
           {(thread.account_emails && thread.account_emails.length > 0) && (
             <div className="tv-mailboxes">
-              {thread.account_emails.map(em => (
-                <span key={em} className="account-chip">📧 {em}</span>
-              ))}
+              {thread.account_emails.map(a => {
+                const email = typeof a === 'string' ? a : a.email;
+                const name = typeof a === 'string' ? null : a.name;
+                return (
+                  <span key={email} className="account-chip" title={email}>
+                    📧 {name ? `${name} (${email})` : email}
+                  </span>
+                );
+              })}
             </div>
           )}
           {(thread.labels && thread.labels.length > 0) && (
@@ -211,7 +217,11 @@ function MessageBlock({ m }) {
           <div><strong>{senderName}</strong> <span className="muted small">to {m.to_addrs}</span></div>
           <div className="muted xs">
             {fmtFull(m.sent_at)}
-            {m.account_email && <span className="account-chip" style={{ marginLeft: 6 }}>via {m.account_email}</span>}
+            {m.account_email && (
+              <span className="account-chip" style={{ marginLeft: 6 }} title={m.account_email}>
+                via {m.account_name ? `${m.account_name} (${m.account_email})` : m.account_email}
+              </span>
+            )}
           </div>
         </div>
       </div>
