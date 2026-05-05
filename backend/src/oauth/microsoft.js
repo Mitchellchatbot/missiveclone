@@ -6,15 +6,15 @@ const CLIENT_ID = process.env.MICROSOFT_CLIENT_ID;
 const CLIENT_SECRET = process.env.MICROSOFT_CLIENT_SECRET;
 const REDIRECT_URI = process.env.MICROSOFT_REDIRECT_URI;
 
-// We request scopes from BOTH Outlook (for IMAP) and Microsoft Graph
-// (for sendMail). The token endpoint will return one access token per
-// request — that's fine: the refresh token covers every consented scope,
-// so we can mint resource-specific tokens on demand later (see
-// getAccessTokenForResource below).
+// Microsoft's v2.0 endpoint rejects multi-resource scopes at the authorize
+// step (AADSTS28000). We request only IMAP at sign-in; the refresh token
+// returned can then mint tokens for ANY admin-consented permission via the
+// /token endpoint with grant_type=refresh_token (see
+// getAccessTokenForResource). The Graph Mail.Send permission has already
+// been admin-consented in the Azure app registration for the tenant, so
+// cross-resource refresh just works.
 const SCOPES = [
   'https://outlook.office.com/IMAP.AccessAsUser.All',
-  'https://graph.microsoft.com/Mail.Send',
-  'https://graph.microsoft.com/Mail.ReadWrite',
   'offline_access',
   'openid', 'profile', 'email'
 ].join(' ');
