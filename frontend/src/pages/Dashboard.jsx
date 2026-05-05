@@ -19,6 +19,7 @@ import AccountModal from '../components/AccountModal.jsx';
 import OnboardingScreen from '../components/OnboardingScreen.jsx';
 import CategoryBar from '../components/CategoryBar.jsx';
 import BulkActionBar from '../components/BulkActionBar.jsx';
+import InboxSearchBar from '../components/InboxSearchBar.jsx';
 import { api } from '../api';
 import { getSocket, disconnectSocket } from '../socket';
 
@@ -292,6 +293,23 @@ export default function Dashboard({ me, onLogout }) {
 
         {view === 'mail' && (
           <>
+            <InboxSearchBar
+              value={search}
+              onChange={setSearch}
+              placeholder={
+                filter.mine ? 'Search your inbox…' :
+                currentTeamSpace ? `Search ${currentTeamSpace.name}…` :
+                filter.starred ? 'Search starred…' :
+                filter.label_id ? 'Search this label…' :
+                filter.category ? 'Search filtered…' :
+                'Search all conversations…'
+              }
+              scopeLabel={
+                filter.mine ? 'My inbox' :
+                currentTeamSpace ? currentTeamSpace.name :
+                null
+              }
+            />
             <CategoryBar filter={filter} setFilter={setFilter} />
             {selectedThreadIds.size > 0 && (
               <BulkActionBar
