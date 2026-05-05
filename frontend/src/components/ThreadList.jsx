@@ -46,6 +46,9 @@ export default function ThreadList({ threads, selectedId, onSelect }) {
               <div className="thread-subject ellipsis">{t.subject || '(no subject)'}</div>
               <div className="thread-row-bottom">
                 <div className="thread-tags">
+                  {(t.account_emails || []).map(em => (
+                    <span key={em} className="account-chip" title={em}>📧 {em}</span>
+                  ))}
                   {statusBadge(t.status)}
                   {t.assignee_name && <span className="badge badge-assignee">@{t.assignee_name}</span>}
                   {(t.labels || []).map(l => (

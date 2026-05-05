@@ -118,6 +118,13 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
         <div className="tv-header-main">
           <div className="tv-subject">{thread.subject || '(no subject)'}</div>
           <div className="muted small ellipsis">{thread.participants}</div>
+          {(thread.account_emails && thread.account_emails.length > 0) && (
+            <div className="tv-mailboxes">
+              {thread.account_emails.map(em => (
+                <span key={em} className="account-chip">📧 {em}</span>
+              ))}
+            </div>
+          )}
           {(thread.labels && thread.labels.length > 0) && (
             <div className="tv-labels">
               {thread.labels.map(l => (
@@ -202,7 +209,10 @@ function MessageBlock({ m }) {
         <Avatar name={senderName} size={36} />
         <div className="msg-head-main">
           <div><strong>{senderName}</strong> <span className="muted small">to {m.to_addrs}</span></div>
-          <div className="muted xs">{fmtFull(m.sent_at)}</div>
+          <div className="muted xs">
+            {fmtFull(m.sent_at)}
+            {m.account_email && <span className="account-chip" style={{ marginLeft: 6 }}>via {m.account_email}</span>}
+          </div>
         </div>
       </div>
       {safeHtml

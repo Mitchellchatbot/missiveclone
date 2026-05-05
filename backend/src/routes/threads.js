@@ -23,7 +23,12 @@ router.get('/', wrap(async (req, res) => {
                       (SELECT json_agg(json_build_object('id', l.id, 'name', l.name, 'color', l.color))
                        FROM thread_labels tl JOIN labels l ON l.id = tl.label_id
                        WHERE tl.thread_id = t.id), '[]'::json
-                    ) AS labels
+                    ) AS labels,
+                    coalesce(
+                      (SELECT array_to_json(array_agg(DISTINCT ea.email))
+                       FROM messages m JOIN email_accounts ea ON ea.id = m.account_id
+                       WHERE m.thread_id = t.id), '[]'::json
+                    ) AS account_emails
              FROM threads t
              LEFT JOIN users u ON u.id = t.assignee_id
              WHERE t.workspace_id = $1`;
@@ -66,14 +71,22 @@ router.get('/:id', wrap(async (req, res) => {
               (SELECT json_agg(json_build_object('id', l.id, 'name', l.name, 'color', l.color))
                FROM thread_labels tl JOIN labels l ON l.id = tl.label_id
                WHERE tl.thread_id = t.id), '[]'::json
-            ) AS labels
+            ) AS labels,
+            coalesce(
+              (SELECT array_to_json(array_agg(DISTINCT ea.email))
+               FROM messages m JOIN email_accounts ea ON ea.id = m.account_id
+               WHERE m.thread_id = t.id), '[]'::json
+            ) AS account_emails
      FROM threads t LEFT JOIN users u ON u.id = t.assignee_id
      WHERE t.id = $1 AND t.workspace_id = $2`,
     [req.params.id, req.user.workspace_id]
   );
   if (!t) return res.status(404).json({ error: 'not found' });
   const messages = await many(
-    'SELECT * FROM messages WHERE thread_id = $1 ORDER BY sent_at ASC',
+    `SELECT m.*, ea.email AS account_email
+     FROM messages m
+     LEFT JOIN email_accounts ea ON ea.id = m.account_id
+     WHERE m.thread_id = $1 ORDER BY m.sent_at ASC`,
     [t.id]
   );
   const messageIds = messages.map(m => m.id);
