@@ -8,13 +8,37 @@ import Avatar from './Avatar.jsx';
 
 function fmtFull(ts) { return new Date(Number(ts)).toLocaleString(); }
 
-function sanitize(html) {
+// Sanitize for iframe rendering. We KEEP style attributes (emails depend on
+// them for layout) and KEEP <style> blocks — the iframe sandbox is the real
+// isolation boundary, not DOMPurify. We still strip scripts, forms, and
+// inline event handlers as defense-in-depth.
+function sanitizeForIframe(html) {
   return DOMPurify.sanitize(html, {
     USE_PROFILES: { html: true },
-    FORBID_TAGS: ['style', 'script', 'iframe', 'object', 'embed', 'link', 'meta', 'form', 'input'],
-    FORBID_ATTR: ['style', 'onerror', 'onclick', 'onload', 'onmouseover'],
+    FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form', 'input', 'meta', 'link'],
+    FORBID_ATTR: ['onerror', 'onclick', 'onload', 'onmouseover', 'onfocus', 'onblur', 'onsubmit'],
     ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel|cid):|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$))/i
   });
+}
+
+// Wrap the sanitized HTML into a complete document so the iframe renders it
+// with our base styles. <base target="_blank"> makes every link open in a
+// new tab, which is what email clients do.
+function buildEmailDoc(rawHtml) {
+  const safe = sanitizeForIframe(rawHtml || '');
+  return `<!doctype html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<base target="_blank">
+<style>
+  body { margin: 0; padding: 12px 14px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 14px; line-height: 1.55; color: #101828; word-wrap: break-word; }
+  img { max-width: 100% !important; height: auto !important; }
+  table { max-width: 100% !important; }
+  a { color: #2f6feb; }
+  pre, code { white-space: pre-wrap; word-break: break-word; }
+  blockquote { border-left: 3px solid #d0d7de; padding-left: 10px; color: #59636e; margin: 8px 0; }
+</style>
+</head><body>${safe}</body></html>`;
 }
 
 function fmtSize(b) {
@@ -207,8 +231,22 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
 }
 
 function MessageBlock({ m }) {
-  const safeHtml = useMemo(() => m.body_html ? sanitize(m.body_html) : null, [m.body_html]);
+  const docHtml = useMemo(() => m.body_html ? buildEmailDoc(m.body_html) : null, [m.body_html]);
   const senderName = m.direction === 'outbound' ? (m.from_addr ? nameFromAddr(m.from_addr) : 'You') : nameFromAddr(m.from_addr) || 'Unknown';
+
+  function autoResize(e) {
+    try {
+      const doc = e.target.contentDocument;
+      if (doc && doc.body) {
+        const h = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
+        e.target.style.height = Math.min(h + 24, 1500) + 'px';
+      }
+    } catch {
+      // Cross-origin — sandbox without allow-same-origin. Use a safe default.
+      e.target.style.height = '500px';
+    }
+  }
+
   return (
     <div className={'msg msg-' + m.direction}>
       <div className="msg-head">
@@ -225,8 +263,16 @@ function MessageBlock({ m }) {
           </div>
         </div>
       </div>
-      {safeHtml
-        ? <div className="msg-body" dangerouslySetInnerHTML={{ __html: safeHtml }} />
+      {docHtml
+        ? (
+          <iframe
+            className="msg-iframe"
+            sandbox="allow-popups allow-popups-to-escape-sandbox allow-same-origin"
+            srcDoc={docHtml}
+            onLoad={autoResize}
+            title="Email content"
+          />
+        )
         : <pre className="msg-body">{m.body_text}</pre>}
       {m.attachments && m.attachments.length > 0 && (
         <div className="att-list">

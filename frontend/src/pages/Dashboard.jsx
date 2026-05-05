@@ -17,6 +17,7 @@ import ComposeNew from '../components/ComposeNew.jsx';
 import WorkspaceModal from '../components/WorkspaceModal.jsx';
 import AccountModal from '../components/AccountModal.jsx';
 import OnboardingScreen from '../components/OnboardingScreen.jsx';
+import CategoryBar from '../components/CategoryBar.jsx';
 import { api } from '../api';
 import { getSocket, disconnectSocket } from '../socket';
 
@@ -187,16 +188,19 @@ export default function Dashboard({ me, onLogout }) {
         )}
 
         {view === 'mail' && (
-          <div className="mail-grid">
-            <ThreadList threads={threads} selectedId={selectedId} onSelect={setSelectedId} />
-            <ThreadView
-              threadId={selectedId}
-              me={me.user}
-              team={team}
-              accounts={accounts}
-              onChanged={loadThreads}
-            />
-          </div>
+          <>
+            <CategoryBar filter={filter} setFilter={setFilter} />
+            <div className="mail-grid">
+              <ThreadList threads={threads} selectedId={selectedId} onSelect={setSelectedId} />
+              <ThreadView
+                threadId={selectedId}
+                me={me.user}
+                team={team}
+                accounts={accounts}
+                onChanged={loadThreads}
+              />
+            </div>
+          </>
         )}
 
         {view === 'chat' && <ChatView me={me.user} team={team} />}
