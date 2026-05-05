@@ -15,6 +15,31 @@ const upload = multer({
   limits: { fileSize: 25 * 1024 * 1024, fieldSize: 10 * 1024 * 1024 }
 });
 
+// Parse Gmail-style search operators out of a query string.
+// Supported: from:, to:, subject:, has:attachment, is:(starred|open|closed|
+//            pending|snoozed), label:NAME, before:YYYY-MM-DD, after:YYYY-MM-DD.
+// Anything else becomes free-text matched against the existing tsvector.
+function parseSearch(q) {
+  const filters = {};
+  const tokens = [];
+  if (!q) return { filters, freeText: '' };
+  // Match: key:"quoted value" | key:value | "quoted free text" | bare-word
+  const re = /(\w+):"([^"]*)"|(\w+):(\S+)|"([^"]*)"|(\S+)/g;
+  let m;
+  while ((m = re.exec(q)) !== null) {
+    if (m[1] !== undefined && m[2] !== undefined) {
+      filters[m[1].toLowerCase()] = m[2];
+    } else if (m[3] !== undefined && m[4] !== undefined) {
+      filters[m[3].toLowerCase()] = m[4];
+    } else if (m[5] !== undefined) {
+      tokens.push(m[5]);
+    } else if (m[6] !== undefined) {
+      tokens.push(m[6]);
+    }
+  }
+  return { filters, freeText: tokens.join(' ').trim() };
+}
+
 // Smart-filter SQL fragments. Each takes no parameters; they're plain
 // pattern matches. Heuristic, not perfect — good enough to cut through noise.
 const CATEGORY_CLAUSES = {
@@ -126,10 +151,59 @@ router.get('/', wrap(async (req, res) => {
     params.push(folder);
     sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id AND m.folder = $${params.length})`;
   }
+  // Parse any operators out of the query. Each operator becomes its own
+  // SQL clause; whatever's left is free-text run against tsvector.
   if (q && q.trim()) {
-    params.push(q.trim());
-    const i = params.length;
-    sql += ` AND to_tsvector('simple', coalesce(t.search_text, '')) @@ plainto_tsquery('simple', $${i})`;
+    const { filters: ops, freeText } = parseSearch(q.trim());
+
+    if (ops.from) {
+      params.push(`%${ops.from}%`);
+      sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND mm.from_addr ILIKE $${params.length})`;
+    }
+    if (ops.to) {
+      params.push(`%${ops.to}%`);
+      sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND mm.to_addrs ILIKE $${params.length})`;
+    }
+    if (ops.subject) {
+      params.push(`%${ops.subject}%`);
+      sql += ` AND t.subject ILIKE $${params.length}`;
+    }
+    if ((ops.has || '').toLowerCase().startsWith('attach')) {
+      sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND mm.has_attachments = 1)`;
+    }
+    const isVal = (ops.is || '').toLowerCase();
+    if (isVal === 'starred')  sql += ` AND t.starred = 1`;
+    if (isVal === 'open')     sql += ` AND t.status = 'open'`;
+    if (isVal === 'closed')   sql += ` AND t.status = 'closed'`;
+    if (isVal === 'pending')  sql += ` AND t.status = 'pending'`;
+    if (isVal === 'snoozed')  {
+      params.push(Date.now());
+      sql += ` AND t.snoozed_until IS NOT NULL AND t.snoozed_until > $${params.length}`;
+    }
+    if (ops.label) {
+      params.push(ops.label);
+      sql += ` AND EXISTS (SELECT 1 FROM thread_labels tl JOIN labels l ON l.id = tl.label_id
+                           WHERE tl.thread_id = t.id AND l.name ILIKE $${params.length})`;
+    }
+    if (ops.before) {
+      const ts = Date.parse(ops.before);
+      if (!isNaN(ts)) {
+        params.push(ts);
+        sql += ` AND t.last_message_at < $${params.length}`;
+      }
+    }
+    if (ops.after) {
+      const ts = Date.parse(ops.after);
+      if (!isNaN(ts)) {
+        params.push(ts);
+        sql += ` AND t.last_message_at > $${params.length}`;
+      }
+    }
+
+    if (freeText) {
+      params.push(freeText);
+      sql += ` AND to_tsvector('simple', coalesce(t.search_text, '')) @@ plainto_tsquery('simple', $${params.length})`;
+    }
   }
   sql += ' ORDER BY t.last_message_at DESC LIMIT 200';
   const rows = await many(sql, params);
