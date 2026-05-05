@@ -57,8 +57,12 @@ router.get('/callback', wrap(async (req, res) => {
   try { tokens = await ms.exchangeCodeForTokens(code); }
   catch (e) { return fail('Token exchange failed', e.message); }
 
-  const profile = await ms.fetchProfile(tokens.access_token);
-  if (!profile) return fail('Failed to read Microsoft profile');
+  const profile = await ms.fetchProfile(tokens);
+  if (!profile) return fail('Failed to read Microsoft profile', JSON.stringify({
+    has_id_token: !!tokens.id_token,
+    has_access_token: !!tokens.access_token,
+    scope: tokens.scope
+  }, null, 2));
   const email = (profile.mail || profile.userPrincipalName || '').toLowerCase();
   if (!email) return fail('Microsoft profile has no email');
 

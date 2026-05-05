@@ -6,12 +6,16 @@ const CLIENT_ID = process.env.MICROSOFT_CLIENT_ID;
 const CLIENT_SECRET = process.env.MICROSOFT_CLIENT_SECRET;
 const REDIRECT_URI = process.env.MICROSOFT_REDIRECT_URI;
 
+// IMPORTANT: only request scopes from a single resource here. Mixing Graph
+// (User.Read) and Outlook (IMAP/SMTP) makes Microsoft issue a token valid
+// for only one of them, which silently breaks Graph calls. We use the
+// id_token (openid claims) to read the user's profile instead — no extra
+// API call needed.
 const SCOPES = [
   'https://outlook.office.com/IMAP.AccessAsUser.All',
   'https://outlook.office.com/SMTP.Send',
   'offline_access',
-  'openid', 'profile', 'email',
-  'User.Read'
+  'openid', 'profile', 'email'
 ].join(' ');
 
 function isConfigured() {
@@ -73,11 +77,56 @@ async function refreshTokens(refreshToken) {
   return body;
 }
 
-async function fetchProfile(accessToken) {
-  const r = await fetch('https://graph.microsoft.com/v1.0/me', {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-  return r.ok ? await r.json() : null;
+// Decode the JWT id_token (without verifying signature — Microsoft already
+// authenticated the token via the channel it came in on). Returns the
+// claims object: { email, name, preferred_username, oid, ... }.
+function decodeIdToken(idToken) {
+  if (!idToken || typeof idToken !== 'string') return null;
+  const parts = idToken.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const json = Buffer.from(
+      parts[1].replace(/-/g, '+').replace(/_/g, '/'),
+      'base64'
+    ).toString('utf8');
+    return JSON.parse(json);
+  } catch { return null; }
+}
+
+// Fallback: Outlook REST API works with our Outlook-resource access token.
+async function fetchOutlookProfile(accessToken) {
+  try {
+    const r = await fetch('https://outlook.office.com/api/v2.0/me', {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return {
+      mail: j.EmailAddress,
+      userPrincipalName: j.EmailAddress,
+      displayName: j.DisplayName
+    };
+  } catch { return null; }
+}
+
+// Combined: prefer id_token claims, fall back to Outlook REST.
+async function fetchProfile(tokens) {
+  const claims = decodeIdToken(tokens.id_token);
+  if (claims) {
+    const email = claims.email || claims.preferred_username || claims.upn;
+    if (email) {
+      return {
+        mail: email,
+        userPrincipalName: email,
+        displayName: claims.name || email
+      };
+    }
+  }
+  if (tokens.access_token) {
+    const p = await fetchOutlookProfile(tokens.access_token);
+    if (p) return p;
+  }
+  return null;
 }
 
 // Returns a fresh access token for an account, refreshing if needed.
