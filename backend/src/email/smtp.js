@@ -5,6 +5,15 @@ const { decrypt } = require('../crypto');
 const { appendToSentFolder } = require('./imap');
 const ms = require('../oauth/microsoft');
 
+// Reasonable timeouts so a stuck SMTP server fails fast (vs nodemailer's
+// default of ~10 min). The user gets a real error instead of a frozen Send
+// button.
+const SMTP_TIMEOUTS = {
+  connectionTimeout: 20 * 1000,   // initial TCP connect
+  greetingTimeout:   20 * 1000,   // server's HELO response
+  socketTimeout:     45 * 1000    // any single socket operation
+};
+
 async function buildTransport(acc) {
   if (acc.provider === 'microsoft') {
     const accessToken = await ms.ensureFreshAccessToken(acc);
@@ -17,14 +26,16 @@ async function buildTransport(acc) {
         type: 'OAuth2',
         user: acc.email,
         accessToken
-      }
+      },
+      ...SMTP_TIMEOUTS
     });
   }
   return nodemailer.createTransport({
     host: acc.smtp_host,
     port: acc.smtp_port,
     secure: !!acc.smtp_secure,
-    auth: { user: acc.smtp_user, pass: decrypt(acc.smtp_pass) }
+    auth: { user: acc.smtp_user, pass: decrypt(acc.smtp_pass) },
+    ...SMTP_TIMEOUTS
   });
 }
 
@@ -67,7 +78,29 @@ async function sendEmail(accountId, { to, cc, bcc, subject, text, html, inReplyT
   };
 
   // Send via SMTP.
-  const info = await tx.sendMail(mail);
+  let info;
+  try {
+    info = await tx.sendMail(mail);
+  } catch (e) {
+    const msg = (e.message || '').toLowerCase();
+    let hint = '';
+    if (msg.includes('5.7.139') || msg.includes('smtp client was not authenticated') ||
+        msg.includes('smtpsendnotauthorized') || msg.includes('smtp auth')) {
+      hint = ' SMTP AUTH appears disabled for this Microsoft 365 mailbox. ' +
+        'Microsoft turns it off by default. Fix: admin.microsoft.com → Users → ' +
+        acc.email + ' → Mail → Manage email apps → enable "Authenticated SMTP", ' +
+        'then disconnect & reconnect the mailbox in this app.';
+    } else if (msg.includes('authentication unsuccessful') || msg.includes('5.7.3')) {
+      hint = ' Authentication failed. Try disconnecting and reconnecting the mailbox.';
+    } else if (msg.includes('timeout') || msg.includes('etimedout') || msg.includes('econnrefused')) {
+      hint = ' SMTP connection timed out or was refused. The SMTP host may be blocking the request.';
+    } else if (msg.includes('5.2.1')) {
+      hint = ' Recipient mailbox unavailable.';
+    }
+    const err = new Error(e.message + (hint ? ' —' + hint : ''));
+    err.original = e;
+    throw err;
+  }
 
   // Best-effort: append the same message to the IMAP Sent folder so it shows
   // up in webmail UIs. Skip for hosts whose SMTP auto-saves to Sent
