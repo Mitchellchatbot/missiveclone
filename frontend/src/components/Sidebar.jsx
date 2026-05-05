@@ -28,7 +28,13 @@ const I = {
   zzz:      'M4 4h12l-12 16h12 M14 4l6 0 M14 12l6 0 M14 20l6 0',
   tag:      'M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z M7 7h.01',
   pencilSquare: 'M12 20h9 M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z',
-  scheduled: 'M12 8v4l3 3 M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z'
+  scheduled: 'M12 8v4l3 3 M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z',
+  shield:   'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z',
+  bell:     'M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9 M13.73 21a2 2 0 0 1-3.46 0',
+  receipt:  'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z M14 2v6h6 M16 13H8 M16 17H8 M10 9H8',
+  cal:      'M19 4H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z M16 2v4 M8 2v4 M3 10h18',
+  users:    'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M23 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75',
+  alert:    'M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z M12 9v4 M12 17h.01'
 };
 
 export default function Sidebar({
@@ -64,7 +70,9 @@ export default function Sidebar({
     (filter.assignee || null) === (key.assignee || null) &&
     (filter.folder || null) === (key.folder || null) &&
     (filter.snoozed || false) === (key.snoozed || false) &&
-    (filter.label_id || null) === (key.label_id || null);
+    (filter.label_id || null) === (key.label_id || null) &&
+    (filter.mine || false) === (key.mine || false) &&
+    (filter.category || null) === (key.category || null);
 
   const inboxItem = (label, iconKey, key, tsId) => (
     <div
@@ -100,6 +108,32 @@ export default function Sidebar({
           onChange={e => setSearch(e.target.value)}
         />
       </div>
+
+      <div className="side-section-title">Personal</div>
+      <div
+        className={'side-item ' + (view === 'mail' && filter.mine && !filter.category ? 'active' : '')}
+        onClick={() => { setView('mail'); setCurrentTeamSpaceId(null); setFilter({ status: '', assignee: null, folder: null, mine: true }); }}
+      >
+        <Icon d={I.user} /><span>My inbox</span>
+      </div>
+
+      <div className="side-section-title">Smart filters</div>
+      {[
+        { key: 'codes',       label: 'Verification codes', icon: 'shield' },
+        { key: 'newsletters', label: 'Newsletters & no-reply', icon: 'bell' },
+        { key: 'receipts',    label: 'Receipts & orders', icon: 'receipt' },
+        { key: 'calendar',    label: 'Calendar invites', icon: 'cal' },
+        { key: 'people',      label: 'Real conversations', icon: 'users' },
+        { key: 'bounces',     label: 'Delivery failures', icon: 'alert' }
+      ].map(c => (
+        <div
+          key={c.key}
+          className={'side-item ' + (view === 'mail' && filter.category === c.key ? 'active' : '')}
+          onClick={() => { setView('mail'); setFilter({ ...filter, category: c.key, status: '', assignee: null, folder: null, snoozed: false, label_id: null }); }}
+        >
+          <Icon d={I[c.icon]} /><span>{c.label}</span>
+        </div>
+      ))}
 
       <div className="side-section-title">Team spaces
         <button className="link" onClick={onManageTeamSpaces}>Manage</button>

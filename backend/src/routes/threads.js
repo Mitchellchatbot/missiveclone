@@ -15,8 +15,57 @@ const upload = multer({
   limits: { fileSize: 25 * 1024 * 1024, fieldSize: 10 * 1024 * 1024 }
 });
 
+// Smart-filter SQL fragments. Each takes no parameters; they're plain
+// pattern matches. Heuristic, not perfect — good enough to cut through noise.
+const CATEGORY_CLAUSES = {
+  codes: `(t.subject ILIKE '%verif%' OR t.subject ILIKE '%verify%'
+       OR t.subject ILIKE '%code%' OR t.subject ILIKE '%OTP%'
+       OR t.subject ILIKE '%one-time%' OR t.subject ILIKE '%one time%'
+       OR t.subject ILIKE '%password%' OR t.subject ILIKE '%authent%'
+       OR t.subject ILIKE '%sign-in%' OR t.subject ILIKE '%sign in%'
+       OR t.subject ILIKE '%login%' OR t.subject ILIKE '%log in%'
+       OR t.subject ILIKE '%2FA%' OR t.subject ILIKE '%two-factor%'
+       OR t.subject ILIKE '%security alert%' OR t.subject ILIKE '%confirm%email%')`,
+
+  newsletters: `EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND (
+       mm.from_addr ILIKE '%noreply%' OR mm.from_addr ILIKE '%no-reply%'
+       OR mm.from_addr ILIKE '%no_reply%' OR mm.from_addr ILIKE '%donotreply%'
+       OR mm.from_addr ILIKE '%do-not-reply%' OR mm.from_addr ILIKE '%newsletter%'
+       OR mm.from_addr ILIKE '%mailer@%' OR mm.from_addr ILIKE '%notifications@%'
+       OR mm.from_addr ILIKE '%alerts@%' OR mm.from_addr ILIKE '%marketing@%'
+       OR mm.from_addr ILIKE '%updates@%' OR mm.from_addr ILIKE '%digest@%'
+     ))`,
+
+  receipts: `(t.subject ILIKE '%receipt%' OR t.subject ILIKE '%invoice%'
+       OR t.subject ILIKE '%your order%' OR t.subject ILIKE '%order #%'
+       OR t.subject ILIKE '%payment%' OR t.subject ILIKE '%purchase%'
+       OR t.subject ILIKE '%paid%' OR t.subject ILIKE '%charge%'
+       OR t.subject ILIKE '%subscription%' OR t.subject ILIKE '%refund%'
+       OR t.subject ILIKE '%transaction%' OR t.subject ILIKE '%billing%')`,
+
+  calendar: `(t.subject ILIKE 'invitation:%' OR t.subject ILIKE '%accepted: %'
+       OR t.subject ILIKE '%declined: %' OR t.subject ILIKE '%canceled: %'
+       OR t.subject ILIKE '%cancelled: %' OR t.subject ILIKE '%meeting%'
+       OR t.subject ILIKE '%calendar%' OR t.subject ILIKE '%appointment%'
+       OR t.subject ILIKE '%reschedul%' OR t.subject ILIKE 'event: %'
+       OR t.subject ILIKE '%zoom meeting%' OR t.subject ILIKE '%google meet%'
+       OR t.subject ILIKE '%teams meeting%')`,
+
+  people: `NOT EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND (
+       mm.from_addr ILIKE '%noreply%' OR mm.from_addr ILIKE '%no-reply%'
+       OR mm.from_addr ILIKE '%donotreply%' OR mm.from_addr ILIKE '%do-not-reply%'
+       OR mm.from_addr ILIKE '%newsletter%' OR mm.from_addr ILIKE '%mailer-daemon%'
+       OR mm.from_addr ILIKE '%notifications@%' OR mm.from_addr ILIKE '%alerts@%'
+     ))`,
+
+  bounces: `(t.subject ILIKE '%delivery%failed%' OR t.subject ILIKE '%undeliverable%'
+       OR t.subject ILIKE '%mail delivery%' OR t.subject ILIKE '%delayed mail%'
+       OR t.subject ILIKE 'mailer-daemon%' OR t.subject ILIKE '%bounced%')`
+};
+
 router.get('/', wrap(async (req, res) => {
-  const { status, assignee, q, folder, team_space_id, snoozed, label_id } = req.query;
+  const { status, assignee, q, folder, team_space_id, snoozed, label_id,
+          mine, mailbox_id, category } = req.query;
   const params = [req.user.workspace_id];
   let sql = `SELECT t.*, u.name AS assignee_name,
                     coalesce(
@@ -47,6 +96,25 @@ router.get('/', wrap(async (req, res) => {
   if (label_id) {
     params.push(label_id);
     sql += ` AND EXISTS (SELECT 1 FROM thread_labels tl WHERE tl.thread_id = t.id AND tl.label_id = $${params.length})`;
+  }
+
+  // mine = 'true': filter to threads in mailboxes owned by the requesting user.
+  if (mine === 'true') {
+    params.push(req.user.id);
+    sql += ` AND EXISTS (SELECT 1 FROM messages mm
+                         JOIN email_accounts ea ON ea.id = mm.account_id
+                         WHERE mm.thread_id = t.id AND ea.user_id = $${params.length})`;
+  }
+
+  // mailbox_id: filter to threads touching one specific connected account.
+  if (mailbox_id) {
+    params.push(mailbox_id);
+    sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND mm.account_id = $${params.length})`;
+  }
+
+  // category: smart filter (codes / newsletters / receipts / etc.)
+  if (category && CATEGORY_CLAUSES[category]) {
+    sql += ` AND ${CATEGORY_CLAUSES[category]}`;
   }
   if (folder === 'SENT') {
     sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id AND m.direction = 'outbound')`;

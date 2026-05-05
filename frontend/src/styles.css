@@ -168,6 +168,16 @@ textarea { resize: vertical; }
   border-radius: 50%;
 }
 .presence-more { padding-left: 6px; }
+.mailbox-picker {
+  width: auto;
+  padding: 4px 8px;
+  font-size: 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  max-width: 240px;
+}
 .topbar-right { display: flex; align-items: center; gap: 12px; }
 .compose-top {
   background: var(--primary); color: white;

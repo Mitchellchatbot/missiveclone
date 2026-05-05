@@ -60,6 +60,9 @@ export default function Dashboard({ me, onLogout }) {
     if (filter.folder) params.set('folder', filter.folder);
     if (filter.snoozed) params.set('snoozed', 'true');
     if (filter.label_id) params.set('label_id', filter.label_id);
+    if (filter.mine) params.set('mine', 'true');
+    if (filter.category) params.set('category', filter.category);
+    if (filter.mailbox_id) params.set('mailbox_id', filter.mailbox_id);
     if (currentTeamSpaceId) params.set('team_space_id', currentTeamSpaceId);
     if (debouncedSearch) params.set('q', debouncedSearch);
     const res = await api('/api/threads?' + params.toString());
@@ -166,6 +169,10 @@ export default function Dashboard({ me, onLogout }) {
           me={me.user}
           view={view} setView={setView}
           currentTeamSpace={currentTeamSpace}
+          currentTeamSpaceId={currentTeamSpaceId}
+          accounts={accounts}
+          filter={filter}
+          setFilter={setFilter}
           onCompose={() => setShowCompose(true)}
         />
 
