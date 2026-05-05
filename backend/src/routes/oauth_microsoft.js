@@ -123,6 +123,20 @@ router.get('/callback', wrap(async (req, res) => {
     );
   }
 
+  // Re-link any orphaned messages from a previous connection of this same
+  // email. When a user disconnects + reconnects, messages get account_id =
+  // NULL (ON DELETE SET NULL on email_accounts FK). The My Inbox filter
+  // requires a non-null account_id to match through to a user, so without
+  // this re-link, the user sees an empty inbox until the next IMAP sync
+  // re-imports the messages with new UIDs.
+  const likeEmail = `%${email}%`;
+  await query(
+    `UPDATE messages SET account_id = $1
+     WHERE workspace_id = $2 AND account_id IS NULL
+       AND (to_addrs ILIKE $3 OR from_addr ILIKE $3 OR cc_addrs ILIKE $3)`,
+    [accountId, stateData.workspace_id, likeEmail]
+  );
+
   // Kick off initial sync (non-blocking).
   syncAccount(accountId)
     .then(() => startWatching(accountId))

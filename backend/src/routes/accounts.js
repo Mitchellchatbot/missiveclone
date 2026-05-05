@@ -62,6 +62,14 @@ router.post('/', wrap(async (req, res) => {
     ]
   );
 
+  // Re-link any orphaned messages from a previous connection of this email.
+  await query(
+    `UPDATE messages SET account_id = $1
+     WHERE workspace_id = $2 AND account_id IS NULL
+       AND (to_addrs ILIKE $3 OR from_addr ILIKE $3 OR cc_addrs ILIKE $3)`,
+    [id, req.user.workspace_id, `%${email}%`]
+  );
+
   syncAccount(id).then(() => startWatching(id)).catch(err => console.error('initial sync error', err));
   res.json({ id });
 }));
@@ -124,6 +132,24 @@ router.post('/:id/sync', wrap(async (req, res) => {
   if (!acc) return res.status(404).json({ error: 'not found' });
   const n = await syncAccount(acc.id);
   res.json({ ok: true, new_messages: n });
+}));
+
+// One-shot: re-link any messages whose account_id is NULL (from a previous
+// disconnect-then-reconnect) to this account if their headers mention this
+// email. Safe to call multiple times.
+router.post('/:id/relink-orphans', wrap(async (req, res) => {
+  const acc = await one(
+    'SELECT id, email FROM email_accounts WHERE id = $1 AND workspace_id = $2',
+    [req.params.id, req.user.workspace_id]
+  );
+  if (!acc) return res.status(404).json({ error: 'not found' });
+  const r = await query(
+    `UPDATE messages SET account_id = $1
+     WHERE workspace_id = $2 AND account_id IS NULL
+       AND (to_addrs ILIKE $3 OR from_addr ILIKE $3 OR cc_addrs ILIKE $3)`,
+    [acc.id, req.user.workspace_id, `%${acc.email}%`]
+  );
+  res.json({ ok: true, relinked: r.rowCount || 0 });
 }));
 
 router.get('/:id/signature', wrap(async (req, res) => {
