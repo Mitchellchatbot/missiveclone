@@ -16,10 +16,28 @@ export default function TopBar({
     return () => s.off('presence:update', onPresence);
   }, [me.name]);
 
-  // Mailboxes in the currently-selected team space (or all of them, if no space).
-  const accountsInScope = (accounts || []).filter(a =>
-    !currentTeamSpaceId || a.team_space_id === currentTeamSpaceId
-  );
+  // Mailboxes in scope:
+  // - My Inbox (filter.mine === true): only the current user's own mailboxes.
+  // - Team space: only mailboxes attached to that team space.
+  // - All conversations (no team space): every mailbox in the workspace.
+  const accountsInScope = (accounts || []).filter(a => {
+    if (filter && filter.mine) return a.user_id === me.id;
+    if (currentTeamSpaceId) return a.team_space_id === currentTeamSpaceId;
+    return true;
+  });
+
+  // Context line shows where the user is currently scoped.
+  const showMineContext = view === 'mail' && filter && filter.mine;
+  const showTeamSpaceContext = view === 'mail' && currentTeamSpace && !showMineContext;
+
+  // The picker is hidden in My Inbox (no meaningful choice — all results are
+  // already in your mailboxes) and only shows when there are 2+ mailboxes
+  // to choose between.
+  const showPicker =
+    view === 'mail' &&
+    !showMineContext &&
+    filter && setFilter &&
+    accountsInScope.length > 1;
 
   return (
     <div className="topbar">
@@ -31,10 +49,13 @@ export default function TopBar({
           <button className={'tab ' + (view === 'scheduled' ? 'active' : '')} onClick={() => setView('scheduled')}>Scheduled</button>
           <button className={'tab ' + (view === 'chat' ? 'active' : '')} onClick={() => setView('chat')}>Team chat</button>
         </div>
-        {view === 'mail' && currentTeamSpace && (
+        {showMineContext && (
+          <div className="topbar-context muted small">My inbox · <strong>{me.email}</strong></div>
+        )}
+        {showTeamSpaceContext && (
           <div className="topbar-context muted small">in <strong>{currentTeamSpace.name}</strong></div>
         )}
-        {view === 'mail' && filter && setFilter && accountsInScope.length > 1 && (
+        {showPicker && (
           <select
             className="mailbox-picker"
             value={filter.mailbox_id || ''}
