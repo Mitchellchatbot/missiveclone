@@ -265,6 +265,8 @@ textarea { resize: vertical; }
 .tv-labels { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .tv-mailboxes { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .tv-mailboxes .account-chip { margin-left: 0; }
+.tv-meta-row .account-chip { margin-left: 0; }
+.tv-meta-row .label-chip { margin-left: 0; }
 .color-picker { display: flex; gap: 6px; flex-wrap: wrap; }
 .color-swatch {
   width: 24px; height: 24px; border-radius: 50%;
@@ -565,15 +567,40 @@ textarea { resize: vertical; }
 .tv-header {
   position: sticky; top: 0;
   background: var(--surface);
-  padding: 14px 22px;
+  padding: 14px 22px 10px;
   border-bottom: 1px solid var(--border);
-  display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;
+  display: flex; flex-direction: column; gap: 8px;
   z-index: 10;
 }
-.tv-header-main { min-width: 0; flex: 1; }
-.tv-subject { font-size: 17px; font-weight: 600; letter-spacing: -0.01em; }
-.tv-controls { display: flex; gap: 8px; align-items: center; }
-.tv-controls select { width: auto; padding: 6px 8px; font-size: 12.5px; }
+.tv-header-top { display: flex; align-items: flex-start; gap: 12px; }
+.tv-header-main { flex: 1; min-width: 0; }
+.tv-subject {
+  font-size: 19px; font-weight: 600; letter-spacing: -0.01em;
+  line-height: 1.3;
+  word-break: break-word;
+}
+.tv-participants {
+  margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tv-reply-btn {
+  flex: 0 0 auto;
+  padding: 7px 16px;
+  font-size: 13px; font-weight: 500;
+}
+
+.tv-meta-row {
+  display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
+  padding: 2px 0;
+}
+
+.tv-actions-row {
+  display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  padding-top: 4px;
+}
+.tv-actions-row select { width: auto; padding: 5px 8px; font-size: 12.5px; }
+.tv-actions-row button { padding: 5px 10px; font-size: 12.5px; }
+.action-pop-wrap { position: relative; }
 .status-select.status-open { color: var(--success); border-color: #abefc6; background: #ecfdf3; }
 .status-select.status-pending { color: var(--warn); border-color: #fec84b; background: #fffaeb; }
 .status-select.status-closed { color: #475467; }

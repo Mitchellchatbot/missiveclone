@@ -139,34 +139,39 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
   return (
     <div className="thread-view">
       <div className="tv-header">
-        <div className="tv-header-main">
-          <div className="tv-subject">{thread.subject || '(no subject)'}</div>
-          <div className="muted small ellipsis">{thread.participants}</div>
-          {(thread.account_emails && thread.account_emails.length > 0) && (
-            <div className="tv-mailboxes">
-              {thread.account_emails.map(a => {
-                const email = typeof a === 'string' ? a : a.email;
-                const name = typeof a === 'string' ? null : a.name;
-                return (
-                  <span key={email} className="account-chip" title={email}>
-                    📧 {name ? `${name} (${email})` : email}
-                  </span>
-                );
-              })}
-            </div>
-          )}
-          {(thread.labels && thread.labels.length > 0) && (
-            <div className="tv-labels">
-              {thread.labels.map(l => (
-                <span key={l.id} className="label-chip" style={{ background: l.color }}>{l.name}</span>
-              ))}
-            </div>
-          )}
-          {isSnoozed && (
-            <div className="muted small">💤 Snoozed until {new Date(Number(thread.snoozed_until)).toLocaleString()} <button className="link" onClick={unsnooze}>unsnooze</button></div>
-          )}
+        <div className="tv-header-top">
+          <div className="tv-header-main">
+            <div className="tv-subject">{thread.subject || '(no subject)'}</div>
+            <div className="muted small tv-participants">{thread.participants}</div>
+          </div>
+          <button className="tv-reply-btn" onClick={() => setShowReply(s => !s)}>↩ Reply</button>
         </div>
-        <div className="tv-controls">
+
+        {((thread.account_emails && thread.account_emails.length > 0) ||
+          (thread.labels && thread.labels.length > 0) || isSnoozed) && (
+          <div className="tv-meta-row">
+            {(thread.account_emails || []).map(a => {
+              const email = typeof a === 'string' ? a : a.email;
+              const name = typeof a === 'string' ? null : a.name;
+              return (
+                <span key={email} className="account-chip" title={email}>
+                  📧 {name ? `${name} (${email})` : email}
+                </span>
+              );
+            })}
+            {(thread.labels || []).map(l => (
+              <span key={l.id} className="label-chip" style={{ background: l.color }}>{l.name}</span>
+            ))}
+            {isSnoozed && (
+              <span className="badge badge-pending">
+                💤 Snoozed until {new Date(Number(thread.snoozed_until)).toLocaleString()}
+                <button className="link" onClick={unsnooze} style={{ marginLeft: 6 }}>unsnooze</button>
+              </span>
+            )}
+          </div>
+        )}
+
+        <div className="tv-actions-row">
           <select value={thread.status} onChange={e => setStatus(e.target.value)} className={'status-select status-' + thread.status}>
             <option value="open">Open</option>
             <option value="pending">Pending</option>
@@ -176,7 +181,7 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
             <option value="">Unassigned</option>
             {team.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
           </select>
-          <div style={{ position: 'relative' }}>
+          <div className="action-pop-wrap">
             <button className="ghost" onClick={() => setShowLabel(s => !s)}>🏷 Label</button>
             {showLabel && (
               <div className="schedule-pop" onMouseLeave={() => setShowLabel(false)}>
@@ -190,7 +195,7 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
               </div>
             )}
           </div>
-          <div style={{ position: 'relative' }}>
+          <div className="action-pop-wrap">
             <button className="ghost" onClick={() => setShowSnooze(s => !s)}>💤 Snooze</button>
             {showSnooze && (
               <div className="schedule-pop" onMouseLeave={() => setShowSnooze(false)}>
@@ -202,7 +207,6 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged }) 
               </div>
             )}
           </div>
-          <button onClick={() => setShowReply(s => !s)}>↩ Reply</button>
         </div>
       </div>
 
