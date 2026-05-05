@@ -4,6 +4,7 @@ const { one } = require('../db');
 const { decrypt } = require('../crypto');
 const { appendToSentFolder } = require('./imap');
 const ms = require('../oauth/microsoft');
+const { sendEmailViaGraph } = require('./graph');
 
 // Reasonable timeouts so a stuck SMTP server fails fast (vs nodemailer's
 // default of ~10 min). The user gets a real error instead of a frozen Send
@@ -49,6 +50,14 @@ function compileRaw(mail) {
 async function sendEmail(accountId, { to, cc, bcc, subject, text, html, inReplyTo, references, attachments }) {
   const acc = await one('SELECT * FROM email_accounts WHERE id = $1', [accountId]);
   if (!acc) throw new Error('account not found');
+
+  // Microsoft accounts: send via Graph API (HTTPS + OAuth) instead of SMTP.
+  // Bypasses the per-tenant 'SMTP AUTH disabled' problem entirely. Each
+  // user just needs to OAuth — no admin needs to flip any switch.
+  if (acc.provider === 'microsoft') {
+    return sendEmailViaGraph(acc, { to, cc, bcc, subject, text, html, inReplyTo, references, attachments });
+  }
+
   const tx = await buildTransport(acc);
   const fromName = acc.display_name || acc.email;
   const headers = {};

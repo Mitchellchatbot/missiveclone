@@ -6,14 +6,15 @@ const CLIENT_ID = process.env.MICROSOFT_CLIENT_ID;
 const CLIENT_SECRET = process.env.MICROSOFT_CLIENT_SECRET;
 const REDIRECT_URI = process.env.MICROSOFT_REDIRECT_URI;
 
-// IMPORTANT: only request scopes from a single resource here. Mixing Graph
-// (User.Read) and Outlook (IMAP/SMTP) makes Microsoft issue a token valid
-// for only one of them, which silently breaks Graph calls. We use the
-// id_token (openid claims) to read the user's profile instead — no extra
-// API call needed.
+// We request scopes from BOTH Outlook (for IMAP) and Microsoft Graph
+// (for sendMail). The token endpoint will return one access token per
+// request — that's fine: the refresh token covers every consented scope,
+// so we can mint resource-specific tokens on demand later (see
+// getAccessTokenForResource below).
 const SCOPES = [
   'https://outlook.office.com/IMAP.AccessAsUser.All',
-  'https://outlook.office.com/SMTP.Send',
+  'https://graph.microsoft.com/Mail.Send',
+  'https://graph.microsoft.com/Mail.ReadWrite',
   'offline_access',
   'openid', 'profile', 'email'
 ].join(' ');
@@ -56,7 +57,7 @@ async function exchangeCodeForTokens(code) {
   return body;
 }
 
-async function refreshTokens(refreshToken) {
+async function refreshTokens(refreshToken, scope) {
   const res = await fetch(`https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -65,7 +66,7 @@ async function refreshTokens(refreshToken) {
       client_secret: CLIENT_SECRET,
       grant_type: 'refresh_token',
       refresh_token: refreshToken,
-      scope: SCOPES
+      scope: scope || SCOPES
     })
   });
   const body = await res.json();
@@ -75,6 +76,24 @@ async function refreshTokens(refreshToken) {
     throw err;
   }
   return body;
+}
+
+// Mint a fresh access token for a specific resource using the stored
+// refresh token. Used by Graph send (graph.microsoft.com) which is a
+// different resource from IMAP (outlook.office.com) — Microsoft only
+// issues tokens for one resource per request.
+async function getAccessTokenForResource(account, scope) {
+  if (!account.oauth_refresh_token) throw new Error('no refresh token on account');
+  const refresh = decrypt(account.oauth_refresh_token);
+  const tokens = await refreshTokens(refresh, scope);
+  // Microsoft sometimes rotates the refresh token; persist it if so.
+  if (tokens.refresh_token && tokens.refresh_token !== refresh) {
+    await query(
+      'UPDATE email_accounts SET oauth_refresh_token = $1 WHERE id = $2',
+      [encrypt(tokens.refresh_token), account.id]
+    );
+  }
+  return tokens.access_token;
 }
 
 // Decode the JWT id_token (without verifying signature — Microsoft already
@@ -129,7 +148,8 @@ async function fetchProfile(tokens) {
   return null;
 }
 
-// Returns a fresh access token for an account, refreshing if needed.
+// Returns a fresh access token for IMAP (outlook.office.com), refreshing
+// if needed. The cached token is for IMAP since that's what we use most.
 async function ensureFreshAccessToken(account) {
   if (!account.oauth_refresh_token) throw new Error('no refresh token on account');
 
@@ -138,7 +158,12 @@ async function ensureFreshAccessToken(account) {
     return decrypt(account.oauth_access_token);
   }
 
-  const tokens = await refreshTokens(decrypt(account.oauth_refresh_token));
+  // Refresh specifically for the IMAP resource so the cached token is usable
+  // for IMAP. Graph send uses getAccessTokenForResource() with its own scope.
+  const tokens = await refreshTokens(
+    decrypt(account.oauth_refresh_token),
+    'https://outlook.office.com/IMAP.AccessAsUser.All offline_access'
+  );
   const newAccess = tokens.access_token;
   const newRefresh = tokens.refresh_token || decrypt(account.oauth_refresh_token);
   const newExp = Date.now() + (tokens.expires_in - 60) * 1000;
@@ -155,5 +180,5 @@ async function ensureFreshAccessToken(account) {
 
 module.exports = {
   isConfigured, authorizeUrl, exchangeCodeForTokens, refreshTokens,
-  fetchProfile, ensureFreshAccessToken, SCOPES
+  fetchProfile, ensureFreshAccessToken, getAccessTokenForResource, SCOPES
 };
