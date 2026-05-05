@@ -16,6 +16,7 @@ import SignaturesModal from '../components/SignaturesModal.jsx';
 import ComposeNew from '../components/ComposeNew.jsx';
 import WorkspaceModal from '../components/WorkspaceModal.jsx';
 import AccountModal from '../components/AccountModal.jsx';
+import OnboardingScreen from '../components/OnboardingScreen.jsx';
 import { api } from '../api';
 import { getSocket, disconnectSocket } from '../socket';
 
@@ -39,6 +40,10 @@ export default function Dashboard({ me, onLogout }) {
   const [showCompose, setShowCompose] = useState(false);
   const [showWorkspace, setShowWorkspace] = useState(false);
   const [editAccountId, setEditAccountId] = useState(null);
+  const [accountsLoaded, setAccountsLoaded] = useState(false);
+  const [onboardingDismissed, setOnboardingDismissed] = useState(
+    () => localStorage.getItem('missive_clone_onboarding_dismissed') === '1'
+  );
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search), 250);
@@ -59,7 +64,9 @@ export default function Dashboard({ me, onLogout }) {
   }, [filter, currentTeamSpaceId, debouncedSearch]);
 
   const loadAccounts = useCallback(async () => {
-    const r = await api('/api/accounts'); setAccounts(r.accounts);
+    const r = await api('/api/accounts');
+    setAccounts(r.accounts);
+    setAccountsLoaded(true);
   }, []);
   const loadTeam = useCallback(async () => {
     const r = await api('/api/auth/team'); setTeam(r.members);
@@ -104,6 +111,23 @@ export default function Dashboard({ me, onLogout }) {
   }
 
   const currentTeamSpace = teamSpaces.find(t => t.id === currentTeamSpaceId) || null;
+
+  // First-run onboarding: full-screen takeover when the user has never
+  // connected a mailbox and hasn't explicitly skipped. Once they connect,
+  // accounts.length > 0 and this screen disappears automatically.
+  if (accountsLoaded && accounts.length === 0 && !onboardingDismissed) {
+    return (
+      <OnboardingScreen
+        me={me}
+        teamSpaces={teamSpaces}
+        onDone={loadAccounts}
+        onSkip={() => {
+          localStorage.setItem('missive_clone_onboarding_dismissed', '1');
+          setOnboardingDismissed(true);
+        }}
+      />
+    );
+  }
 
   return (
     <div className="app">
