@@ -66,4 +66,23 @@ router.get('/team', requireAuth, wrap(async (req, res) => {
   res.json({ members: rows });
 }));
 
+router.patch('/workspace', requireAuth, wrap(async (req, res) => {
+  const { name } = req.body || {};
+  if (!name || !name.trim()) return res.status(400).json({ error: 'name required' });
+  const { query } = require('../db');
+  await query('UPDATE workspaces SET name = $1 WHERE id = $2', [name.trim(), req.user.workspace_id]);
+  res.json({ ok: true });
+}));
+
+router.delete('/team/:userId', requireAuth, wrap(async (req, res) => {
+  if (req.params.userId === req.user.id) {
+    return res.status(400).json({ error: 'You cannot remove yourself' });
+  }
+  const { one, query } = require('../db');
+  const u = await one('SELECT id FROM users WHERE id = $1 AND workspace_id = $2', [req.params.userId, req.user.workspace_id]);
+  if (!u) return res.status(404).json({ error: 'not found' });
+  await query('DELETE FROM users WHERE id = $1', [u.id]);
+  res.json({ ok: true });
+}));
+
 module.exports = router;

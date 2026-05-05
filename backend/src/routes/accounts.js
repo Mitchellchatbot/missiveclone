@@ -65,6 +65,45 @@ router.post('/', wrap(async (req, res) => {
   res.json({ id });
 }));
 
+router.patch('/:id', wrap(async (req, res) => {
+  const { display_name, team_space_id, move_threads } = req.body || {};
+  const acc = await one(
+    'SELECT id, team_space_id FROM email_accounts WHERE id = $1 AND workspace_id = $2',
+    [req.params.id, req.user.workspace_id]
+  );
+  if (!acc) return res.status(404).json({ error: 'not found' });
+
+  // Validate team_space_id if provided.
+  if (team_space_id) {
+    const ts = await one(
+      'SELECT id FROM team_spaces WHERE id = $1 AND workspace_id = $2',
+      [team_space_id, req.user.workspace_id]
+    );
+    if (!ts) return res.status(400).json({ error: 'team_space_id invalid' });
+  }
+
+  const sets = [];
+  const params = [];
+  if (display_name !== undefined) { params.push(display_name || null); sets.push(`display_name = $${params.length}`); }
+  if (team_space_id !== undefined) { params.push(team_space_id || null); sets.push(`team_space_id = $${params.length}`); }
+  if (sets.length) {
+    params.push(acc.id);
+    await query(`UPDATE email_accounts SET ${sets.join(', ')} WHERE id = $${params.length}`, params);
+  }
+
+  // Optional: move all existing threads from this account to the new space too.
+  if (team_space_id !== undefined && (move_threads === undefined || move_threads === true)) {
+    await query(
+      `UPDATE threads SET team_space_id = $1
+       WHERE workspace_id = $2
+         AND id IN (SELECT DISTINCT m.thread_id FROM messages m WHERE m.account_id = $3)`,
+      [team_space_id || null, req.user.workspace_id, acc.id]
+    );
+  }
+
+  res.json({ ok: true });
+}));
+
 router.delete('/:id', wrap(async (req, res) => {
   const acc = await one(
     'SELECT id FROM email_accounts WHERE id = $1 AND workspace_id = $2',

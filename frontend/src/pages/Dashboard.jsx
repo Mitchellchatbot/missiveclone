@@ -14,6 +14,8 @@ import TeamSpaceModal from '../components/TeamSpaceModal.jsx';
 import LabelsModal from '../components/LabelsModal.jsx';
 import SignaturesModal from '../components/SignaturesModal.jsx';
 import ComposeNew from '../components/ComposeNew.jsx';
+import WorkspaceModal from '../components/WorkspaceModal.jsx';
+import AccountModal from '../components/AccountModal.jsx';
 import { api } from '../api';
 import { getSocket, disconnectSocket } from '../socket';
 
@@ -35,6 +37,8 @@ export default function Dashboard({ me, onLogout }) {
   const [showLabels, setShowLabels] = useState(false);
   const [showSigs, setShowSigs] = useState(false);
   const [showCompose, setShowCompose] = useState(false);
+  const [showWorkspace, setShowWorkspace] = useState(false);
+  const [editAccountId, setEditAccountId] = useState(null);
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search), 250);
@@ -114,12 +118,14 @@ export default function Dashboard({ me, onLogout }) {
         setCurrentTeamSpaceId={setCurrentTeamSpaceId}
         onManageTeamSpaces={() => setShowSpaces(true)}
         onAddAccount={() => setShowConnect(true)}
+        onEditAccount={(id) => setEditAccountId(id)}
         onSync={syncAll}
         onCompose={() => setShowCompose(true)}
         onLabels={() => setShowLabels(true)}
         onSignatures={() => setShowSigs(true)}
         onInvite={() => setShowInvite(true)}
         onCanned={() => setShowCanned(true)}
+        onWorkspace={() => setShowWorkspace(true)}
         onLogout={onLogout}
       />
 
@@ -130,6 +136,16 @@ export default function Dashboard({ me, onLogout }) {
           currentTeamSpace={currentTeamSpace}
           onCompose={() => setShowCompose(true)}
         />
+
+        {accounts.length === 0 && (
+          <div className="onboarding-banner">
+            <div>
+              <strong>👋 Welcome.</strong> You haven't connected an inbox yet.
+              Connect your Outlook (or any IMAP account) so your emails show up here.
+            </div>
+            <button onClick={() => setShowConnect(true)}>Connect inbox</button>
+          </div>
+        )}
 
         {view === 'mail' && (
           <div className="mail-grid">
@@ -178,6 +194,18 @@ export default function Dashboard({ me, onLogout }) {
               setSelectedId(r.thread_id);
             }
           }}
+        />
+      )}
+      {showWorkspace && (
+        <WorkspaceModal me={me.user} onClose={() => setShowWorkspace(false)} onChanged={() => { /* workspace reload can be added if needed */ }} />
+      )}
+      {editAccountId && (
+        <AccountModal
+          accountId={editAccountId}
+          accounts={accounts}
+          teamSpaces={teamSpaces}
+          onClose={() => setEditAccountId(null)}
+          onChanged={() => { loadAccounts(); loadTeamSpaces(); loadThreads(); }}
         />
       )}
     </div>

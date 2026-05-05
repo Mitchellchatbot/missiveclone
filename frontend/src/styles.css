@@ -271,6 +271,31 @@ textarea { resize: vertical; }
 /* err inline (for ScheduledView) */
 .err-inline { color: var(--danger); }
 
+/* onboarding banner */
+.onboarding-banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  background: var(--primary-soft);
+  border-bottom: 1px solid #cfe0ff;
+  padding: 12px 22px;
+  color: var(--text);
+  font-size: 13px;
+}
+.onboarding-banner button {
+  flex: 0 0 auto;
+  padding: 6px 14px;
+  font-size: 12.5px;
+}
+
+/* team space members editor inside TeamSpaceModal */
+.ts-members {
+  margin: 6px 0 12px 12px;
+  padding: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex; flex-direction: column; gap: 6px;
+}
+
 /* Microsoft sign-in button */
 .ms-btn {
   display: flex; align-items: center; justify-content: center;

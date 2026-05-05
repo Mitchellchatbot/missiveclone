@@ -36,10 +36,10 @@ export default function Sidebar({
   view, setView,
   filter, setFilter,
   search, setSearch,
-  accounts, onAddAccount, onSync,
+  accounts, onAddAccount, onSync, onEditAccount,
   teamSpaces, currentTeamSpaceId, setCurrentTeamSpaceId,
   onManageTeamSpaces, onCompose, onLabels, onSignatures,
-  onInvite, onCanned,
+  onInvite, onCanned, onWorkspace,
   onLogout
 }) {
   const [openSpaces, setOpenSpaces] = useState(() => new Set(teamSpaces.map(t => t.id)));
@@ -79,7 +79,7 @@ export default function Sidebar({
 
   return (
     <aside className="sidebar">
-      <div className="ws-card">
+      <div className="ws-card" onClick={onWorkspace} style={{ cursor: 'pointer' }} title="Workspace settings">
         <Avatar name={workspace?.name || 'W'} size={32} />
         <div className="ws-name-wrap">
           <div className="ws-name">{workspace?.name || 'Workspace'}</div>
@@ -190,7 +190,7 @@ export default function Sidebar({
       </div>
       {accounts.length === 0 && <div className="muted small pad-h">No accounts connected</div>}
       {accounts.map(a => (
-        <div className="acct" key={a.id} title={`IMAP: ${a.imap_host}`}>
+        <div className="acct" key={a.id} title={a.email + ' · click to edit'} onClick={() => onEditAccount && onEditAccount(a.id)} style={{ cursor: 'pointer' }}>
           <Avatar name={a.email} size={22} />
           <div style={{ overflow: 'hidden' }}>
             <div className="ellipsis">{a.email}</div>
