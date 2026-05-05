@@ -3,8 +3,23 @@ const MailComposer = require('nodemailer/lib/mail-composer');
 const { one } = require('../db');
 const { decrypt } = require('../crypto');
 const { appendToSentFolder } = require('./imap');
+const ms = require('../oauth/microsoft');
 
-function buildTransport(acc) {
+async function buildTransport(acc) {
+  if (acc.provider === 'microsoft') {
+    const accessToken = await ms.ensureFreshAccessToken(acc);
+    return nodemailer.createTransport({
+      host: acc.smtp_host || 'smtp.office365.com',
+      port: acc.smtp_port || 587,
+      secure: false,
+      requireTLS: true,
+      auth: {
+        type: 'OAuth2',
+        user: acc.email,
+        accessToken
+      }
+    });
+  }
   return nodemailer.createTransport({
     host: acc.smtp_host,
     port: acc.smtp_port,
@@ -23,7 +38,7 @@ function compileRaw(mail) {
 async function sendEmail(accountId, { to, cc, bcc, subject, text, html, inReplyTo, references, attachments }) {
   const acc = await one('SELECT * FROM email_accounts WHERE id = $1', [accountId]);
   if (!acc) throw new Error('account not found');
-  const tx = buildTransport(acc);
+  const tx = await buildTransport(acc);
   const fromName = acc.display_name || acc.email;
   const headers = {};
   if (inReplyTo) headers['In-Reply-To'] = `<${inReplyTo}>`;

@@ -288,7 +288,16 @@ const MIGRATIONS = [
   // Snooze + signatures (added later):
   `ALTER TABLE threads ADD COLUMN IF NOT EXISTS snoozed_until BIGINT`,
   `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS signature_html TEXT`,
-  `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS signature_text TEXT`
+  `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS signature_text TEXT`,
+  // OAuth (Microsoft / Google) columns:
+  `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS provider TEXT`,
+  `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS oauth_access_token TEXT`,
+  `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS oauth_refresh_token TEXT`,
+  `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS oauth_expires_at BIGINT`,
+  // imap_pass and smtp_pass were originally NOT NULL; OAuth accounts won't
+  // have them, so relax the constraint.
+  `ALTER TABLE email_accounts ALTER COLUMN imap_pass DROP NOT NULL`,
+  `ALTER TABLE email_accounts ALTER COLUMN smtp_pass DROP NOT NULL`
 ];
 
 function ensurePool() {

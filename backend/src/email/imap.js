@@ -4,6 +4,7 @@ const { v4: uuid } = require('uuid');
 const { one, many, query } = require('../db');
 const { decrypt } = require('../crypto');
 const { emitToWorkspace } = require('../sockets');
+const ms = require('../oauth/microsoft');
 
 const watchers = new Map();
 
@@ -11,7 +12,17 @@ function getAccount(id) {
   return one('SELECT * FROM email_accounts WHERE id = $1', [id]);
 }
 
-function buildClient(acc) {
+async function buildClient(acc) {
+  if (acc.provider === 'microsoft') {
+    const accessToken = await ms.ensureFreshAccessToken(acc);
+    return new ImapFlow({
+      host: acc.imap_host || 'outlook.office365.com',
+      port: acc.imap_port || 993,
+      secure: true,
+      auth: { user: acc.email, accessToken },
+      logger: false
+    });
+  }
   return new ImapFlow({
     host: acc.imap_host,
     port: acc.imap_port,
@@ -215,7 +226,7 @@ async function syncFolder(client, acc, folder, direction) {
 async function syncAccount(accountId) {
   const acc = await getAccount(accountId);
   if (!acc) return 0;
-  const client = buildClient(acc);
+  const client = await buildClient(acc);
   await client.connect();
   let count = 0;
   try {
@@ -238,7 +249,7 @@ async function syncAccount(accountId) {
 
 async function appendToSentFolder(acc, raw) {
   if (!acc.sent_folder) return;
-  const client = buildClient(acc);
+  const client = await buildClient(acc);
   try {
     await client.connect();
     await client.append(acc.sent_folder, raw, ['\\Seen']);
@@ -253,7 +264,13 @@ async function startWatching(accountId) {
   if (watchers.has(accountId)) return;
   const acc = await getAccount(accountId);
   if (!acc) return;
-  const client = buildClient(acc);
+  let client;
+  try {
+    client = await buildClient(acc);
+  } catch (e) {
+    console.error('buildClient failed for', acc.email, '-', e.message);
+    return;
+  }
   watchers.set(accountId, client);
 
   try {

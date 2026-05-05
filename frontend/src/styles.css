@@ -252,6 +252,34 @@ textarea { resize: vertical; }
 /* err inline (for ScheduledView) */
 .err-inline { color: var(--danger); }
 
+/* Microsoft sign-in button */
+.ms-btn {
+  display: flex; align-items: center; justify-content: center;
+  background: #2f2f2f; color: white;
+  padding: 10px 16px; border-radius: 6px;
+  font-weight: 500;
+  border: 0; cursor: pointer;
+  width: 100%;
+  transition: background var(--transition);
+}
+.ms-btn:hover { background: #1f1f1f; }
+.ms-btn:disabled { opacity: 0.5; cursor: default; }
+.divider {
+  position: relative;
+  text-align: center;
+  margin: 4px 0;
+}
+.divider::before {
+  content: ''; position: absolute; top: 50%; left: 0; right: 0;
+  height: 1px; background: var(--border);
+}
+.divider span {
+  background: var(--surface); padding: 0 12px;
+  position: relative;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 /* =====  Sidebar  ===== */
 .sidebar {
   background: var(--side-bg);

@@ -29,6 +29,20 @@ export default function ConnectAccount({ teamSpaces, defaultTeamSpaceId, onClose
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
 
+  async function connectMicrosoft() {
+    setErr(''); setBusy(true);
+    try {
+      const params = new URLSearchParams();
+      if (tsId) params.set('team_space_id', tsId);
+      const r = await api('/api/oauth/microsoft/start?' + params.toString());
+      if (r && r.url) {
+        window.location.href = r.url;   // full-page redirect to Microsoft
+      } else {
+        setErr('OAuth start did not return a URL');
+      }
+    } catch (e) { setErr(e.message); setBusy(false); }
+  }
+
   function applyPreset(p) {
     setPreset(p);
     setForm(f => ({ ...f, ...presets[p] }));
@@ -59,8 +73,28 @@ export default function ConnectAccount({ teamSpaces, defaultTeamSpaceId, onClose
     <div className="modal-back" onClick={onClose}>
       <form className="modal" onClick={e => e.stopPropagation()} onSubmit={submit}>
         <h3>Connect email account</h3>
+
+        {teamSpaces && teamSpaces.length > 0 && (
+          <select value={tsId} onChange={e => setTsId(e.target.value)}>
+            {teamSpaces.map(ts => <option key={ts.id} value={ts.id}>Add to: {ts.name}</option>)}
+          </select>
+        )}
+
+        <button type="button" className="ms-btn" onClick={connectMicrosoft} disabled={busy}>
+          <svg width="18" height="18" viewBox="0 0 23 23" style={{ marginRight: 8, verticalAlign: 'middle' }}>
+            <rect x="1" y="1" width="10" height="10" fill="#f25022"/>
+            <rect x="12" y="1" width="10" height="10" fill="#7fba00"/>
+            <rect x="1" y="12" width="10" height="10" fill="#00a4ef"/>
+            <rect x="12" y="12" width="10" height="10" fill="#ffb900"/>
+          </svg>
+          Sign in with Microsoft (recommended for Outlook)
+        </button>
+
+        <div className="divider"><span>or use IMAP / SMTP</span></div>
+
         <div className="muted small">
           For Gmail: enable 2FA and use an <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noreferrer">App Password</a>.
+          Outlook with M365 will likely fail here — use the Microsoft button above.
         </div>
         <div className="row">
           {Object.keys(presets).map(p => (
@@ -70,11 +104,6 @@ export default function ConnectAccount({ teamSpaces, defaultTeamSpaceId, onClose
         <input placeholder="Email address" type="email" value={form.email} onChange={e => set('email', e.target.value)} required />
         <input placeholder="Display name (optional)" value={form.display_name} onChange={e => set('display_name', e.target.value)} />
         <input placeholder="Password / App password" type="password" value={form.pass} onChange={e => set('pass', e.target.value)} required />
-        {teamSpaces && teamSpaces.length > 0 && (
-          <select value={tsId} onChange={e => setTsId(e.target.value)}>
-            {teamSpaces.map(ts => <option key={ts.id} value={ts.id}>Team space: {ts.name}</option>)}
-          </select>
-        )}
 
         <div className="row">
           <input placeholder="IMAP host" value={form.imap_host} onChange={e => set('imap_host', e.target.value)} required />

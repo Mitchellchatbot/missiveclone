@@ -25,6 +25,7 @@ const taskRoutes = require('./routes/tasks');
 const composeRoutes = require('./routes/compose');
 const labelRoutes = require('./routes/labels');
 const scheduledRoutes = require('./routes/scheduled');
+const oauthMicrosoftRoutes = require('./routes/oauth_microsoft');
 const { initSockets } = require('./sockets');
 const { startAllWatchers, syncAccount } = require('./email/imap');
 
@@ -51,7 +52,12 @@ app.get('/api/status', async (_req, res) => {
     node_env: process.env.NODE_ENV || null,
     has_jwt_secret: !!process.env.JWT_SECRET,
     has_encryption_key: !!process.env.ENCRYPTION_KEY,
-    database_ssl: process.env.DATABASE_SSL || null
+    database_ssl: process.env.DATABASE_SSL || null,
+    microsoft_oauth: {
+      configured: !!(process.env.MICROSOFT_CLIENT_ID && process.env.MICROSOFT_CLIENT_SECRET && process.env.MICROSOFT_REDIRECT_URI),
+      tenant: process.env.MICROSOFT_TENANT || 'common',
+      redirect_uri: process.env.MICROSOFT_REDIRECT_URI || null
+    }
   });
 });
 
@@ -68,6 +74,7 @@ app.use('/api/tasks', taskRoutes);
 app.use('/api/compose', composeRoutes);
 app.use('/api/labels', labelRoutes);
 app.use('/api/scheduled', scheduledRoutes);
+app.use('/api/oauth/microsoft', oauthMicrosoftRoutes);
 
 // Serve the built frontend (single-service deploy on Railway etc.)
 const distPath = path.join(__dirname, '..', '..', 'frontend', 'dist');
