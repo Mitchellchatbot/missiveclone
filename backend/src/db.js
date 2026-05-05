@@ -298,7 +298,20 @@ const MIGRATIONS = [
   // imap_pass and smtp_pass were originally NOT NULL; OAuth accounts won't
   // have them, so relax the constraint.
   `ALTER TABLE email_accounts ALTER COLUMN imap_pass DROP NOT NULL`,
-  `ALTER TABLE email_accounts ALTER COLUMN smtp_pass DROP NOT NULL`
+  `ALTER TABLE email_accounts ALTER COLUMN smtp_pass DROP NOT NULL`,
+  // Reconnect-recovery: any messages whose account_id went NULL after a
+  // disconnect get re-linked to whichever current mailbox in the same
+  // workspace mentions that address in headers. Idempotent — only touches
+  // NULL rows, so re-runs are no-ops.
+  `UPDATE messages SET account_id = ea.id
+   FROM email_accounts ea
+   WHERE messages.workspace_id = ea.workspace_id
+     AND messages.account_id IS NULL
+     AND (
+       messages.to_addrs ILIKE '%' || ea.email || '%'
+       OR messages.from_addr ILIKE '%' || ea.email || '%'
+       OR messages.cc_addrs ILIKE '%' || ea.email || '%'
+     )`
 ];
 
 function ensurePool() {
