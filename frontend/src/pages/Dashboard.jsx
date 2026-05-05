@@ -112,6 +112,20 @@ export default function Dashboard({ me, onLogout }) {
     loadThreads();
   }
 
+  async function closeThread(t) {
+    const next = t.status === 'closed' ? 'open' : 'closed';
+    await api(`/api/threads/${t.id}`, { method: 'PATCH', body: JSON.stringify({ status: next }) });
+    if (next === 'closed' && selectedId === t.id) setSelectedId(null);
+    loadThreads();
+  }
+
+  async function snoozeThread(t) {
+    const oneHour = 60 * 60 * 1000;
+    await api(`/api/threads/${t.id}`, { method: 'PATCH', body: JSON.stringify({ snoozed_until: Date.now() + oneHour }) });
+    if (selectedId === t.id) setSelectedId(null);
+    loadThreads();
+  }
+
   function openThreadFromDraft(threadId) {
     setView('mail');
     setSelectedId(threadId);
@@ -191,7 +205,13 @@ export default function Dashboard({ me, onLogout }) {
           <>
             <CategoryBar filter={filter} setFilter={setFilter} />
             <div className="mail-grid">
-              <ThreadList threads={threads} selectedId={selectedId} onSelect={setSelectedId} />
+              <ThreadList
+                threads={threads}
+                selectedId={selectedId}
+                onSelect={setSelectedId}
+                onCloseThread={closeThread}
+                onSnoozeThread={snoozeThread}
+              />
               <ThreadView
                 threadId={selectedId}
                 me={me.user}

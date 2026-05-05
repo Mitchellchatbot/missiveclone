@@ -25,12 +25,19 @@ function firstParticipant(s) {
 
 const statusBadge = (s) => <span className={`badge badge-${s}`}>{s}</span>;
 
-export default function ThreadList({ threads, selectedId, onSelect }) {
+export default function ThreadList({ threads, selectedId, onSelect, onCloseThread, onSnoozeThread }) {
+  function quick(action, t, e) {
+    e.stopPropagation();
+    if (action === 'close') onCloseThread && onCloseThread(t);
+    if (action === 'snooze') onSnoozeThread && onSnoozeThread(t);
+  }
+
   return (
     <div className="thread-list">
       {threads.length === 0 && <div className="empty">No conversations</div>}
       {threads.map(t => {
         const fp = firstParticipant(t.participants);
+        const isClosed = t.status === 'closed';
         return (
           <div
             key={t.id}
@@ -41,7 +48,23 @@ export default function ThreadList({ threads, selectedId, onSelect }) {
             <div className="thread-row-main">
               <div className="thread-row-top">
                 <div className="thread-from ellipsis">{fp || '—'}</div>
-                <div className="thread-date">{fmtDate(t.last_message_at)}</div>
+                <div className="thread-row-actions">
+                  {!isClosed && onSnoozeThread && (
+                    <button
+                      className="thread-action-btn"
+                      title="Snooze 1 hour"
+                      onClick={(e) => quick('snooze', t, e)}
+                    >💤</button>
+                  )}
+                  {onCloseThread && (
+                    <button
+                      className="thread-action-btn close-btn"
+                      title={isClosed ? 'Re-open conversation' : 'Close conversation'}
+                      onClick={(e) => quick('close', t, e)}
+                    >{isClosed ? '↺' : '✕'}</button>
+                  )}
+                  <div className="thread-date">{fmtDate(t.last_message_at)}</div>
+                </div>
               </div>
               <div className="thread-subject ellipsis">{t.subject || '(no subject)'}</div>
               <div className="thread-row-bottom">
