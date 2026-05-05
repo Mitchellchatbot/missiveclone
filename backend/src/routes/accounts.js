@@ -12,7 +12,8 @@ router.use(requireAuth);
 
 router.get('/', wrap(async (req, res) => {
   const rows = await many(
-    `SELECT id, email, display_name, imap_host, smtp_host, last_synced_at, team_space_id
+    `SELECT id, email, display_name, imap_host, smtp_host, last_synced_at,
+            team_space_id, user_id, provider
      FROM email_accounts WHERE workspace_id = $1`,
     [req.user.workspace_id]
   );

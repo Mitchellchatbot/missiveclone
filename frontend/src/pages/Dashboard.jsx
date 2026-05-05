@@ -41,8 +41,11 @@ export default function Dashboard({ me, onLogout }) {
   const [showWorkspace, setShowWorkspace] = useState(false);
   const [editAccountId, setEditAccountId] = useState(null);
   const [accountsLoaded, setAccountsLoaded] = useState(false);
+  // Dismiss flag is per-user-id so two teammates sharing a browser don't
+  // affect each other, and rejoining workspaces re-shows the onboarding.
+  const dismissKey = `missive_clone_onboarding_dismissed_${me.user.id}`;
   const [onboardingDismissed, setOnboardingDismissed] = useState(
-    () => localStorage.getItem('missive_clone_onboarding_dismissed') === '1'
+    () => localStorage.getItem(dismissKey) === '1'
   );
 
   useEffect(() => {
@@ -112,17 +115,22 @@ export default function Dashboard({ me, onLogout }) {
 
   const currentTeamSpace = teamSpaces.find(t => t.id === currentTeamSpaceId) || null;
 
-  // First-run onboarding: full-screen takeover when the user has never
-  // connected a mailbox and hasn't explicitly skipped. Once they connect,
-  // accounts.length > 0 and this screen disappears automatically.
-  if (accountsLoaded && accounts.length === 0 && !onboardingDismissed) {
+  // Count mailboxes THIS user owns, not the whole workspace. Otherwise
+  // anyone joining a workspace where someone else already connected a
+  // mailbox skips the onboarding entirely (the bug Sean hit).
+  const myAccountCount = accounts.filter(a => a.user_id === me.user.id).length;
+
+  // Full-screen first-run onboarding. Fires for every user the first
+  // time they land in the dashboard with no mailbox of their own,
+  // even if a teammate has already connected mailboxes to the workspace.
+  if (accountsLoaded && myAccountCount === 0 && !onboardingDismissed) {
     return (
       <OnboardingScreen
         me={me}
         teamSpaces={teamSpaces}
         onDone={loadAccounts}
         onSkip={() => {
-          localStorage.setItem('missive_clone_onboarding_dismissed', '1');
+          localStorage.setItem(dismissKey, '1');
           setOnboardingDismissed(true);
         }}
       />
@@ -161,13 +169,13 @@ export default function Dashboard({ me, onLogout }) {
           onCompose={() => setShowCompose(true)}
         />
 
-        {accounts.length === 0 && (
+        {myAccountCount === 0 && (
           <div className="onboarding-banner">
             <div>
-              <strong>👋 Welcome.</strong> You haven't connected an inbox yet.
-              Connect your Outlook (or any IMAP account) so your emails show up here.
+              <strong>👋 Hi {me.user.name?.split(' ')[0] || 'there'}.</strong> You haven't connected your own inbox yet.
+              Connect your Outlook so emails sent to you show up here too.
             </div>
-            <button onClick={() => setShowConnect(true)}>Connect inbox</button>
+            <button onClick={() => setShowConnect(true)}>Connect my inbox</button>
           </div>
         )}
 
