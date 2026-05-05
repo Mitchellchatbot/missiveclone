@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import DOMPurify from 'dompurify';
+import { Star, Mail, Moon, Tag, Reply, Forward, Paperclip, Clock } from 'lucide-react';
 import { api, getApiBase } from '../api';
 import { getSocket } from '../socket';
 import ComposeReply from './ComposeReply.jsx';
@@ -171,13 +172,17 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
             className={'star-btn-lg ' + (thread.starred ? 'on' : '')}
             onClick={toggleStar}
             title={thread.starred ? 'Unstar' : 'Star'}
-          >{thread.starred ? '★' : '☆'}</button>
+          ><Star size={20} fill={thread.starred ? 'currentColor' : 'none'} strokeWidth={2} /></button>
           <div className="tv-header-main">
             <div className="tv-subject">{thread.subject || '(no subject)'}</div>
             <div className="muted small tv-participants">{thread.participants}</div>
           </div>
-          <button className="ghost" onClick={forwardLast} title="Forward last message">↪ Forward</button>
-          <button className="tv-reply-btn" onClick={() => setShowReply(s => !s)}>↩ Reply</button>
+          <button className="ghost icon-text" onClick={forwardLast} title="Forward last message">
+            <Forward size={14} /> Forward
+          </button>
+          <button className="tv-reply-btn icon-text" onClick={() => setShowReply(s => !s)}>
+            <Reply size={14} /> Reply
+          </button>
         </div>
 
         {((thread.account_emails && thread.account_emails.length > 0) ||
@@ -188,7 +193,8 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
               const name = typeof a === 'string' ? null : a.name;
               return (
                 <span key={email} className="account-chip" title={email}>
-                  📧 {name ? `${name} (${email})` : email}
+                  <Mail size={11} strokeWidth={2.2} />
+                  {name ? `${name} (${email})` : email}
                 </span>
               );
             })}
@@ -196,8 +202,8 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
               <span key={l.id} className="label-chip" style={{ background: l.color }}>{l.name}</span>
             ))}
             {isSnoozed && (
-              <span className="badge badge-pending">
-                💤 Snoozed until {new Date(Number(thread.snoozed_until)).toLocaleString()}
+              <span className="badge badge-snoozed">
+                <Moon size={10} /> Snoozed until {new Date(Number(thread.snoozed_until)).toLocaleString()}
                 <button className="link" onClick={unsnooze} style={{ marginLeft: 6 }}>unsnooze</button>
               </span>
             )}
@@ -215,7 +221,9 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
             {team.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
           </select>
           <div className="action-pop-wrap">
-            <button className="ghost" onClick={() => setShowLabel(s => !s)}>🏷 Label</button>
+            <button className="ghost icon-text" onClick={() => setShowLabel(s => !s)}>
+              <Tag size={14} /> Label
+            </button>
             {showLabel && (
               <div className="schedule-pop" onMouseLeave={() => setShowLabel(false)}>
                 {allLabels.length === 0 && <div className="muted small pad-h">No labels yet — create some via "Labels" in the sidebar.</div>}
@@ -229,7 +237,9 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
             )}
           </div>
           <div className="action-pop-wrap">
-            <button className="ghost" onClick={() => setShowSnooze(s => !s)}>💤 Snooze</button>
+            <button className="ghost icon-text" onClick={() => setShowSnooze(s => !s)}>
+              <Moon size={14} /> Snooze
+            </button>
             {showSnooze && (
               <div className="schedule-pop" onMouseLeave={() => setShowSnooze(false)}>
                 {SNOOZE_PRESETS.map(p => (
@@ -294,7 +304,8 @@ function MessageBlock({ m }) {
             {fmtFull(m.sent_at)}
             {m.account_email && (
               <span className="account-chip" style={{ marginLeft: 6 }} title={m.account_email}>
-                via {m.account_name ? `${m.account_name} (${m.account_email})` : m.account_email}
+                <Mail size={11} strokeWidth={2.2} />
+                via {m.account_name || m.account_email}
               </span>
             )}
           </div>
@@ -318,7 +329,7 @@ function MessageBlock({ m }) {
               href={getApiBase() + `/api/attachments/${a.id}`}
               onClick={e => downloadAttachment(e, a)}
               className="att">
-              📎 <span>{a.filename}</span> <span className="muted xs">{fmtSize(a.size_bytes)}</span>
+              <Paperclip size={12} /> <span>{a.filename}</span> <span className="muted xs">{fmtSize(a.size_bytes)}</span>
             </a>
           ))}
         </div>

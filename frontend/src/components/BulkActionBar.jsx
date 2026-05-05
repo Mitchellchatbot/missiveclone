@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { X, RotateCcw, Clock, Moon, Star, StarOff, UserPlus, Tag } from 'lucide-react';
 import { api } from '../api';
 
 export default function BulkActionBar({ selectedIds, onClear, onChanged, team, labels }) {
@@ -23,15 +24,29 @@ export default function BulkActionBar({ selectedIds, onClear, onChanged, team, l
   return (
     <div className="bulk-bar">
       <div className="bulk-count"><strong>{n}</strong> selected</div>
-      <button className="ghost small" onClick={() => bulk('close')} disabled={busy}>✕ Close</button>
-      <button className="ghost small" onClick={() => bulk('open')} disabled={busy}>↺ Re-open</button>
-      <button className="ghost small" onClick={() => bulk('pending')} disabled={busy}>⏰ Pending</button>
-      <button className="ghost small" onClick={() => bulk('snooze', 60 * 60 * 1000)} disabled={busy}>💤 Snooze 1h</button>
-      <button className="ghost small" onClick={() => bulk('star')} disabled={busy}>★ Star</button>
-      <button className="ghost small" onClick={() => bulk('unstar')} disabled={busy}>☆ Unstar</button>
+      <button className="ghost small icon-text" onClick={() => bulk('close')} disabled={busy}>
+        <X size={13} /> Close
+      </button>
+      <button className="ghost small icon-text" onClick={() => bulk('open')} disabled={busy}>
+        <RotateCcw size={13} /> Re-open
+      </button>
+      <button className="ghost small icon-text" onClick={() => bulk('pending')} disabled={busy}>
+        <Clock size={13} /> Pending
+      </button>
+      <button className="ghost small icon-text" onClick={() => bulk('snooze', 60 * 60 * 1000)} disabled={busy}>
+        <Moon size={13} /> Snooze 1h
+      </button>
+      <button className="ghost small icon-text" onClick={() => bulk('star')} disabled={busy} style={{ color: '#f59e0b' }}>
+        <Star size={13} fill="currentColor" /> Star
+      </button>
+      <button className="ghost small icon-text" onClick={() => bulk('unstar')} disabled={busy}>
+        <StarOff size={13} /> Unstar
+      </button>
 
       <div className="action-pop-wrap">
-        <button className="ghost small" onClick={() => setShowAssign(s => !s)} disabled={busy}>👤 Assign…</button>
+        <button className="ghost small icon-text" onClick={() => setShowAssign(s => !s)} disabled={busy}>
+          <UserPlus size={13} /> Assign…
+        </button>
         {showAssign && (
           <div className="schedule-pop" onMouseLeave={() => setShowAssign(false)}>
             <div className="schedule-opt" onClick={() => { bulk('assign', null); setShowAssign(false); }}>
@@ -48,7 +63,9 @@ export default function BulkActionBar({ selectedIds, onClear, onChanged, team, l
 
       {labels && labels.length > 0 && (
         <div className="action-pop-wrap">
-          <button className="ghost small" onClick={() => setShowLabel(s => !s)} disabled={busy}>🏷 Label…</button>
+          <button className="ghost small icon-text" onClick={() => setShowLabel(s => !s)} disabled={busy}>
+            <Tag size={13} /> Label…
+          </button>
           {showLabel && (
             <div className="schedule-pop" onMouseLeave={() => setShowLabel(false)}>
               {labels.map(l => (

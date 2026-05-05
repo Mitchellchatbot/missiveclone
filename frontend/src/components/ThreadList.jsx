@@ -1,4 +1,5 @@
 import React from 'react';
+import { Star, Mail, Moon, X, RotateCcw } from 'lucide-react';
 import Avatar from './Avatar.jsx';
 
 function fmtDate(ts) {
@@ -27,7 +28,7 @@ const statusBadge = (s) => <span className={`badge badge-${s}`}>{s}</span>;
 export default function ThreadList({
   threads, selectedId, onSelect,
   onCloseThread, onSnoozeThread, onToggleStar,
-  selectedIds = new Set(), onToggleSelect, onClearSelect
+  selectedIds = new Set(), onToggleSelect
 }) {
   function quick(action, t, e) {
     e.stopPropagation();
@@ -71,7 +72,9 @@ export default function ThreadList({
                   className={'star-btn ' + (isStarred ? 'on' : '')}
                   onClick={(e) => quick('star', t, e)}
                   title={isStarred ? 'Unstar' : 'Star'}
-                >{isStarred ? '★' : '☆'}</button>
+                >
+                  <Star size={15} fill={isStarred ? 'currentColor' : 'none'} strokeWidth={2} />
+                </button>
               )}
               <Avatar name={fp || t.subject || '?'} size={36} />
             </div>
@@ -81,17 +84,17 @@ export default function ThreadList({
                 <div className="thread-row-actions">
                   {!isClosed && onSnoozeThread && (
                     <button
-                      className="thread-action-btn"
+                      className="thread-action-btn snooze-btn"
                       title="Snooze 1 hour"
                       onClick={(e) => quick('snooze', t, e)}
-                    >💤</button>
+                    ><Moon size={14} /></button>
                   )}
                   {onCloseThread && (
                     <button
-                      className="thread-action-btn close-btn"
+                      className={'thread-action-btn ' + (isClosed ? 'reopen-btn' : 'close-btn')}
                       title={isClosed ? 'Re-open' : 'Close'}
                       onClick={(e) => quick('close', t, e)}
-                    >{isClosed ? '↺' : '✕'}</button>
+                    >{isClosed ? <RotateCcw size={14} /> : <X size={14} />}</button>
                   )}
                   <div className="thread-date">{fmtDate(t.last_message_at)}</div>
                 </div>
@@ -104,7 +107,8 @@ export default function ThreadList({
                     const name = typeof a === 'string' ? null : a.name;
                     return (
                       <span key={email} className="account-chip" title={email}>
-                        📧 {name ? `${name} (${email})` : email}
+                        <Mail size={11} strokeWidth={2.2} />
+                        {name ? `${name}` : email}
                       </span>
                     );
                   })}
@@ -113,7 +117,9 @@ export default function ThreadList({
                   {(t.labels || []).map(l => (
                     <span key={l.id} className="label-chip" style={{ background: l.color }}>{l.name}</span>
                   ))}
-                  {t.snoozed_until && Number(t.snoozed_until) > Date.now() && <span className="badge badge-pending">💤</span>}
+                  {t.snoozed_until && Number(t.snoozed_until) > Date.now() && (
+                    <span className="badge badge-snoozed"><Moon size={10} /> snoozed</span>
+                  )}
                 </div>
               </div>
             </div>
