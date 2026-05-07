@@ -123,6 +123,25 @@ export default function Dashboard({ me, onLogout }) {
 
   useEffect(() => () => disconnectSocket(), []);
 
+  // Deep-link from external apps (e.g. DelegationDoer's "Open in Missive"
+  // buttons): a `?thread=ID` query param auto-selects that thread on load.
+  // We also relax the status filter so threads in any state (closed, etc.)
+  // are visible. The URL is cleaned up after handling so the deep-link
+  // doesn't keep re-firing on later state changes.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const tid = params.get('thread');
+    if (tid) {
+      setSelectedId(tid);
+      setFilter((f) => ({ ...f, status: null }));
+      params.delete('thread');
+      const qs = params.toString();
+      const next = window.location.pathname + (qs ? `?${qs}` : '');
+      window.history.replaceState({}, '', next);
+    }
+  }, []);
+
   async function syncAll() {
     for (const a of accounts) {
       try { await api(`/api/accounts/${a.id}/sync`, { method: 'POST' }); } catch {}
