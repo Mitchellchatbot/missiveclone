@@ -45,25 +45,28 @@ async function sendEmailViaGraph(account, mail) {
     bccRecipients: parseAddresses(mail.bcc)
   };
 
-  // Graph's `internetMessageHeaders` only accepts custom headers prefixed
-  // `x-`/`X-` — standard RFC 5322 headers like In-Reply-To and References
-  // are rejected (Graph errors with "should start with 'x-' or 'X-'").
-  // Outlook threads Microsoft↔Microsoft via `conversationId` automatically,
-  // and non-Microsoft clients fall back to subject matching, so dropping
-  // these headers on the Graph path is the supported approach.
-  //
-  // If you need true RFC threading guarantees for a specific account, use
-  // the SMTP transport instead — smtp.js still sets both headers correctly.
-  if (mail.inReplyTo || (mail.references && mail.references.length)) {
-    // Surface them as informational X-* so they're at least visible on the
-    // wire (useful for debugging) without tripping Graph's validator.
-    const headers = [];
-    if (mail.inReplyTo) headers.push({ name: 'X-Orig-In-Reply-To', value: `<${mail.inReplyTo}>` });
-    if (mail.references && mail.references.length) {
-      headers.push({ name: 'X-Orig-References', value: mail.references.map(r => `<${r}>`).join(' ') });
-    }
-    message.internetMessageHeaders = headers;
+  // Threading headers for Graph: `internetMessageHeaders` only allows
+  // headers prefixed `x-`/`X-`, so standard names like In-Reply-To and
+  // References are rejected there. The supported workaround is to set
+  // them via `singleValueExtendedProperties` under PSETID_INTERNET_HEADERS
+  // (GUID 00020386-0000-0000-C000-000000000046, MAPI's "internet headers"
+  // namespace). Graph translates these into real RFC 5322 headers on the
+  // outbound message, which is what non-Microsoft recipients (and Outlook
+  // web) use to thread the reply correctly.
+  const extProps = [];
+  if (mail.inReplyTo) {
+    extProps.push({
+      id: 'String {00020386-0000-0000-C000-000000000046} Name In-Reply-To',
+      value: `<${mail.inReplyTo}>`
+    });
   }
+  if (mail.references && mail.references.length) {
+    extProps.push({
+      id: 'String {00020386-0000-0000-C000-000000000046} Name References',
+      value: mail.references.map(r => `<${r}>`).join(' ')
+    });
+  }
+  if (extProps.length) message.singleValueExtendedProperties = extProps;
 
   // Inline attachments (base64). Graph caps this at ~3 MB total per message;
   // larger attachments need an upload-session API which we skip in MVP.
