@@ -19,13 +19,26 @@ router.get('/start', requireAuth, wrap(async (req, res) => {
       error: 'Microsoft OAuth not configured. Server admin must set MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET, MICROSOFT_REDIRECT_URI.'
     });
   }
-  const { team_space_id } = req.query;
+  const { team_space_id, return_to } = req.query;
+  // Optional return_to: must be an absolute https URL (or http://localhost
+  // for local dev). Embedded in the state JWT so the callback can bounce
+  // the user back into the caller app instead of our own frontend.
+  let safeReturnTo = null;
+  if (typeof return_to === 'string' && return_to) {
+    try {
+      const u = new URL(return_to);
+      const okProto = u.protocol === 'https:' ||
+        (u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1'));
+      if (okProto) safeReturnTo = u.toString();
+    } catch { /* invalid url — fall through to null */ }
+  }
   const state = jwt.sign(
     {
       kind: 'oauth_microsoft',
       workspace_id: req.user.workspace_id,
       user_id: req.user.id,
       team_space_id: team_space_id || null,
+      return_to: safeReturnTo,
       nonce: crypto.randomBytes(8).toString('hex')
     },
     process.env.JWT_SECRET,
@@ -142,7 +155,17 @@ router.get('/callback', wrap(async (req, res) => {
     .then(() => startWatching(accountId))
     .catch(err => console.error('initial sync after oauth', err.message));
 
-  // Send the user back to the app.
+  // Redirect to the caller's return_to URL (set on /start), augmented
+  // with the new account id + email so the caller can deep-link the
+  // user to that inbox. Falls back to our own frontend if no return_to
+  // was provided.
+  if (stateData.return_to) {
+    const target = new URL(stateData.return_to);
+    target.searchParams.set('oauth', 'microsoft_ok');
+    target.searchParams.set('connectedAccount', accountId);
+    target.searchParams.set('connectedEmail', email);
+    return res.redirect(target.toString());
+  }
   res.redirect('/?oauth=microsoft_ok');
 }));
 
