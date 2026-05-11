@@ -22,11 +22,19 @@ async function findGraphMessageIdByInternetId(token, internetMessageId) {
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${token}` }
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      console.warn(`[graph] findGraphMessageIdByInternetId(${id}) failed: ${res.status} ${detail.slice(0, 200)}`);
+      return null;
+    }
     const data = await res.json();
     const first = (data.value && data.value[0]) || null;
+    if (!first) {
+      console.warn(`[graph] findGraphMessageIdByInternetId(${id}) → 0 matches`);
+    }
     return first ? first.id : null;
-  } catch {
+  } catch (err) {
+    console.warn(`[graph] findGraphMessageIdByInternetId(${id}) threw: ${err.message}`);
     return null;
   }
 }
@@ -62,32 +70,31 @@ function parseAddresses(s) {
  */
 async function sendEmailViaGraph(account, mail) {
   const token = await ms.getAccessTokenForResource(account, GRAPH_SCOPE);
-
   const attachments = buildAttachments(mail.attachments);
+  const tag = `[graph ${account.email}]`;
 
   // Threading via Graph requires the `createReply` action, not raw
   // `sendMail` with In-Reply-To headers — Graph silently ignores RFC
   // threading headers and ALWAYS creates a new conversationId on
   // /sendMail, which makes Outlook show the result as a fresh thread.
-  // So: when this is a reply, look up the parent in the mailbox and
-  // use /messages/{id}/createReply -> patch -> send, which inherits
-  // the conversationId and sets all RFC headers automatically.
   if (mail.inReplyTo) {
     const parentId = await findGraphMessageIdByInternetId(token, mail.inReplyTo);
     if (parentId) {
-      return sendAsReplyViaGraph(token, parentId, mail, attachments);
+      console.log(`${tag} reply → parent ${parentId} (inReplyTo=${mail.inReplyTo})`);
+      return sendAsReplyViaGraph(token, parentId, mail, attachments, tag);
     }
-    // Parent not in this mailbox yet (or we lack Mail.Read). Fall through
-    // to the plain sendMail path — threading will degrade to client-side
-    // subject matching but the message still goes out.
+    console.warn(`${tag} reply → parent NOT FOUND for inReplyTo=${mail.inReplyTo}; falling back to draft-send (no thread inheritance)`);
+  } else {
+    console.log(`${tag} new outbound (no inReplyTo)`);
   }
-
-  return sendNewMessageViaGraph(token, mail, attachments);
+  return sendAsDraftViaGraph(token, mail, attachments, tag);
 }
 
-// Plain new-thread send. Used when there's no inReplyTo or the parent
-// can't be located in the Microsoft mailbox.
-async function sendNewMessageViaGraph(token, mail, attachments) {
+// Draft-then-send for new outbound (no parent). Returns the draft's
+// internetMessageId so subsequent replies in the thread can locate it.
+// Using create-draft + send instead of plain /me/sendMail because the
+// latter returns 202 with no id — we'd lose track of our own outbound.
+async function sendAsDraftViaGraph(token, mail, attachments, tag = '[graph]') {
   const message = {
     subject: mail.subject || '',
     body: {
@@ -100,24 +107,37 @@ async function sendNewMessageViaGraph(token, mail, attachments) {
   };
   if (attachments.length) message.attachments = attachments;
 
-  const res = await fetch(`${GRAPH_BASE}/me/sendMail`, {
+  // 1) Create draft. Graph returns the Message resource with both id +
+  //    internetMessageId populated.
+  const draftRes = await fetch(`${GRAPH_BASE}/me/messages`, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ message, saveToSentItems: true })
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(message)
   });
-  await assertGraphOk(res, 202, 'sendMail');
-  return { messageId: null, accepted: parseAddresses(mail.to).map(r => r.emailAddress.address) };
+  await assertGraphOk(draftRes, 201, 'create draft');
+  const draft = await draftRes.json();
+  const draftId = draft.id;
+  const internetMessageId = stripBrackets(draft.internetMessageId);
+
+  // 2) Send.
+  const sendRes = await fetch(
+    `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/send`,
+    { method: 'POST', headers: { Authorization: `Bearer ${token}` } }
+  );
+  await assertGraphOk(sendRes, 202, 'send draft');
+  console.log(`${tag} sent draft ${draftId} (internetMessageId=${internetMessageId || 'unknown'})`);
+
+  return {
+    messageId: internetMessageId || null,
+    accepted: parseAddresses(mail.to).map(r => r.emailAddress.address)
+  };
 }
 
 // createReply -> patch -> send. Inherits the parent's conversationId so
-// Outlook threads the reply with the original message. Recipients can be
-// overridden — by default createReply sets toRecipients to the parent's
-// sender, which is usually what we want anyway.
-async function sendAsReplyViaGraph(token, parentMessageId, mail, attachments) {
-  // 1) Create the draft reply. Graph returns a full Message resource.
+// Outlook threads the reply with the original message.
+async function sendAsReplyViaGraph(token, parentMessageId, mail, attachments, tag = '[graph reply]') {
+  // 1) Create the draft reply. Graph returns a full Message resource
+  //    with conversationId inherited from the parent.
   const draftRes = await fetch(
     `${GRAPH_BASE}/me/messages/${encodeURIComponent(parentMessageId)}/createReply`,
     { method: 'POST', headers: { Authorization: `Bearer ${token}` } }
@@ -126,9 +146,7 @@ async function sendAsReplyViaGraph(token, parentMessageId, mail, attachments) {
   const draft = await draftRes.json();
   const draftId = draft.id;
 
-  // 2) PATCH the draft with our body + recipient overrides + attachments.
-  //    createReply pre-fills body with the quoted parent; we replace it
-  //    entirely so the reply contains just what the user typed.
+  // 2) PATCH the draft with our body + recipient overrides.
   const patch = {
     subject: mail.subject || draft.subject,
     body: {
@@ -141,39 +159,52 @@ async function sendAsReplyViaGraph(token, parentMessageId, mail, attachments) {
   };
   const patchRes = await fetch(`${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}`, {
     method: 'PATCH',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json'
-    },
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(patch)
   });
   await assertGraphOk(patchRes, 200, 'PATCH reply draft');
 
-  // 3) Attach files one-by-one to the draft if any. (Graph requires
-  //    attachments to be added as child resources, not inline on PATCH.)
   for (const att of attachments) {
     const aRes = await fetch(
       `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/attachments`,
       {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify(att)
       }
     );
     await assertGraphOk(aRes, 201, 'attach to reply draft');
   }
 
-  // 4) Send the draft. Graph returns 202 Accepted.
+  // 3) Re-read the draft so we get the post-PATCH internetMessageId
+  //    (sometimes Graph regenerates it after subject/body changes).
+  const getRes = await fetch(
+    `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}?$select=internetMessageId,conversationId`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  let internetMessageId = stripBrackets(draft.internetMessageId);
+  if (getRes.ok) {
+    const fresh = await getRes.json();
+    if (fresh.internetMessageId) internetMessageId = stripBrackets(fresh.internetMessageId);
+  }
+
+  // 4) Send.
   const sendRes = await fetch(
     `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/send`,
     { method: 'POST', headers: { Authorization: `Bearer ${token}` } }
   );
   await assertGraphOk(sendRes, 202, 'send reply draft');
+  console.log(`${tag} sent reply draft ${draftId} (internetMessageId=${internetMessageId || 'unknown'})`);
 
-  return { messageId: null, accepted: parseAddresses(mail.to).map(r => r.emailAddress.address) };
+  return {
+    messageId: internetMessageId || null,
+    accepted: parseAddresses(mail.to).map(r => r.emailAddress.address)
+  };
+}
+
+function stripBrackets(v) {
+  if (!v) return null;
+  return String(v).replace(/^<|>$/g, '');
 }
 
 function buildAttachments(rawAttachments) {
