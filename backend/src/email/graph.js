@@ -1,6 +1,35 @@
 const ms = require('../oauth/microsoft');
 
 const GRAPH_SCOPE = 'https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Mail.ReadWrite offline_access';
+const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
+
+// Find the Graph message id for a given RFC Message-ID header value, by
+// searching Inbox + Sent across the mailbox. Returns null if not found
+// (e.g. the parent message hasn't synced into the mailbox yet, or it
+// originated from an account we can't query).
+async function findGraphMessageIdByInternetId(token, internetMessageId) {
+  if (!internetMessageId) return null;
+  // Graph's internetMessageId includes the angle brackets in the stored
+  // value. Strip whatever the caller passed in and re-wrap.
+  const id = String(internetMessageId).replace(/^<|>$/g, '');
+  // Single quotes inside an OData literal are escaped by doubling.
+  const escapedForOData = id.replace(/'/g, "''");
+  const filter = `internetMessageId eq '<${escapedForOData}>'`;
+  const url =
+    `${GRAPH_BASE}/me/messages?$filter=${encodeURIComponent(filter)}` +
+    `&$select=id,conversationId&$top=1`;
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const first = (data.value && data.value[0]) || null;
+    return first ? first.id : null;
+  } catch {
+    return null;
+  }
+}
 
 // Parse "Name <addr>, addr2, addr3" into Graph's recipient shape.
 function parseAddresses(s) {
@@ -34,6 +63,31 @@ function parseAddresses(s) {
 async function sendEmailViaGraph(account, mail) {
   const token = await ms.getAccessTokenForResource(account, GRAPH_SCOPE);
 
+  const attachments = buildAttachments(mail.attachments);
+
+  // Threading via Graph requires the `createReply` action, not raw
+  // `sendMail` with In-Reply-To headers — Graph silently ignores RFC
+  // threading headers and ALWAYS creates a new conversationId on
+  // /sendMail, which makes Outlook show the result as a fresh thread.
+  // So: when this is a reply, look up the parent in the mailbox and
+  // use /messages/{id}/createReply -> patch -> send, which inherits
+  // the conversationId and sets all RFC headers automatically.
+  if (mail.inReplyTo) {
+    const parentId = await findGraphMessageIdByInternetId(token, mail.inReplyTo);
+    if (parentId) {
+      return sendAsReplyViaGraph(token, parentId, mail, attachments);
+    }
+    // Parent not in this mailbox yet (or we lack Mail.Read). Fall through
+    // to the plain sendMail path — threading will degrade to client-side
+    // subject matching but the message still goes out.
+  }
+
+  return sendNewMessageViaGraph(token, mail, attachments);
+}
+
+// Plain new-thread send. Used when there's no inReplyTo or the parent
+// can't be located in the Microsoft mailbox.
+async function sendNewMessageViaGraph(token, mail, attachments) {
   const message = {
     subject: mail.subject || '',
     body: {
@@ -44,79 +98,119 @@ async function sendEmailViaGraph(account, mail) {
     ccRecipients: parseAddresses(mail.cc),
     bccRecipients: parseAddresses(mail.bcc)
   };
+  if (attachments.length) message.attachments = attachments;
 
-  // Threading headers for Graph: `internetMessageHeaders` only allows
-  // headers prefixed `x-`/`X-`, so standard names like In-Reply-To and
-  // References are rejected there. The supported workaround is to set
-  // them via `singleValueExtendedProperties` under PSETID_INTERNET_HEADERS
-  // (GUID 00020386-0000-0000-C000-000000000046, MAPI's "internet headers"
-  // namespace). Graph translates these into real RFC 5322 headers on the
-  // outbound message, which is what non-Microsoft recipients (and Outlook
-  // web) use to thread the reply correctly.
-  const extProps = [];
-  if (mail.inReplyTo) {
-    extProps.push({
-      id: 'String {00020386-0000-0000-C000-000000000046} Name In-Reply-To',
-      value: `<${mail.inReplyTo}>`
-    });
-  }
-  if (mail.references && mail.references.length) {
-    extProps.push({
-      id: 'String {00020386-0000-0000-C000-000000000046} Name References',
-      value: mail.references.map(r => `<${r}>`).join(' ')
-    });
-  }
-  if (extProps.length) message.singleValueExtendedProperties = extProps;
-
-  // Inline attachments (base64). Graph caps this at ~3 MB total per message;
-  // larger attachments need an upload-session API which we skip in MVP.
-  if (Array.isArray(mail.attachments) && mail.attachments.length) {
-    const totalBytes = mail.attachments.reduce((n, a) => n + (a.size || (a.content ? a.content.length : 0)), 0);
-    if (totalBytes > 3 * 1024 * 1024) {
-      throw new Error(
-        `Total attachment size ${(totalBytes / 1024 / 1024).toFixed(1)} MB exceeds Graph's 3 MB inline limit. ` +
-        `Use smaller files or split across messages.`
-      );
-    }
-    message.attachments = mail.attachments.map(a => ({
-      '@odata.type': '#microsoft.graph.fileAttachment',
-      name: a.filename || 'attachment',
-      contentType: a.content_type || 'application/octet-stream',
-      contentBytes: Buffer.isBuffer(a.content)
-        ? a.content.toString('base64')
-        : Buffer.from(a.content || '').toString('base64')
-    }));
-  }
-
-  const res = await fetch('https://graph.microsoft.com/v1.0/me/sendMail', {
+  const res = await fetch(`${GRAPH_BASE}/me/sendMail`, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${token}`,
+      Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({ message, saveToSentItems: true })
   });
+  await assertGraphOk(res, 202, 'sendMail');
+  return { messageId: null, accepted: parseAddresses(mail.to).map(r => r.emailAddress.address) };
+}
 
-  // Graph returns 202 Accepted on success.
-  if (res.status !== 202) {
-    let bodyText = '';
-    try { bodyText = await res.text(); } catch { /* ignore */ }
-    let parsed;
-    try { parsed = JSON.parse(bodyText); } catch { /* ignore */ }
-    const detail = (parsed && parsed.error && parsed.error.message) || bodyText || `HTTP ${res.status}`;
+// createReply -> patch -> send. Inherits the parent's conversationId so
+// Outlook threads the reply with the original message. Recipients can be
+// overridden — by default createReply sets toRecipients to the parent's
+// sender, which is usually what we want anyway.
+async function sendAsReplyViaGraph(token, parentMessageId, mail, attachments) {
+  // 1) Create the draft reply. Graph returns a full Message resource.
+  const draftRes = await fetch(
+    `${GRAPH_BASE}/me/messages/${encodeURIComponent(parentMessageId)}/createReply`,
+    { method: 'POST', headers: { Authorization: `Bearer ${token}` } }
+  );
+  await assertGraphOk(draftRes, 201, 'createReply');
+  const draft = await draftRes.json();
+  const draftId = draft.id;
 
-    let hint = '';
-    if (res.status === 401 || res.status === 403) {
-      hint = ' Token may be missing the Mail.Send Graph permission. ' +
-             'Disconnect and reconnect this Microsoft account, then admin-consent ' +
-             'the Mail.Send permission in your Azure App registration.';
-    } else if (res.status === 429) {
-      hint = ' Rate-limited by Graph. Try again in a minute.';
-    }
-    throw new Error(`Graph sendMail failed: ${detail}${hint}`);
+  // 2) PATCH the draft with our body + recipient overrides + attachments.
+  //    createReply pre-fills body with the quoted parent; we replace it
+  //    entirely so the reply contains just what the user typed.
+  const patch = {
+    subject: mail.subject || draft.subject,
+    body: {
+      contentType: mail.html ? 'HTML' : 'Text',
+      content: mail.html || mail.text || ''
+    },
+    toRecipients: parseAddresses(mail.to),
+    ccRecipients: parseAddresses(mail.cc),
+    bccRecipients: parseAddresses(mail.bcc)
+  };
+  const patchRes = await fetch(`${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}`, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(patch)
+  });
+  await assertGraphOk(patchRes, 200, 'PATCH reply draft');
+
+  // 3) Attach files one-by-one to the draft if any. (Graph requires
+  //    attachments to be added as child resources, not inline on PATCH.)
+  for (const att of attachments) {
+    const aRes = await fetch(
+      `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/attachments`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(att)
+      }
+    );
+    await assertGraphOk(aRes, 201, 'attach to reply draft');
   }
 
+  // 4) Send the draft. Graph returns 202 Accepted.
+  const sendRes = await fetch(
+    `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/send`,
+    { method: 'POST', headers: { Authorization: `Bearer ${token}` } }
+  );
+  await assertGraphOk(sendRes, 202, 'send reply draft');
+
   return { messageId: null, accepted: parseAddresses(mail.to).map(r => r.emailAddress.address) };
+}
+
+function buildAttachments(rawAttachments) {
+  const list = Array.isArray(rawAttachments) ? rawAttachments : [];
+  if (!list.length) return [];
+  const totalBytes = list.reduce((n, a) => n + (a.size || (a.content ? a.content.length : 0)), 0);
+  if (totalBytes > 3 * 1024 * 1024) {
+    throw new Error(
+      `Total attachment size ${(totalBytes / 1024 / 1024).toFixed(1)} MB exceeds Graph's 3 MB inline limit. ` +
+      `Use smaller files or split across messages.`
+    );
+  }
+  return list.map(a => ({
+    '@odata.type': '#microsoft.graph.fileAttachment',
+    name: a.filename || 'attachment',
+    contentType: a.content_type || 'application/octet-stream',
+    contentBytes: Buffer.isBuffer(a.content)
+      ? a.content.toString('base64')
+      : Buffer.from(a.content || '').toString('base64')
+  }));
+}
+
+async function assertGraphOk(res, expectedStatus, op) {
+  if (res.status === expectedStatus) return;
+  let bodyText = '';
+  try { bodyText = await res.text(); } catch { /* ignore */ }
+  let parsed;
+  try { parsed = JSON.parse(bodyText); } catch { /* ignore */ }
+  const detail = (parsed && parsed.error && parsed.error.message) || bodyText || `HTTP ${res.status}`;
+  let hint = '';
+  if (res.status === 401 || res.status === 403) {
+    hint = ' Token may be missing the Mail.Send / Mail.ReadWrite Graph permission. ' +
+           'Reconnect this Microsoft account and admin-consent both scopes.';
+  } else if (res.status === 429) {
+    hint = ' Rate-limited by Graph. Try again in a minute.';
+  }
+  throw new Error(`Graph ${op} failed: ${detail}${hint}`);
 }
 
 module.exports = { sendEmailViaGraph };
