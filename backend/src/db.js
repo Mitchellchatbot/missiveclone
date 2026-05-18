@@ -16,19 +16,49 @@ function shouldUseSsl() {
   return process.env.NODE_ENV === 'production';
 }
 
+// All missiveclone tables live under this Postgres schema. Defaulting to
+// "missive" keeps every table (users, threads, drafts, …) namespaced so
+// we can share a Supabase project with another app without colliding
+// on names like `users`. The schema is auto-created on init().
+const DB_SCHEMA = process.env.DB_SCHEMA || 'missive';
+// The literal we splice into the SCHEMA template — quoted so a future
+// admin who picks a schema with a hyphen or uppercase letter doesn't
+// silently get downcased / split.
+const QUOTED_SCHEMA = `"${DB_SCHEMA.replace(/"/g, '""')}"`;
+
 const pool = HAS_DB
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
       ssl: shouldUseSsl() ? { rejectUnauthorized: false } : false,
       max: 10,
       // Don't keep retrying forever on a busted DATABASE_URL.
-      connectionTimeoutMillis: 10000
+      connectionTimeoutMillis: 10000,
+      // Push search_path via libpq startup options so unqualified
+      // table references (in SCHEMA below and across the route files)
+      // resolve to our namespaced schema.
+      options: `-c search_path=${DB_SCHEMA},public`
     })
   : null;
 
-if (pool) pool.on('error', (err) => console.error('pg pool error', err));
+if (pool) {
+  pool.on('error', (err) => console.error('pg pool error', err));
+  // Belt-and-suspenders: when running through a transaction-mode
+  // pooler (Supabase's pgbouncer), the startup `options` are usually
+  // honored, but the SET on connect guarantees search_path is correct
+  // on every new physical backend that joins the pg pool.
+  pool.on('connect', (client) => {
+    client.query(`SET search_path TO ${DB_SCHEMA}, public`).catch(() => {
+      // Schema may not exist yet on first-ever boot — init() creates
+      // it. Silenced because the next query in init() (CREATE SCHEMA)
+      // is what fixes the world.
+    });
+  });
+}
 
 const SCHEMA = `
+CREATE SCHEMA IF NOT EXISTS ${QUOTED_SCHEMA};
+SET search_path TO ${QUOTED_SCHEMA}, public;
+
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
