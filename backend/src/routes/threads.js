@@ -205,9 +205,19 @@ router.get('/', wrap(async (req, res) => {
       sql += ` AND to_tsvector('simple', coalesce(t.search_text, '')) @@ plainto_tsquery('simple', $${params.length})`;
     }
   }
-  sql += ' ORDER BY t.last_message_at DESC LIMIT 200';
+  // Pagination: caller passes `limit` (1..200, default 50) + `offset`
+  // (>=0, default 0) so the UI can infinite-scroll instead of dumping
+  // a flat 200/1000 list every page load. Bounded so a runaway client
+  // can't ask for half a million rows.
+  const limit  = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+  params.push(limit);
+  const limitIdx = params.length;
+  params.push(offset);
+  const offsetIdx = params.length;
+  sql += ` ORDER BY t.last_message_at DESC LIMIT $${limitIdx} OFFSET $${offsetIdx}`;
   const rows = await many(sql, params);
-  res.json({ threads: rows });
+  res.json({ threads: rows, limit, offset, hasMore: rows.length === limit });
 }));
 
 router.get('/:id', wrap(async (req, res) => {
