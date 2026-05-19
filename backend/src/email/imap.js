@@ -226,8 +226,14 @@ async function syncFolder(client, acc, folder, direction) {
 async function syncAccount(accountId) {
   const acc = await getAccount(accountId);
   if (!acc) return 0;
-  const client = await buildClient(acc);
-  await client.connect();
+  let client;
+  try {
+    client = await buildClient(acc);
+    await client.connect();
+  } catch (e) {
+    await recordSyncError(accountId, e);
+    throw e;
+  }
   let count = 0;
   try {
     const { inbox, sent } = await detectFolders(client);
@@ -240,11 +246,33 @@ async function syncAccount(accountId) {
       try { count += await syncFolder(client, acc, sent, 'outbound'); }
       catch (e) { console.warn('sent folder sync failed for', acc.email, '-', e.message); }
     }
-    await query('UPDATE email_accounts SET last_synced_at = $1 WHERE id = $2', [Date.now(), acc.id]);
+    await query(
+      `UPDATE email_accounts
+         SET last_synced_at = $1, last_sync_error = NULL, last_sync_error_at = NULL
+         WHERE id = $2`,
+      [Date.now(), acc.id]
+    );
+  } catch (e) {
+    await recordSyncError(accountId, e);
+    throw e;
   } finally {
     await client.logout().catch(() => {});
   }
   return count;
+}
+
+async function recordSyncError(accountId, err) {
+  try {
+    const msg = (err && err.message) ? String(err.message).slice(0, 500) : String(err).slice(0, 500);
+    await query(
+      `UPDATE email_accounts
+         SET last_sync_error = $1, last_sync_error_at = $2
+         WHERE id = $3`,
+      [msg, Date.now(), accountId]
+    );
+  } catch (writeErr) {
+    console.error('recordSyncError write failed', writeErr.message);
+  }
 }
 
 async function appendToSentFolder(acc, raw) {
