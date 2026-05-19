@@ -261,9 +261,39 @@ async function syncAccount(accountId) {
   return count;
 }
 
+// ImapFlow throws errors whose .message is often just "Command failed";
+// the diagnostic info (auth-failed flag, server response, IMAP command,
+// OAuth refresh body) is on sibling properties. Microsoft's token endpoint
+// stashes the error JSON on err.body. We pull a curated set of fields into
+// a single readable string capped at 500 chars — never the full err.response
+// (can include credentials) or arbitrary stack traces.
+function formatSyncError(err) {
+  if (!err) return 'unknown error';
+  const msg = err.message ? String(err.message) : String(err);
+  const tags = [];
+  if (err.code) tags.push(`code=${err.code}`);
+  if (err.responseStatus) tags.push(`status=${err.responseStatus}`);
+  if (err.serverResponseCode) tags.push(`server=${err.serverResponseCode}`);
+  if (err.authenticationFailed) tags.push('authFailed');
+  if (err.command) tags.push(`cmd=${err.command}`);
+  const parts = [msg];
+  if (tags.length) parts.push(`[${tags.join(', ')}]`);
+  if (typeof err.responseText === 'string' && err.responseText) {
+    parts.push(`resp: ${err.responseText}`);
+  }
+  if (err.body && typeof err.body === 'object') {
+    const safe = {};
+    for (const k of ['error', 'error_description', 'error_codes', 'correlation_id', 'trace_id']) {
+      if (err.body[k] !== undefined) safe[k] = err.body[k];
+    }
+    if (Object.keys(safe).length) parts.push(`oauth: ${JSON.stringify(safe)}`);
+  }
+  return parts.join(' ').slice(0, 500);
+}
+
 async function recordSyncError(accountId, err) {
   try {
-    const msg = (err && err.message) ? String(err.message).slice(0, 500) : String(err).slice(0, 500);
+    const msg = formatSyncError(err);
     await query(
       `UPDATE email_accounts
          SET last_sync_error = $1, last_sync_error_at = $2
