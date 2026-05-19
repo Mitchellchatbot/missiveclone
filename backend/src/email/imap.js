@@ -244,16 +244,43 @@ async function syncFolder(client, acc, folder, direction) {
     return 0;
   }
 
+  // Pull messages. If Outlook rejects the range as invalid (our pre-check
+  // missed it because uidNext wasn't reported — happens for some mailboxes
+  // /folder responses), reset to 0 and try once more from the bottom.
+  // Without this fallback, stuck accounts can never self-heal because the
+  // FETCH throws before the success branch writes uid_validity.
   let count = 0;
   let maxUid = lastUid;
-  const range = `${lastUid + 1}:*`;
-  for await (const msg of client.fetch(range, { uid: true, source: true })) {
-    if (!msg.source) continue;
-    const parsed = await simpleParser(msg.source);
-    const ok = await ingestMessage(acc, msg.uid, folder, parsed, direction);
-    if (ok) count++;
-    if (msg.uid > maxUid) maxUid = msg.uid;
+  let attempted = false;
+  while (true) {
+    const range = `${lastUid + 1}:*`;
+    try {
+      for await (const msg of client.fetch(range, { uid: true, source: true })) {
+        if (!msg.source) continue;
+        const parsed = await simpleParser(msg.source);
+        const ok = await ingestMessage(acc, msg.uid, folder, parsed, direction);
+        if (ok) count++;
+        if (msg.uid > maxUid) maxUid = msg.uid;
+      }
+      break;
+    } catch (e) {
+      const text = `${e && e.message} ${e && e.responseText}`.toLowerCase();
+      const looksStale = text.includes('invalid') || text.includes('message set');
+      if (!attempted && looksStale && lastUid > 0) {
+        console.warn(
+          `fetch rejected as stale for ${acc.email}/${folder} ` +
+          `(lastUid=${lastUid}, uidNext=${uidNext}) — resetting to 0 and retrying`
+        );
+        lastUid = 0;
+        maxUid = 0;
+        count = 0;
+        attempted = true;
+        continue;
+      }
+      throw e;
+    }
   }
+
   if (maxUid > lastUid || currentValidity !== storedValidity) {
     await setFolderState(acc.id, folder, maxUid, currentValidity);
   }
