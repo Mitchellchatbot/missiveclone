@@ -331,6 +331,12 @@ const MIGRATIONS = [
   // Not exposed via the API; query the DB directly.
   `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS last_sync_error TEXT`,
   `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS last_sync_error_at BIGINT`,
+  // IMAP servers bump UIDVALIDITY when a mailbox is recreated (migration,
+  // archive/restore). When that happens our stored last_sync_uid points at
+  // messages that no longer exist and Outlook returns "The specified
+  // message set is invalid" for `<old_uid>:*` ranges, stranding the
+  // account. Stored as TEXT to dodge BIGINT range/overflow surprises.
+  `ALTER TABLE folder_sync_state ADD COLUMN IF NOT EXISTS uid_validity TEXT`,
   // imap_pass and smtp_pass were originally NOT NULL; OAuth accounts won't
   // have them, so relax the constraint.
   `ALTER TABLE email_accounts ALTER COLUMN imap_pass DROP NOT NULL`,
