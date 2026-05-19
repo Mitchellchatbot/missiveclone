@@ -169,19 +169,22 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
 
 async function getFolderState(accountId, folder) {
   const r = await one(
-    'SELECT last_sync_uid FROM folder_sync_state WHERE account_id = $1 AND folder = $2',
+    'SELECT last_sync_uid, uid_validity FROM folder_sync_state WHERE account_id = $1 AND folder = $2',
     [accountId, folder]
   );
-  return r ? Number(r.last_sync_uid) : 0;
+  return r
+    ? { lastUid: Number(r.last_sync_uid), uidValidity: r.uid_validity || null }
+    : { lastUid: 0, uidValidity: null };
 }
 
-async function setFolderState(accountId, folder, lastUid) {
+async function setFolderState(accountId, folder, lastUid, uidValidity) {
   await query(
-    `INSERT INTO folder_sync_state (account_id, folder, last_sync_uid)
-     VALUES ($1, $2, $3)
+    `INSERT INTO folder_sync_state (account_id, folder, last_sync_uid, uid_validity)
+     VALUES ($1, $2, $3, $4)
      ON CONFLICT (account_id, folder)
-     DO UPDATE SET last_sync_uid = EXCLUDED.last_sync_uid`,
-    [accountId, folder, lastUid]
+     DO UPDATE SET last_sync_uid = EXCLUDED.last_sync_uid,
+                   uid_validity  = EXCLUDED.uid_validity`,
+    [accountId, folder, lastUid, uidValidity]
   );
 }
 
@@ -207,11 +210,43 @@ async function detectFolders(client) {
 }
 
 async function syncFolder(client, acc, folder, direction) {
-  const lastUid = await getFolderState(acc.id, folder);
+  const mb = await client.mailboxOpen(folder);
+  const currentValidity = mb && mb.uidValidity != null ? String(mb.uidValidity) : null;
+  const uidNext = mb && mb.uidNext != null ? Number(mb.uidNext) : null;
+
+  let { lastUid, uidValidity: storedValidity } = await getFolderState(acc.id, folder);
+
+  // Two stale-watermark cases that both produce Outlook's
+  // "The specified message set is invalid" on `<lastUid+1>:*`:
+  //   1. UIDVALIDITY changed (mailbox recreated server-side).
+  //   2. We never tracked UIDVALIDITY before this fix and the mailbox
+  //      silently reset under us — detectable as lastUid >= uidNext.
+  // Either way, treat it as a fresh import. ingestMessage dedupes on
+  // message_id, so re-fetching previously-seen messages is bandwidth
+  // cost only — no duplicate rows.
+  const validityChanged = storedValidity && currentValidity && storedValidity !== currentValidity;
+  const watermarkPastUidNext = uidNext != null && lastUid >= uidNext;
+  if (validityChanged || watermarkPastUidNext) {
+    console.warn(
+      `folder state stale for ${acc.email}/${folder} ` +
+      `(lastUid=${lastUid}, uidNext=${uidNext}, ` +
+      `stored=${storedValidity}, current=${currentValidity}) — resetting`
+    );
+    lastUid = 0;
+  }
+
+  // Nothing to fetch — record current UIDVALIDITY so we can detect a
+  // future reset, then exit. Avoids issuing `1:*` against an empty box.
+  if (uidNext != null && lastUid + 1 >= uidNext) {
+    if (currentValidity !== storedValidity) {
+      await setFolderState(acc.id, folder, lastUid, currentValidity);
+    }
+    return 0;
+  }
+
   let count = 0;
   let maxUid = lastUid;
   const range = `${lastUid + 1}:*`;
-  await client.mailboxOpen(folder);
   for await (const msg of client.fetch(range, { uid: true, source: true })) {
     if (!msg.source) continue;
     const parsed = await simpleParser(msg.source);
@@ -219,7 +254,9 @@ async function syncFolder(client, acc, folder, direction) {
     if (ok) count++;
     if (msg.uid > maxUid) maxUid = msg.uid;
   }
-  if (maxUid > lastUid) await setFolderState(acc.id, folder, maxUid);
+  if (maxUid > lastUid || currentValidity !== storedValidity) {
+    await setFolderState(acc.id, folder, maxUid, currentValidity);
+  }
   return count;
 }
 
