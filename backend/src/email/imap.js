@@ -213,8 +213,20 @@ async function syncFolder(client, acc, folder, direction) {
   const mb = await client.mailboxOpen(folder);
   const currentValidity = mb && mb.uidValidity != null ? String(mb.uidValidity) : null;
   const uidNext = mb && mb.uidNext != null ? Number(mb.uidNext) : null;
+  const exists = mb && mb.exists != null ? Number(mb.exists) : null;
 
   let { lastUid, uidValidity: storedValidity } = await getFolderState(acc.id, folder);
+
+  // Empty mailbox — Outlook doesn't always advertise UIDNEXT in this case,
+  // and rejects `1:*` (and `<n>:*`) as "The specified message set is
+  // invalid". Record the current UIDVALIDITY and exit cleanly so the
+  // account doesn't stay marked as failed with a stale watermark.
+  if (exists === 0) {
+    if (lastUid !== 0 || currentValidity !== storedValidity) {
+      await setFolderState(acc.id, folder, 0, currentValidity);
+    }
+    return 0;
+  }
 
   // Two stale-watermark cases that both produce Outlook's
   // "The specified message set is invalid" on `<lastUid+1>:*`:
