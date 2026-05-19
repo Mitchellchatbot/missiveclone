@@ -331,6 +331,16 @@ async function startWatching(accountId) {
   }
   watchers.set(accountId, client);
 
+  // Without an 'error' listener, ImapFlow's long-lived IDLE socket emits
+  // unhandled 'error' on TCP timeout (NAT eviction, server-side idle limit)
+  // and crashes the whole Node process via uncaughtException. Catching it
+  // here drops the dead watcher; the 2-min cron poll keeps the account in
+  // sync until the next process restart re-attaches a fresh watcher.
+  client.on('error', (err) => {
+    console.warn('watcher socket error for', acc.email, '-', err && err.message);
+    watchers.delete(accountId);
+  });
+
   try {
     await client.connect();
     await client.mailboxOpen('INBOX');

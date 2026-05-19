@@ -10,6 +10,17 @@ if (!process.env.JWT_SECRET) {
   process.env.JWT_SECRET = require('crypto').randomBytes(32).toString('hex');
 }
 
+// Backstop: an unlistened socket 'error' from a long-lived ImapFlow watcher
+// (or any background async failure) would otherwise kill the process and
+// trigger a Railway restart loop. Log and keep running — per-watcher cleanup
+// happens at the source via client.on('error') in email/imap.js.
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', (err && err.stack) || err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', (reason && reason.stack) || reason);
+});
+
 const db = require('./db');
 const { many, ping, HAS_DB } = db;
 const authRoutes = require('./routes/auth');
