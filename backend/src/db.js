@@ -325,6 +325,12 @@ const MIGRATIONS = [
   `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS oauth_access_token TEXT`,
   `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS oauth_refresh_token TEXT`,
   `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS oauth_expires_at BIGINT`,
+  // Ops-only diagnostic: captures why a syncAccount() run threw (IMAP
+  // disabled by tenant, stale refresh token, decrypt failure, etc.) so we
+  // can SELECT this column to investigate accounts stuck on "Never synced".
+  // Not exposed via the API; query the DB directly.
+  `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS last_sync_error TEXT`,
+  `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS last_sync_error_at BIGINT`,
   // imap_pass and smtp_pass were originally NOT NULL; OAuth accounts won't
   // have them, so relax the constraint.
   `ALTER TABLE email_accounts ALTER COLUMN imap_pass DROP NOT NULL`,
