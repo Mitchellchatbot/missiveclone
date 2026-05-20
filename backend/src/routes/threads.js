@@ -429,7 +429,7 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
 
   await query(
     `UPDATE threads SET last_message_at = $1,
-       search_text = LEFT(coalesce(search_text, '') || ' ' || $2, 900000)
+       search_text = RIGHT(coalesce(search_text, '') || ' ' || $2, 500000)
      WHERE id = $3`,
     [now, [replySubject, replyTo, body_text || ''].join(' '), t.id]
   );
