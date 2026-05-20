@@ -153,18 +153,17 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     (parsed.text || '').slice(0, 4000)
   ].filter(Boolean).join(' ');
 
-  // Cap search_text at 500K characters. Postgres' tsvector tops out at 1MB
-  // *bytes*, and LEFT/RIGHT are *character*-based, so a higher char cap
-  // can still exceed 1MB once you factor in multi-byte UTF-8 (emoji,
-  // accents). 500K chars × max 4 bytes/char = 2MB worst case, but real
-  // email text averages ~1.2 B/char → ~600KB, well clear of the limit.
-  // RIGHT() keeps the newest content (recent messages search better)
-  // and drops the oldest.
+  // Cap search_text at 250K characters. Postgres' tsvector limit is 1,048,575
+  // *bytes*; RIGHT() counts *characters*. UTF-8 maxes at 4 bytes/char, so any
+  // cap ≤ floor(1048575 / 4) = 262,143 chars cannot exceed the byte limit no
+  // matter how emoji-/CJK-heavy the content is. 250K chars × max 4 B/char =
+  // 1,000,000 B worst case, ~300KB in real email text. Bytes-safe by
+  // arithmetic. RIGHT() keeps the newest content; older is dropped.
   await query(
     `UPDATE threads SET last_message_at = $1,
        status = CASE WHEN status = 'closed' AND $4 = 'inbound' THEN 'open' ELSE status END,
        snoozed_until = CASE WHEN $4 = 'inbound' THEN NULL ELSE snoozed_until END,
-       search_text = RIGHT(coalesce(search_text, '') || ' ' || $2, 500000)
+       search_text = RIGHT(coalesce(search_text, '') || ' ' || $2, 250000)
      WHERE id = $3`,
     [sentAt, searchAdd, threadId, dir]
   );
