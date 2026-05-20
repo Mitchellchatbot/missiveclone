@@ -339,12 +339,15 @@ router.post('/bulk', wrap(async (req, res) => {
     case 'assign':
       await query(`UPDATE threads SET assignee_id = $1 WHERE id = ANY($2::text[])`, [value || null, ids]);
       break;
-    case 'label_add':
+    case 'label_add': {
       if (!value) return res.status(400).json({ error: 'value=label_id required' });
-      for (const tid of ids) {
-        await query(`INSERT INTO thread_labels (thread_id, label_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [tid, value]);
-      }
+      const tuples = ids.map((_, i) => `($${i+1}, $${ids.length+1})`).join(', ');
+      await query(
+        `INSERT INTO thread_labels (thread_id, label_id) VALUES ${tuples} ON CONFLICT DO NOTHING`,
+        [...ids, value]
+      );
       break;
+    }
     default:
       return res.status(400).json({ error: 'unknown action' });
   }
@@ -418,12 +421,18 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
       files.length ? 1 : 0, now
     ]
   );
-  for (const f of files) {
-    const aid = uuid();
+  if (files.length) {
+    const values = [];
+    const params = [];
+    for (const f of files) {
+      const base = params.length;
+      values.push(`($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, $${base+8})`);
+      params.push(uuid(), id, req.user.workspace_id, f.filename, f.content_type, f.size, f.content, now);
+    }
     await query(
       `INSERT INTO attachments (id, message_id, workspace_id, filename, content_type, size_bytes, data, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [aid, id, req.user.workspace_id, f.filename, f.content_type, f.size, f.content, now]
+       VALUES ${values.join(', ')}`,
+      params
     );
   }
 
