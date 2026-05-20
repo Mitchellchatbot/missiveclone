@@ -101,6 +101,10 @@ router.get('/callback', wrap(async (req, res) => {
   let accountId;
   if (existing) {
     accountId = existing.id;
+    // Overwrite IMAP/SMTP host config too. If the row was originally a
+    // Gmail account that the user re-OAuth'd into Microsoft, the leftover
+    // imap.gmail.com host would cause ImapFlow to hand the Microsoft
+    // token to Gmail's IMAP — which rejects it as AUTHENTICATIONFAILED.
     await query(
       `UPDATE email_accounts
          SET provider = 'microsoft',
@@ -108,9 +112,17 @@ router.get('/callback', wrap(async (req, res) => {
              oauth_refresh_token = $2,
              oauth_expires_at = $3,
              team_space_id = COALESCE(team_space_id, $4),
-             display_name = COALESCE(display_name, $5)
+             display_name = COALESCE(display_name, $5),
+             imap_host = 'outlook.office365.com',
+             imap_port = 993,
+             imap_secure = 1,
+             imap_user = $7,
+             smtp_host = 'smtp.office365.com',
+             smtp_port = 587,
+             smtp_secure = 0,
+             smtp_user = $7
          WHERE id = $6`,
-      [accessEnc, refreshEnc, expiresAt, tsId, profile.displayName || null, existing.id]
+      [accessEnc, refreshEnc, expiresAt, tsId, profile.displayName || null, existing.id, email]
     );
   } else {
     accountId = uuid();
