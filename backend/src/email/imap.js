@@ -153,11 +153,15 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     (parsed.text || '').slice(0, 4000)
   ].filter(Boolean).join(' ');
 
+  // Cap search_text at 900KB. Postgres' tsvector tops out at 1MB; the GIN
+  // index update on threads.search_text throws 54000 once a busy thread
+  // accumulates past that. LEFT() truncates the oldest text first so
+  // recent content stays searchable.
   await query(
     `UPDATE threads SET last_message_at = $1,
        status = CASE WHEN status = 'closed' AND $4 = 'inbound' THEN 'open' ELSE status END,
        snoozed_until = CASE WHEN $4 = 'inbound' THEN NULL ELSE snoozed_until END,
-       search_text = coalesce(search_text, '') || ' ' || $2
+       search_text = LEFT(coalesce(search_text, '') || ' ' || $2, 900000)
      WHERE id = $3`,
     [sentAt, searchAdd, threadId, dir]
   );

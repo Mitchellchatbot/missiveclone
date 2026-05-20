@@ -5,7 +5,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "dev": "nodemon src/index.js",
+    "diagnose": "node scripts/diagnose-empty-inboxes.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
