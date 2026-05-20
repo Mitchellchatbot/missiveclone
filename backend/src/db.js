@@ -341,6 +341,11 @@ const MIGRATIONS = [
   // have them, so relax the constraint.
   `ALTER TABLE email_accounts ALTER COLUMN imap_pass DROP NOT NULL`,
   `ALTER TABLE email_accounts ALTER COLUMN smtp_pass DROP NOT NULL`,
+  // Index account_id on messages — used by mailbox_id thread filters
+  // (EXISTS messages WHERE thread_id=t.id AND account_id=$X), account
+  // deletes, and the reconnect-recovery UPDATE just below. Without it,
+  // those scans walk the entire messages table.
+  `CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account_id)`,
   // Reconnect-recovery: any messages whose account_id went NULL after a
   // disconnect get re-linked to whichever current mailbox in the same
   // workspace mentions that address in headers. Idempotent — only touches

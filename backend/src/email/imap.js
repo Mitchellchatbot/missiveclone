@@ -44,10 +44,12 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id) {
     .map(r => r.replace(/[<>]/g, '').trim()).filter(Boolean);
 
   const candidates = [inReply, ...refs].filter(Boolean);
-  for (const mid of candidates) {
+  if (candidates.length) {
     const m = await one(
-      'SELECT thread_id FROM messages WHERE message_id = $1 AND workspace_id = $2',
-      [mid, workspace_id]
+      `SELECT thread_id FROM messages
+       WHERE workspace_id = $1 AND message_id = ANY($2::text[])
+       LIMIT 1`,
+      [workspace_id, candidates]
     );
     if (m) return m.thread_id;
   }
@@ -125,22 +127,29 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     ]
   );
 
-  for (const att of attachments) {
-    if (!att.content) continue;
-    const aid = uuid();
-    await query(
-      `INSERT INTO attachments
-        (id, message_id, workspace_id, filename, content_type, size_bytes, content_id, data, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [
-        aid, id, acc.workspace_id,
+  const attRows = attachments.filter(a => a.content);
+  if (attRows.length) {
+    const nowMs = Date.now();
+    const values = [];
+    const params = [];
+    for (const att of attRows) {
+      const base = params.length;
+      values.push(`($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, $${base+8}, $${base+9})`);
+      params.push(
+        uuid(), id, acc.workspace_id,
         att.filename || 'attachment',
         att.contentType || 'application/octet-stream',
         att.size || (att.content && att.content.length) || 0,
         (att.cid || '').replace(/[<>]/g, '') || null,
         att.content,
-        Date.now()
-      ]
+        nowMs
+      );
+    }
+    await query(
+      `INSERT INTO attachments
+        (id, message_id, workspace_id, filename, content_type, size_bytes, content_id, data, created_at)
+       VALUES ${values.join(', ')}`,
+      params
     );
   }
 
