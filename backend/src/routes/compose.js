@@ -4,6 +4,7 @@ const { v4: uuid } = require('uuid');
 const { one, query } = require('../db');
 const { requireAuth } = require('../auth');
 const { sendEmail } = require('../email/smtp');
+const { fireWebhook } = require('../email/imap');
 const { emitToWorkspace } = require('../sockets');
 const wrap = require('../util/wrap');
 
@@ -85,12 +86,18 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
   );
 
   const msgId = uuid();
+  // folder='Sent' is written here so that when IMAP later polls the
+  // sender's Sent folder (or appendToSentFolder mirrors the message
+  // there) the dedup key (message_id, account_id, folder) matches and
+  // we don't end up with two outbound rows for one email. Without
+  // this, the dedup would miss because the existing row had
+  // folder=NULL while the IMAP fetch carried folder='Sent'.
   await query(
     `INSERT INTO messages
-      (id, thread_id, account_id, workspace_id, direction, message_id,
+      (id, thread_id, account_id, workspace_id, direction, folder, message_id,
        subject, from_addr, to_addrs, cc_addrs, body_text, body_html, sent_at,
        has_attachments, created_at)
-      VALUES ($1, $2, $3, $4, 'outbound', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+      VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
     [msgId, threadId, acc.id, req.user.workspace_id, messageId,
      subject, '', to, cc || '', body_text || '', body_html || '',
      now, files.length ? 1 : 0, now]
@@ -104,8 +111,20 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
     );
   }
 
-  emitToWorkspace(req.user.workspace_id, 'thread:updated', { thread_id: threadId });
-  emitToWorkspace(req.user.workspace_id, 'message:new', { thread_id: threadId, message_id: msgId });
+  // account_id on the wire is what lets DelegationDoer's per-user SSE
+  // filter scope events to the accounts a worker can see; without it
+  // only leaders would see compose-sent emails appear live.
+  emitToWorkspace(req.user.workspace_id, 'thread:updated', { thread_id: threadId, account_id: acc.id });
+  emitToWorkspace(req.user.workspace_id, 'message:new', { thread_id: threadId, message_id: msgId, account_id: acc.id });
+  // Also push to DD via the HMAC webhook so the redundant push path
+  // covers compose-sent mail too. Same as what ingestMessage does for
+  // inbound IMAP deliveries.
+  fireWebhook('message:new', {
+    workspace_id: req.user.workspace_id,
+    account_id: acc.id,
+    thread_id: threadId,
+    message_id: msgId
+  });
 
   res.json({ ok: true, thread_id: threadId, message_id: msgId });
 }));

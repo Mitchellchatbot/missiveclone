@@ -4,7 +4,9 @@ const { v4: uuid } = require('uuid');
 const { one, many, query } = require('../db');
 const { requireAuth } = require('../auth');
 const { sendEmail } = require('../email/smtp');
+const { appendThreadSearchText } = require('../email/imap');
 const { emitToWorkspace } = require('../sockets');
+const { fireWebhook } = require('../email/imap');
 const wrap = require('../util/wrap');
 
 const router = express.Router();
@@ -409,11 +411,14 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
 
   const id = uuid();
   const now = Date.now();
+  // folder='Sent' so the dedup key (message_id, account_id, folder)
+  // matches when IMAP later polls the sender's Sent folder for the
+  // same message. Without this we'd end up with two outbound rows.
   await query(
     `INSERT INTO messages
-      (id, thread_id, account_id, workspace_id, direction, message_id, in_reply_to,
+      (id, thread_id, account_id, workspace_id, direction, folder, message_id, in_reply_to,
        subject, from_addr, to_addrs, cc_addrs, body_text, body_html, sent_at, has_attachments, created_at)
-      VALUES ($1, $2, $3, $4, 'outbound', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+      VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
     [
       id, t.id, acc.id, req.user.workspace_id, sent.messageId,
       last ? last.message_id : null, replySubject,
@@ -437,17 +442,26 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
   }
 
   await query(
-    `UPDATE threads SET last_message_at = $1,
-       search_text = RIGHT(coalesce(search_text, '') || ' ' || $2, 250000)
-     WHERE id = $3`,
-    [now, [replySubject, replyTo, body_text || ''].join(' '), t.id]
+    `UPDATE threads SET last_message_at = $1 WHERE id = $2`,
+    [now, t.id]
   );
+  await appendThreadSearchText(t.id, [replySubject, replyTo, body_text || ''].join(' '));
 
   // Successful send: clear this user's draft for the thread.
   await query('DELETE FROM drafts WHERE user_id = $1 AND thread_id = $2', [req.user.id, t.id]);
 
-  emitToWorkspace(req.user.workspace_id, 'message:new', { thread_id: t.id, message_id: id });
-  emitToWorkspace(req.user.workspace_id, 'thread:updated', { thread_id: t.id });
+  // account_id on the wire scopes DD's per-user SSE filter to the
+  // workers who can see this mailbox.
+  emitToWorkspace(req.user.workspace_id, 'message:new', { thread_id: t.id, message_id: id, account_id: acc.id });
+  emitToWorkspace(req.user.workspace_id, 'thread:updated', { thread_id: t.id, account_id: acc.id });
+  // Also push to DD via the HMAC webhook so the redundant push path
+  // covers replies too. Symmetric with ingestMessage on the inbound side.
+  fireWebhook('message:new', {
+    workspace_id: req.user.workspace_id,
+    account_id: acc.id,
+    thread_id: t.id,
+    message_id: id
+  });
   res.json({ ok: true, message_id: id });
 }));
 

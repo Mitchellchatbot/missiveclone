@@ -196,10 +196,10 @@ server.listen(PORT, '0.0.0.0', () => {
                  now]
               );
               await query(
-                `INSERT INTO messages (id, thread_id, account_id, workspace_id, direction,
+                `INSERT INTO messages (id, thread_id, account_id, workspace_id, direction, folder,
                   message_id, subject, from_addr, to_addrs, cc_addrs, body_text, body_html,
                   sent_at, created_at)
-                 VALUES ($1, $2, $3, $4, 'outbound', $5, $6, '', $7, $8, $9, $10, $11, $12)`,
+                 VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, '', $7, $8, $9, $10, $11, $12)`,
                 [msgId, threadId, s.account_id, s.workspace_id, sent.messageId,
                  s.subject || '', s.to_addrs || '', s.cc_addrs || '',
                  s.body_text || '', s.body_html || '', now, now]
@@ -208,6 +208,15 @@ server.listen(PORT, '0.0.0.0', () => {
               await query(`UPDATE scheduled_messages SET status = 'sent', thread_id = $1 WHERE id = $2`, [threadId, s.id]);
               emitToWorkspace(s.workspace_id, 'thread:updated', { thread_id: threadId, account_id: s.account_id });
               emitToWorkspace(s.workspace_id, 'message:new', { thread_id: threadId, message_id: msgId, account_id: s.account_id });
+              // Push to DD via webhook so the scheduled email shows
+              // up live just like a compose-sent one would.
+              const { fireWebhook } = require('./email/imap');
+              fireWebhook('message:new', {
+                workspace_id: s.workspace_id,
+                account_id: s.account_id,
+                thread_id: threadId,
+                message_id: msgId
+              });
             } catch (e) {
               console.error('scheduled send failed', s.id, e.message);
               await query(

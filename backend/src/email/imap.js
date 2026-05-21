@@ -185,10 +185,32 @@ async function appendThreadSearchText(threadId, fragment) {
 
 async function ingestMessage(acc, uid, folder, parsed, direction) {
   const messageId = (parsed.messageId || '').replace(/[<>]/g, '');
+  const fromAddr = parsed.from ? parsed.from.text : '';
+  const fromAddrLower = (parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address || '').toLowerCase();
+  // If caller didn't pre-decide direction, infer from From: header.
+  const dir = direction || (fromAddrLower === acc.email.toLowerCase() ? 'outbound' : 'inbound');
   if (messageId) {
+    // Dedup is scoped to (message_id, account_id, direction). Key
+    // properties:
+    //   - Re-polling the same folder catches duplicates (same direction
+    //     each time) ✓
+    //   - A self-sent email landing in Sent (direction=outbound) AND
+    //     in INBOX (direction=inbound) for the same mailbox gets two
+    //     records, matching Gmail/Outlook behavior ✓
+    //   - The same email reaching two different mailboxes in the same
+    //     workspace produces one record per mailbox (different
+    //     account_id) ✓
+    // The old (message_id, workspace_id) key was too aggressive — it
+    // caused self-sent emails composed in DelegationDoer to never
+    // appear in the sender's own INBOX view (the outbound record was
+    // created by compose, then dedup blocked the inbound copy from
+    // ever being ingested).
     const dup = await one(
-      'SELECT id FROM messages WHERE message_id = $1 AND workspace_id = $2',
-      [messageId, acc.workspace_id]
+      `SELECT id FROM messages
+        WHERE message_id = $1
+          AND account_id = $2
+          AND direction = $3`,
+      [messageId, acc.id, dir]
     );
     if (dup) return false;
   }
@@ -196,10 +218,6 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
   const threadId = await findOrCreateThread(acc.workspace_id, parsed, acc.team_space_id, acc.id);
   const id = uuid();
   const sentAt = parsed.date ? new Date(parsed.date).getTime() : Date.now();
-  const fromAddr = parsed.from ? parsed.from.text : '';
-  const fromAddrLower = (parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address || '').toLowerCase();
-  // If caller didn't pre-decide direction, infer from From: header.
-  const dir = direction || (fromAddrLower === acc.email.toLowerCase() ? 'outbound' : 'inbound');
   const attachments = Array.isArray(parsed.attachments) ? parsed.attachments : [];
   const hasAtt = attachments.length > 0 ? 1 : 0;
 
@@ -649,5 +667,5 @@ function startWatchdog() {
 
 module.exports = {
   syncAccount, startWatching, stopWatching, startAllWatchers, startWatchdog,
-  appendToSentFolder, appendThreadSearchText
+  appendToSentFolder, appendThreadSearchText, fireWebhook
 };
