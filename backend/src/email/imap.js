@@ -269,8 +269,13 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
   );
   await appendThreadSearchText(threadId, searchAdd);
 
-  emitToWorkspace(acc.workspace_id, 'thread:updated', { thread_id: threadId });
-  emitToWorkspace(acc.workspace_id, 'message:new', { thread_id: threadId, message_id: id });
+  // account_id is included so consumers that filter by which inbox the
+  // event belongs to (e.g. DelegationDoer's per-user SSE stream, which
+  // only delivers events for the accounts a worker is allowed to see)
+  // can scope without a second round-trip. Missiveclone's own frontend
+  // ignores extra fields.
+  emitToWorkspace(acc.workspace_id, 'thread:updated', { thread_id: threadId, account_id: acc.id });
+  emitToWorkspace(acc.workspace_id, 'message:new', { thread_id: threadId, message_id: id, account_id: acc.id });
 
   // Push to DelegationDoer so the sidebar badge + inbox list can refresh
   // in real time instead of waiting on the 30s poll. Only fires for
