@@ -206,8 +206,8 @@ server.listen(PORT, '0.0.0.0', () => {
               );
 
               await query(`UPDATE scheduled_messages SET status = 'sent', thread_id = $1 WHERE id = $2`, [threadId, s.id]);
-              emitToWorkspace(s.workspace_id, 'thread:updated', { thread_id: threadId });
-              emitToWorkspace(s.workspace_id, 'message:new', { thread_id: threadId, message_id: msgId });
+              emitToWorkspace(s.workspace_id, 'thread:updated', { thread_id: threadId, account_id: s.account_id });
+              emitToWorkspace(s.workspace_id, 'message:new', { thread_id: threadId, message_id: msgId, account_id: s.account_id });
             } catch (e) {
               console.error('scheduled send failed', s.id, e.message);
               await query(
