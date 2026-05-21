@@ -38,7 +38,10 @@ function normalizeAddrList(list) {
   return list.text || '';
 }
 
-async function findOrCreateThread(workspace_id, parsed, team_space_id) {
+async function findOrCreateThread(workspace_id, parsed, team_space_id, account_id) {
+  // RFC 5322 threading first — Message-ID chain via In-Reply-To /
+  // References. This is the only path that's safe across accounts;
+  // a real reply chain genuinely belongs in one thread.
   const inReply = (parsed.inReplyTo || '').replace(/[<>]/g, '').trim() || null;
   const refs = (parsed.references ? (Array.isArray(parsed.references) ? parsed.references : [parsed.references]) : [])
     .map(r => r.replace(/[<>]/g, '').trim()).filter(Boolean);
@@ -54,13 +57,30 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id) {
     if (m) return m.thread_id;
   }
 
+  // Subject-based fallback — used when the email is the first in a
+  // conversation (no In-Reply-To). Scoped to the SAME account_id +
+  // SAME sender so unrelated notification emails to different
+  // mailboxes don't merge. Previous behavior was workspace-wide
+  // subject match, which collapsed every "Email Account Activity"
+  // GoDaddy notification across all 23 mailboxes into one
+  // 160-message mega-thread. Don't do that.
   const subject = (parsed.subject || '').trim();
   const cleanSubj = subject.replace(/^(re|fwd|fw)\s*:\s*/i, '').trim();
-  if (cleanSubj) {
+  const fromAddrLower = (parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address || '').toLowerCase();
+  if (cleanSubj && account_id && fromAddrLower) {
     const t = await one(
-      `SELECT id FROM threads WHERE workspace_id = $1 AND subject = $2
-       ORDER BY last_message_at DESC LIMIT 1`,
-      [workspace_id, cleanSubj]
+      `SELECT t.id FROM threads t
+        WHERE t.workspace_id = $1
+          AND t.subject = $2
+          AND EXISTS (
+            SELECT 1 FROM messages m
+             WHERE m.thread_id = t.id
+               AND m.account_id = $3
+               AND LOWER(m.from_addr) LIKE '%' || $4 || '%'
+          )
+        ORDER BY t.last_message_at DESC
+        LIMIT 1`,
+      [workspace_id, cleanSubj, account_id, fromAddrLower]
     );
     if (t) return t.id;
   }
@@ -98,7 +118,7 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     if (dup) return false;
   }
 
-  const threadId = await findOrCreateThread(acc.workspace_id, parsed, acc.team_space_id);
+  const threadId = await findOrCreateThread(acc.workspace_id, parsed, acc.team_space_id, acc.id);
   const id = uuid();
   const sentAt = parsed.date ? new Date(parsed.date).getTime() : Date.now();
   const fromAddr = parsed.from ? parsed.from.text : '';
