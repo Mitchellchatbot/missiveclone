@@ -38,7 +38,7 @@ const labelRoutes = require('./routes/labels');
 const scheduledRoutes = require('./routes/scheduled');
 const oauthMicrosoftRoutes = require('./routes/oauth_microsoft');
 const { initSockets } = require('./sockets');
-const { startAllWatchers, syncAccount } = require('./email/imap');
+const { startAllWatchers, startWatchdog, syncAccount } = require('./email/imap');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -138,7 +138,12 @@ server.listen(PORT, '0.0.0.0', () => {
       console.log('[boot] DB ready');
 
       try { await startAllWatchers(); } catch (e) { console.error('[boot] watchers failed', e.message); }
+      try { startWatchdog(); } catch (e) { console.error('[boot] watchdog failed', e.message); }
 
+      // Fallback poll. Dropped from 2 min → 30s now that the pool's
+      // larger and watchers self-heal on disconnect — this is purely a
+      // safety net for the rare case where IDLE silently misses an
+      // EXISTS event (some Exchange tenants under load).
       setInterval(async () => {
         try {
           const accs = await many('SELECT id FROM email_accounts');
@@ -148,7 +153,7 @@ server.listen(PORT, '0.0.0.0', () => {
         } catch (e) {
           console.error('poll loop', e.message);
         }
-      }, 2 * 60 * 1000);
+      }, 30 * 1000);
 
       // Scheduled-send dispatcher — every 30s, send any due messages.
       const { sendEmail } = require('./email/smtp');

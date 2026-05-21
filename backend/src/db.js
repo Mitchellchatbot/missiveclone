@@ -30,9 +30,17 @@ const pool = HAS_DB
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
       ssl: shouldUseSsl() ? { rejectUnauthorized: false } : false,
-      max: 10,
-      // Don't keep retrying forever on a busted DATABASE_URL.
-      connectionTimeoutMillis: 10000,
+      // Bumped from 10 → 30. The old ceiling was getting exhausted under
+      // sidebar polls × N users + cron + IDLE callbacks, surfacing in DD
+      // as "timeout exceeded when trying to connect" 500s. 30 keeps
+      // plenty of headroom for our scale without thrashing Supabase.
+      max: 30,
+      // 5s connection timeout (was 10s) — fail fast when the pool is
+      // saturated so callers can degrade instead of stacking up.
+      connectionTimeoutMillis: 5000,
+      // 60s idle timeout (was the 30s default) so steady-state load
+      // doesn't churn through TCP+TLS handshakes on every other query.
+      idleTimeoutMillis: 60000,
       // Push search_path via libpq startup options so unqualified
       // table references (in SCHEMA below and across the route files)
       // resolve to our namespaced schema.
@@ -46,8 +54,14 @@ if (pool) {
   // pooler (Supabase's pgbouncer), the startup `options` are usually
   // honored, but the SET on connect guarantees search_path is correct
   // on every new physical backend that joins the pg pool.
+  // Also caps any single statement at 15s so a runaway query can't
+  // hold a pool slot indefinitely — protects against the "one slow
+  // query starves everyone else" failure mode we keep hitting.
   pool.on('connect', (client) => {
-    client.query(`SET search_path TO ${DB_SCHEMA}, public`).catch(() => {
+    Promise.all([
+      client.query(`SET search_path TO ${DB_SCHEMA}, public`),
+      client.query(`SET statement_timeout = '15s'`)
+    ]).catch(() => {
       // Schema may not exist yet on first-ever boot — init() creates
       // it. Silenced because the next query in init() (CREATE SCHEMA)
       // is what fixes the world.
