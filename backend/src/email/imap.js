@@ -1,12 +1,43 @@
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const { v4: uuid } = require('uuid');
+const crypto = require('crypto');
 const { one, many, query } = require('../db');
 const { decrypt } = require('../crypto');
 const { emitToWorkspace } = require('../sockets');
 const ms = require('../oauth/microsoft');
 
+// Per-account live IMAP IDLE clients. Map key is account id.
 const watchers = new Map();
+// Per-account exponential-backoff state for the self-healing reconnect.
+// Tracked separately from `watchers` so a queued retry can be cancelled
+// when stopWatching() is called.
+const retryState = new Map();
+
+// DD webhook target. Read once at module load — set on Railway as
+// WEBHOOK_URL=https://<dd-host>/api/missive-webhook. Both env vars
+// must be present or we skip silently (keeps local dev working).
+const WEBHOOK_URL = process.env.WEBHOOK_URL || null;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
+
+// Fire-and-forget webhook to DD when a new message lands. Non-blocking:
+// ingest must complete even if DD is down. Polling on the DD side is
+// the backstop, so we don't retry on failure — just log.
+function fireWebhook(event, payload) {
+  if (!WEBHOOK_URL || !WEBHOOK_SECRET) return;
+  const body = JSON.stringify({ event, ts: Date.now(), ...payload });
+  const sig = crypto.createHmac('sha256', WEBHOOK_SECRET).update(body).digest('hex');
+  fetch(WEBHOOK_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Missive-Signature': sig
+    },
+    body
+  }).catch((err) => {
+    console.warn('[webhook] fire failed', event, err && err.message);
+  });
+}
 
 function getAccount(id) {
   return one('SELECT * FROM email_accounts WHERE id = $1', [id]);
@@ -108,6 +139,50 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id, account_i
   return id;
 }
 
+// Append a new fragment to threads.search_text under a character cap,
+// resilient to the GIN to_tsvector trigger's 1 MB-per-tsvector ceiling.
+//
+// Why the retry: to_tsvector emits a lexeme + position list per occurrence,
+// so for token-dense content (URLs, IDs, code) the output tsvector can
+// exceed the input string in bytes. A cap on the input doesn't guarantee
+// the trigger won't reject. Real-world incident: a thread's cap-250K
+// search_text produced a 1.05 MB tsvector and crashed every subsequent
+// ingest for that account.
+//
+// First try the normal capped append (100K chars — empirically safe with
+// headroom). If that overflows, replace search_text with just the new
+// fragment: search degrades for that one bloated thread, but ingest never
+// breaks. Both attempts swallow tsvector errors; other errors propagate.
+async function appendThreadSearchText(threadId, fragment) {
+  const SEARCH_TEXT_CAP = 100000;
+  const isTsvectorOverflow = (e) =>
+    String((e && e.message) || '').includes('too long for tsvector');
+
+  try {
+    await query(
+      `UPDATE threads SET search_text = RIGHT(coalesce(search_text, '') || ' ' || $2, $3)
+       WHERE id = $1`,
+      [threadId, fragment, SEARCH_TEXT_CAP]
+    );
+    return;
+  } catch (e) {
+    if (!isTsvectorOverflow(e)) throw e;
+    console.warn(`[ingest] tsvector overflow on thread ${threadId} appending search_text — replacing with latest fragment only`);
+  }
+  try {
+    await query(
+      `UPDATE threads SET search_text = $1 WHERE id = $2`,
+      [String(fragment).slice(0, SEARCH_TEXT_CAP), threadId]
+    );
+  } catch (e) {
+    if (isTsvectorOverflow(e)) {
+      console.error(`[ingest] cannot update search_text for thread ${threadId} even after reset — skipping`);
+      return;
+    }
+    throw e;
+  }
+}
+
 async function ingestMessage(acc, uid, folder, parsed, direction) {
   const messageId = (parsed.messageId || '').replace(/[<>]/g, '');
   if (messageId) {
@@ -182,23 +257,33 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     (parsed.text || '').slice(0, 4000)
   ].filter(Boolean).join(' ');
 
-  // Cap search_text at 250K characters. Postgres' tsvector limit is 1,048,575
-  // *bytes*; RIGHT() counts *characters*. UTF-8 maxes at 4 bytes/char, so any
-  // cap ≤ floor(1048575 / 4) = 262,143 chars cannot exceed the byte limit no
-  // matter how emoji-/CJK-heavy the content is. 250K chars × max 4 B/char =
-  // 1,000,000 B worst case, ~300KB in real email text. Bytes-safe by
-  // arithmetic. RIGHT() keeps the newest content; older is dropped.
+  // Split into two updates so a tsvector overflow on the GIN index can't
+  // abort ingestMessage. The non-search fields always succeed; search_text
+  // is best-effort via appendThreadSearchText.
   await query(
     `UPDATE threads SET last_message_at = $1,
-       status = CASE WHEN status = 'closed' AND $4 = 'inbound' THEN 'open' ELSE status END,
-       snoozed_until = CASE WHEN $4 = 'inbound' THEN NULL ELSE snoozed_until END,
-       search_text = RIGHT(coalesce(search_text, '') || ' ' || $2, 250000)
-     WHERE id = $3`,
-    [sentAt, searchAdd, threadId, dir]
+       status = CASE WHEN status = 'closed' AND $3 = 'inbound' THEN 'open' ELSE status END,
+       snoozed_until = CASE WHEN $3 = 'inbound' THEN NULL ELSE snoozed_until END
+     WHERE id = $2`,
+    [sentAt, threadId, dir]
   );
+  await appendThreadSearchText(threadId, searchAdd);
 
   emitToWorkspace(acc.workspace_id, 'thread:updated', { thread_id: threadId });
   emitToWorkspace(acc.workspace_id, 'message:new', { thread_id: threadId, message_id: id });
+
+  // Push to DelegationDoer so the sidebar badge + inbox list can refresh
+  // in real time instead of waiting on the 30s poll. Only fires for
+  // inbound — outbound messages were initiated from DD and the UI
+  // already updated optimistically.
+  if (dir === 'inbound') {
+    fireWebhook('message:new', {
+      workspace_id: acc.workspace_id,
+      account_id: acc.id,
+      thread_id: threadId,
+      message_id: id
+    });
+  }
   return true;
 }
 
@@ -411,6 +496,21 @@ async function recordSyncError(accountId, err) {
          WHERE id = $3`,
       [msg, Date.now(), accountId]
     );
+
+    // IMAP rejected the OAuth bearer token. The cached access_token is bad
+    // (revoked, wrong scope, or stale). Null it out so the next poll forces
+    // ensureFreshAccessToken to mint a new one via the refresh_token instead
+    // of replaying the same bad token for ~60 min until natural expiry.
+    // Harmless if the refresh token is also dead — the resulting refresh
+    // error is more diagnostic than a repeating AUTHENTICATE failure.
+    if (err && err.authenticationFailed) {
+      await query(
+        `UPDATE email_accounts
+           SET oauth_access_token = NULL, oauth_expires_at = 0
+           WHERE id = $1 AND provider = 'microsoft'`,
+        [accountId]
+      );
+    }
   } catch (writeErr) {
     console.error('recordSyncError write failed', writeErr.message);
   }
@@ -429,6 +529,27 @@ async function appendToSentFolder(acc, raw) {
   }
 }
 
+// Reconnect backoff: 5s base, doubled on each consecutive failure,
+// capped at 5 min, with ±25% jitter so a fleet of mailboxes coming
+// back from a shared incident doesn't synchronize their retries.
+const RETRY_BASE_MS = 5_000;
+const RETRY_CAP_MS = 5 * 60_000;
+
+function scheduleReconnect(accountId, attempt) {
+  const prev = retryState.get(accountId);
+  if (prev && prev.timer) clearTimeout(prev.timer);
+  const base = Math.min(RETRY_CAP_MS, RETRY_BASE_MS * Math.pow(2, Math.max(0, attempt - 1)));
+  const jitter = base * (0.75 + Math.random() * 0.5);
+  const delay = Math.round(jitter);
+  const timer = setTimeout(() => {
+    retryState.delete(accountId);
+    startWatching(accountId).catch((err) => {
+      console.warn('[watch] retry failed for', accountId, '-', err && err.message);
+    });
+  }, delay);
+  retryState.set(accountId, { timer, attempt });
+}
+
 async function startWatching(accountId) {
   if (watchers.has(accountId)) return;
   const acc = await getAccount(accountId);
@@ -438,19 +559,30 @@ async function startWatching(accountId) {
     client = await buildClient(acc);
   } catch (e) {
     console.error('buildClient failed for', acc.email, '-', e.message);
+    const prev = retryState.get(accountId);
+    scheduleReconnect(accountId, (prev && prev.attempt ? prev.attempt + 1 : 1));
     return;
   }
   watchers.set(accountId, client);
 
   // Without an 'error' listener, ImapFlow's long-lived IDLE socket emits
-  // unhandled 'error' on TCP timeout (NAT eviction, server-side idle limit)
-  // and crashes the whole Node process via uncaughtException. Catching it
-  // here drops the dead watcher; the 2-min cron poll keeps the account in
-  // sync until the next process restart re-attaches a fresh watcher.
-  client.on('error', (err) => {
-    console.warn('watcher socket error for', acc.email, '-', err && err.message);
-    watchers.delete(accountId);
-  });
+  // unhandled 'error' on TCP timeout (NAT eviction, server-side idle
+  // limit) and crashes the whole Node process via uncaughtException.
+  // Catching it here drops the dead watcher AND schedules a reconnect
+  // with exponential backoff so the account self-heals without needing
+  // a process restart — that was the previous behaviour and it was
+  // silently leaving accounts unwatched for hours.
+  const onDead = (label) => (err) => {
+    console.warn(`watcher ${label} for`, acc.email, '-', err && err.message);
+    if (watchers.get(accountId) === client) {
+      watchers.delete(accountId);
+      const prev = retryState.get(accountId);
+      scheduleReconnect(accountId, (prev && prev.attempt ? prev.attempt + 1 : 1));
+    }
+  };
+  client.on('error', onDead('error'));
+  client.on('close', onDead('close'));
+  client.on('end', onDead('end'));
 
   try {
     await client.connect();
@@ -458,9 +590,14 @@ async function startWatching(accountId) {
     client.on('exists', async () => {
       try { await syncAccount(accountId); } catch (e) { console.error('idle sync', e.message); }
     });
+    // Connected cleanly — clear any backoff so the *next* drop starts
+    // at 5s again instead of inheriting an old long delay.
+    retryState.delete(accountId);
   } catch (e) {
     console.error('watch error', e.message);
-    watchers.delete(accountId);
+    if (watchers.get(accountId) === client) watchers.delete(accountId);
+    const prev = retryState.get(accountId);
+    scheduleReconnect(accountId, (prev && prev.attempt ? prev.attempt + 1 : 1));
   }
 }
 
@@ -469,6 +606,11 @@ function stopWatching(accountId) {
   if (c) {
     try { c.logout(); } catch {}
     watchers.delete(accountId);
+  }
+  const rs = retryState.get(accountId);
+  if (rs && rs.timer) {
+    clearTimeout(rs.timer);
+    retryState.delete(accountId);
   }
 }
 
@@ -479,7 +621,28 @@ async function startAllWatchers() {
   }
 }
 
+// Periodic watchdog. Cron-style: every 5 minutes, look at every connected
+// account, and if its watcher is missing from the map, re-attach. This
+// catches the rare case where on-error didn't fire (or fired but the
+// retry timer was lost across a redeploy) — backstop to the per-watcher
+// auto-heal so an account can't stay dark indefinitely.
+function startWatchdog() {
+  setInterval(async () => {
+    try {
+      const rows = await many('SELECT id, email FROM email_accounts');
+      for (const r of rows) {
+        if (!watchers.has(r.id) && !retryState.has(r.id)) {
+          console.warn('[watchdog] re-attaching watcher for', r.email);
+          startWatching(r.id).catch(() => {});
+        }
+      }
+    } catch (e) {
+      console.error('[watchdog]', e && e.message);
+    }
+  }, 5 * 60_000);
+}
+
 module.exports = {
-  syncAccount, startWatching, stopWatching, startAllWatchers,
-  appendToSentFolder
+  syncAccount, startWatching, stopWatching, startAllWatchers, startWatchdog,
+  appendToSentFolder, appendThreadSearchText
 };
