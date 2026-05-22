@@ -174,6 +174,39 @@ router.post('/:id/test-graph', wrap(async (req, res) => {
   }
 }));
 
+// Workspace-wide rescan. Clears every Microsoft account's Graph delta
+// cursor (folder_sync_state.delta_link) so the next sync re-walks the
+// full mailbox from Outlook. ingestMessage dedupes on
+// (message_id, account_id, direction), so re-fetching previously-seen
+// messages is bandwidth cost only — no duplicate rows. Returns
+// immediately and runs sync in the background; check /api/accounts
+// for last_synced_at to know when each account is done.
+router.post('/rescan-all', wrap(async (req, res) => {
+  const accs = await many(
+    `SELECT id, email FROM email_accounts
+     WHERE workspace_id = $1 AND provider = 'microsoft'`,
+    [req.user.workspace_id]
+  );
+  if (!accs.length) return res.json({ ok: true, accounts: 0 });
+
+  await query(
+    `UPDATE folder_sync_state SET delta_link = NULL
+     WHERE account_id = ANY($1::text[])`,
+    [accs.map(a => a.id)]
+  );
+
+  // Fire each sync without awaiting — let them run in parallel and let
+  // the response come back fast. Per-user Graph rate limits apply per
+  // account, so concurrent fan-out is safe.
+  for (const a of accs) {
+    syncAccount(a.id).catch((err) => {
+      console.warn(`[rescan] sync failed for ${a.email}: ${err && err.message}`);
+    });
+  }
+
+  res.json({ ok: true, accounts: accs.length, account_ids: accs.map(a => a.id) });
+}));
+
 router.post('/:id/sync', wrap(async (req, res) => {
   const acc = await one(
     'SELECT id FROM email_accounts WHERE id = $1 AND workspace_id = $2',
