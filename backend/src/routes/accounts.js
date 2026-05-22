@@ -125,6 +125,55 @@ router.delete('/:id', wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// Diagnostic: confirm a Microsoft account's refresh token can mint a Graph
+// Mail.ReadWrite token AND that the resulting token can actually read mail.
+// Used to verify a migration from IMAP-sync to Graph-sync wouldn't force
+// every user to re-OAuth. If this returns ok:true, the existing tokens are
+// already good enough for inbound sync via Graph.
+router.post('/:id/test-graph', wrap(async (req, res) => {
+  const acc = await one(
+    `SELECT id, email, provider, oauth_refresh_token
+     FROM email_accounts WHERE id = $1 AND workspace_id = $2`,
+    [req.params.id, req.user.workspace_id]
+  );
+  if (!acc) return res.status(404).json({ error: 'not found' });
+  if (acc.provider !== 'microsoft') return res.status(400).json({ error: 'not a microsoft account' });
+  if (!acc.oauth_refresh_token) return res.status(400).json({ error: 'no refresh token stored' });
+
+  const ms = require('../oauth/microsoft');
+  const READ_SCOPE = 'https://graph.microsoft.com/Mail.ReadWrite offline_access';
+  try {
+    const token = await ms.getAccessTokenForResource(acc, READ_SCOPE);
+    const r = await fetch('https://graph.microsoft.com/v1.0/me/messages?$top=1&$select=id,subject,receivedDateTime', {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      return res.json({
+        ok: false,
+        token_minted: true,
+        graph_read_status: r.status,
+        graph_error: body.error || body
+      });
+    }
+    return res.json({
+      ok: true,
+      token_minted: true,
+      graph_read_status: r.status,
+      sample_count: Array.isArray(body.value) ? body.value.length : 0,
+      sample_subject: body.value && body.value[0] && body.value[0].subject
+    });
+  } catch (err) {
+    return res.json({
+      ok: false,
+      token_minted: false,
+      stage: 'token_mint',
+      error: err.message,
+      oauth: err.body || null
+    });
+  }
+}));
+
 router.post('/:id/sync', wrap(async (req, res) => {
   const acc = await one(
     'SELECT id FROM email_accounts WHERE id = $1 AND workspace_id = $2',
