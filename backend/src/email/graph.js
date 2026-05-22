@@ -244,4 +244,367 @@ async function assertGraphOk(res, expectedStatus, op) {
   throw new Error(`Graph ${op} failed: ${detail}${hint}`);
 }
 
-module.exports = { sendEmailViaGraph };
+// ────────────────────────────────────────────────────────────────────────
+// Graph-based inbound sync. Replaces IMAP for Microsoft accounts.
+//
+// Why: outlook.office365.com:993 throttles aggressively under any kind of
+// fleet load — once we held ~14 mailboxes on one Railway egress IP every
+// mailbox got "Connection not available" on IMAP, leaving Mitchell and
+// 13 others permanently unable to do an initial sync. Graph has its own
+// rate limits but they're per-user (not per-IP), it never requires the
+// tenant admin to flip an IMAP-enabled toggle per user, and Microsoft is
+// deprecating Basic Auth + IMAP-OAuth entirely.
+//
+// Architecture: each call to syncAccountViaGraph runs a delta query on
+// the inbox and sent-items folders. Microsoft returns @odata.nextLink
+// for pagination and @odata.deltaLink at the end of the stream; we
+// persist that deltaLink in folder_sync_state.delta_link so the next
+// poll only fetches *changes* since the last call. Initial sync (no
+// deltaLink yet) walks the full mailbox once, paginated.
+// ────────────────────────────────────────────────────────────────────────
+
+const GRAPH_SYNC_SCOPE =
+  'https://graph.microsoft.com/Mail.ReadWrite offline_access';
+
+// Fields fetched per message. internetMessageHeaders is required for
+// threading via In-Reply-To / References (same path IMAP uses). body is
+// requested in HTML — we keep both bodyPreview (always populated by
+// Graph) as the text fallback.
+const MSG_SELECT = [
+  'id',
+  'internetMessageId',
+  'subject',
+  'from',
+  'toRecipients',
+  'ccRecipients',
+  'bccRecipients',
+  'body',
+  'bodyPreview',
+  'receivedDateTime',
+  'sentDateTime',
+  'hasAttachments',
+  'internetMessageHeaders',
+  'isDraft',
+  'conversationId'
+].join(',');
+
+// Fetch helper — adds Authorization header, throws on non-2xx with the
+// Graph error body inlined so callers can log a useful diagnostic. 410
+// (Gone) is the special "deltaLink expired" signal; we surface that as
+// an .expired flag rather than throwing.
+async function graphGet(url, token) {
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      // Without this, Graph returns Internet headers in lowercased form
+      // which mailparser-style consumers wouldn't recognize.
+      Prefer: 'outlook.body-content-type="html"'
+    }
+  });
+  if (res.status === 410) {
+    return { expired: true, status: 410 };
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { /* ignore */ }
+    const detail = (parsed && parsed.error && parsed.error.message) || text || `HTTP ${res.status}`;
+    const err = new Error(`Graph GET ${url.split('?')[0]} → ${res.status}: ${detail.slice(0, 300)}`);
+    err.status = res.status;
+    err.body = parsed || null;
+    throw err;
+  }
+  return await res.json();
+}
+
+// Turn a single Graph message + (optional, separately-fetched) attachments
+// array into the mailparser-shaped object ingestMessage expects. We don't
+// invoke mailparser here — Graph already gave us structured fields.
+function graphToParsed(msg, attachments) {
+  // Pull RFC headers off internetMessageHeaders so RFC-based threading
+  // (the only kind that's safe across accounts) keeps working.
+  const headers = Array.isArray(msg.internetMessageHeaders) ? msg.internetMessageHeaders : [];
+  const headerVal = (name) => {
+    const h = headers.find(h => h.name && h.name.toLowerCase() === name.toLowerCase());
+    return h ? h.value : null;
+  };
+  const inReplyTo = headerVal('In-Reply-To') || null;
+  const references = headerVal('References') || null;
+  const referencesArr = references
+    ? references.split(/\s+/).map(s => s.trim()).filter(Boolean)
+    : [];
+
+  const fromAddr = msg.from && msg.from.emailAddress
+    ? {
+        text: msg.from.emailAddress.name
+          ? `${msg.from.emailAddress.name} <${msg.from.emailAddress.address}>`
+          : msg.from.emailAddress.address,
+        value: [{ name: msg.from.emailAddress.name || '', address: msg.from.emailAddress.address || '' }]
+      }
+    : null;
+
+  const toRecipientsToList = (list) => {
+    if (!Array.isArray(list) || list.length === 0) return null;
+    const text = list
+      .map(r => r.emailAddress && (r.emailAddress.name
+        ? `${r.emailAddress.name} <${r.emailAddress.address}>`
+        : r.emailAddress.address))
+      .filter(Boolean)
+      .join(', ');
+    return text ? { text } : null;
+  };
+
+  const bodyContent = (msg.body && msg.body.content) || '';
+  const bodyType = (msg.body && msg.body.contentType || '').toLowerCase();
+  const html = bodyType === 'html' ? bodyContent : '';
+  const text = bodyType === 'text' ? bodyContent : (msg.bodyPreview || '');
+
+  // Microsoft strips angle brackets from internetMessageId in storage but
+  // adds them back on read. Either way ingestMessage strips them, so
+  // pass through as-is.
+  const messageId = msg.internetMessageId || '';
+
+  const date = msg.receivedDateTime
+    ? new Date(msg.receivedDateTime)
+    : (msg.sentDateTime ? new Date(msg.sentDateTime) : new Date());
+
+  return {
+    messageId,
+    inReplyTo,
+    references: referencesArr,
+    subject: msg.subject || '',
+    from: fromAddr,
+    to: toRecipientsToList(msg.toRecipients),
+    cc: toRecipientsToList(msg.ccRecipients),
+    bcc: toRecipientsToList(msg.bccRecipients),
+    text,
+    html,
+    date,
+    attachments: attachments || [],
+    // Surface conversationId so future enhancements can use Microsoft's
+    // own thread grouping if RFC-based grouping ever loses a candidate.
+    _graphConversationId: msg.conversationId || null
+  };
+}
+
+// Pull all attachments for a message and shape them like mailparser does
+// — { filename, contentType, size, cid, content (Buffer) }. fileAttachment
+// is the only common type; itemAttachment (nested message) and
+// referenceAttachment (OneDrive link) are exotic enough to skip for now.
+async function fetchAttachmentsForMessage(token, messageGraphId) {
+  const url =
+    `${GRAPH_BASE}/me/messages/${encodeURIComponent(messageGraphId)}/attachments` +
+    `?$select=id,name,contentType,size,contentId,isInline,@odata.type` +
+    // Include the binary content for fileAttachment in the same call.
+    `&$expand=microsoft.graph.fileAttachment/contentBytes`;
+  let json;
+  try {
+    json = await graphGet(url, token);
+  } catch (e) {
+    // Some Graph tenants don't support $expand on attachment content.
+    // Fall back to per-attachment fetch.
+    if (e.status === 400) {
+      const list = await graphGet(
+        `${GRAPH_BASE}/me/messages/${encodeURIComponent(messageGraphId)}/attachments`
+          + `?$select=id,name,contentType,size,contentId,isInline,@odata.type`,
+        token
+      );
+      const out = [];
+      for (const a of (list.value || [])) {
+        if (a['@odata.type'] !== '#microsoft.graph.fileAttachment') continue;
+        const full = await graphGet(
+          `${GRAPH_BASE}/me/messages/${encodeURIComponent(messageGraphId)}/attachments/${encodeURIComponent(a.id)}`,
+          token
+        );
+        if (full.contentBytes) {
+          out.push({
+            filename: full.name || 'attachment',
+            contentType: full.contentType || 'application/octet-stream',
+            size: full.size || 0,
+            cid: full.contentId || '',
+            content: Buffer.from(full.contentBytes, 'base64')
+          });
+        }
+      }
+      return out;
+    }
+    throw e;
+  }
+  const out = [];
+  for (const a of (json.value || [])) {
+    if (a['@odata.type'] !== '#microsoft.graph.fileAttachment') continue;
+    if (!a.contentBytes) continue;
+    out.push({
+      filename: a.name || 'attachment',
+      contentType: a.contentType || 'application/octet-stream',
+      size: a.size || 0,
+      cid: a.contentId || '',
+      content: Buffer.from(a.contentBytes, 'base64')
+    });
+  }
+  return out;
+}
+
+// Walk one Graph folder via delta. Returns { count, deltaLink } so the
+// caller can persist the new resume cursor only AFTER all pages
+// ingested cleanly. If a page mid-walk throws (network blip, ingest
+// error), we keep the OLD deltaLink and the next poll re-fetches from
+// the previous good point — message_id dedup makes that idempotent.
+async function syncFolderViaGraph(account, folderPath, direction) {
+  const { ingestMessage } = require('./imap');
+  const db = require('../db');
+
+  // Refresh the token once at the top of the folder walk. A walk may
+  // take many seconds; if Graph hands us back a long stream we don't
+  // want the token to expire mid-stream. ensureFreshAccessToken on the
+  // IMAP path does the same thing.
+  let token = await ms.getAccessTokenForResource(account, GRAPH_SYNC_SCOPE);
+
+  const stored = await db.one(
+    'SELECT delta_link FROM folder_sync_state WHERE account_id = $1 AND folder = $2',
+    [account.id, folderPath]
+  );
+  let url = stored && stored.delta_link
+    ? stored.delta_link
+    : `${GRAPH_BASE}/me/mailFolders/${encodeURIComponent(folderPath)}/messages/delta?$select=${MSG_SELECT}&$top=50`;
+
+  let count = 0;
+  let lastDeltaLink = null;
+  let pageNum = 0;
+  // Safety brake: 200 pages × 50 messages = 10k per folder per call,
+  // enough headroom for an initial sync but bounded enough that a runaway
+  // pagination loop can't hang the worker forever.
+  const MAX_PAGES = 200;
+
+  while (url && pageNum < MAX_PAGES) {
+    pageNum += 1;
+    let page;
+    try {
+      page = await graphGet(url, token);
+    } catch (e) {
+      // 401 mid-walk usually means the token aged out past its expiry
+      // (rare given we just minted it, but Graph sometimes invalidates
+      // out of band). Re-mint once and retry the same URL.
+      if (e.status === 401) {
+        token = await ms.getAccessTokenForResource(account, GRAPH_SYNC_SCOPE);
+        page = await graphGet(url, token);
+      } else {
+        throw e;
+      }
+    }
+    if (page.expired) {
+      // deltaLink expired — Microsoft drops the cursor after long gaps
+      // (28 days default). Clear it and restart from scratch on the
+      // next call. Don't try to recover inline; just stop and let the
+      // next poll do a fresh initial sync.
+      console.warn(`[graph] delta cursor expired for ${account.email}/${folderPath} — clearing and restarting next poll`);
+      await db.query(
+        `UPDATE folder_sync_state SET delta_link = NULL
+           WHERE account_id = $1 AND folder = $2`,
+        [account.id, folderPath]
+      );
+      return { count: 0, restarted: true };
+    }
+
+    const messages = Array.isArray(page.value) ? page.value : [];
+    for (const m of messages) {
+      // Skip drafts — Outlook stores in-progress drafts in the inbox/sent
+      // folders' delta stream, but they're not "real" mail.
+      if (m.isDraft) continue;
+      // @removed marks a deletion in delta semantics. We currently don't
+      // mirror Outlook deletions (would require tombstoning local rows),
+      // so skip and move on. Same as IMAP path's behavior.
+      if (m['@removed']) continue;
+
+      let attachments = [];
+      if (m.hasAttachments) {
+        try {
+          attachments = await fetchAttachmentsForMessage(token, m.id);
+        } catch (e) {
+          // One bad attachment fetch shouldn't strand the whole message.
+          // Log and continue with empty attachments — the message body
+          // still goes in and the user can re-fetch the attachment via
+          // a "redownload" path later if needed.
+          console.warn(`[graph] attachment fetch failed for ${m.id} (${account.email}): ${e.message}`);
+        }
+      }
+
+      const parsed = graphToParsed(m, attachments);
+      try {
+        const ok = await ingestMessage(account, /* uid */ 0, folderPath, parsed, direction);
+        if (ok) count += 1;
+      } catch (e) {
+        // Don't let one corrupt message kill the whole folder walk. Log
+        // and move on. The delta link we'd save still covers this message
+        // so we won't retry forever — caller can re-fetch by clearing
+        // the delta link manually if a fix lands.
+        console.warn(`[graph] ingest failed for ${m.id} (${account.email}): ${e.message}`);
+      }
+    }
+
+    if (page['@odata.nextLink']) {
+      url = page['@odata.nextLink'];
+      continue;
+    }
+    if (page['@odata.deltaLink']) {
+      lastDeltaLink = page['@odata.deltaLink'];
+    }
+    url = null;
+  }
+
+  // Resume-cursor selection:
+  //   - Got a deltaLink → save it. Next poll picks up changes only.
+  //   - Hit MAX_PAGES without deltaLink → save the unconsumed nextLink so
+  //     the next poll continues the initial sync where we left off.
+  //   - Neither (rare empty mailbox initial state) → leave previous
+  //     cursor alone.
+  if (!lastDeltaLink && pageNum >= MAX_PAGES && url) {
+    console.warn(`[graph] folder walk hit MAX_PAGES for ${account.email}/${folderPath} — saving nextLink to resume`);
+    lastDeltaLink = url;
+  }
+
+  // Persist resume cursor — only if we got one and only at the very end.
+  if (lastDeltaLink) {
+    await db.query(
+      `INSERT INTO folder_sync_state (account_id, folder, last_sync_uid, delta_link, uid_validity)
+       VALUES ($1, $2, 0, $3, NULL)
+       ON CONFLICT (account_id, folder)
+       DO UPDATE SET delta_link = EXCLUDED.delta_link`,
+      [account.id, folderPath, lastDeltaLink]
+    );
+  }
+
+  return { count, deltaLink: lastDeltaLink };
+}
+
+async function syncAccountViaGraph(account) {
+  const { recordSyncError } = require('./imap');
+  const db = require('../db');
+
+  // Microsoft uses fixed well-known names for the inbox + sent folders;
+  // no need to detect them like IMAP requires.
+  let totalCount = 0;
+  try {
+    const inbox = await syncFolderViaGraph(account, 'inbox', 'inbound');
+    totalCount += inbox.count || 0;
+    try {
+      const sent = await syncFolderViaGraph(account, 'sentitems', 'outbound');
+      totalCount += sent.count || 0;
+    } catch (e) {
+      // Sent-folder failure is non-fatal — inbox is the priority.
+      console.warn(`[graph] sentitems sync failed for ${account.email}: ${e.message}`);
+    }
+    await db.query(
+      `UPDATE email_accounts
+         SET last_synced_at = $1, last_sync_error = NULL, last_sync_error_at = NULL
+         WHERE id = $2`,
+      [Date.now(), account.id]
+    );
+    return totalCount;
+  } catch (e) {
+    await recordSyncError(account.id, e);
+    throw e;
+  }
+}
+
+module.exports = { sendEmailViaGraph, syncAccountViaGraph };

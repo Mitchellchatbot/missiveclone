@@ -351,6 +351,12 @@ const MIGRATIONS = [
   // message set is invalid" for `<old_uid>:*` ranges, stranding the
   // account. Stored as TEXT to dodge BIGINT range/overflow surprises.
   `ALTER TABLE folder_sync_state ADD COLUMN IF NOT EXISTS uid_validity TEXT`,
+  // Graph delta sync stores the @odata.deltaLink (a full URL containing
+  // the opaque resume token Microsoft returns at the end of each delta
+  // page) here. IMAP uses last_sync_uid + uid_validity; Graph uses this.
+  // The two pathways never share state, so it's safe to leave the IMAP
+  // columns untouched when a Microsoft account is synced via Graph.
+  `ALTER TABLE folder_sync_state ADD COLUMN IF NOT EXISTS delta_link TEXT`,
   // imap_pass and smtp_pass were originally NOT NULL; OAuth accounts won't
   // have them, so relax the constraint.
   `ALTER TABLE email_accounts ALTER COLUMN imap_pass DROP NOT NULL`,

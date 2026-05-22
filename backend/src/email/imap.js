@@ -445,6 +445,15 @@ async function syncFolder(client, acc, folder, direction) {
 async function syncAccount(accountId) {
   const acc = await getAccount(accountId);
   if (!acc) return 0;
+  // Microsoft accounts sync via Graph instead of IMAP — outlook.office365.com
+  // IMAP throttles aggressively per egress IP, which strands every mailbox
+  // on the same Railway service simultaneously. See graph.js header for
+  // the full story. graph.js handles recordSyncError and last_synced_at
+  // bookkeeping, so we just return its count.
+  if (acc.provider === 'microsoft') {
+    const { syncAccountViaGraph } = require('./graph');
+    return syncAccountViaGraph(acc);
+  }
   let client;
   try {
     client = await buildClient(acc);
@@ -577,6 +586,13 @@ async function startWatching(accountId) {
   if (watchers.has(accountId)) return;
   const acc = await getAccount(accountId);
   if (!acc) return;
+  // Microsoft accounts don't use IMAP IDLE — Graph delta polling via the
+  // 30s cron in index.js handles incremental sync. IDLE was the main
+  // source of "Connection not available" stalls. No watcher, no retry
+  // state, no work to do here. Real-time latency on Microsoft is now
+  // bounded by the cron interval; the migration off IDLE is the whole
+  // point of routing to Graph in the first place.
+  if (acc.provider === 'microsoft') return;
   let client;
   try {
     client = await buildClient(acc);
@@ -667,5 +683,8 @@ function startWatchdog() {
 
 module.exports = {
   syncAccount, startWatching, stopWatching, startAllWatchers, startWatchdog,
-  appendToSentFolder, appendThreadSearchText, fireWebhook
+  appendToSentFolder, appendThreadSearchText, fireWebhook,
+  // Exposed so graph.js can drive the same ingest pipeline without
+  // duplicating thread/message/attachment INSERT logic.
+  ingestMessage, recordSyncError, getAccount
 };
