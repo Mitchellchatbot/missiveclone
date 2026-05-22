@@ -450,7 +450,14 @@ async function fetchAttachmentsForMessage(token, messageGraphId) {
 // ingested cleanly. If a page mid-walk throws (network blip, ingest
 // error), we keep the OLD deltaLink and the next poll re-fetches from
 // the previous good point — message_id dedup makes that idempotent.
-async function syncFolderViaGraph(account, folderPath, direction) {
+//
+// `folderPath` is Graph's well-known name ('inbox' | 'sentitems') used
+// in the URL + folder_sync_state key. `folderLabel` is the value
+// written into messages.folder — it must match what the IMAP path
+// would have written (and what DelegationDoer's threads filter
+// queries against), e.g. 'INBOX' uppercase. The two diverge because
+// Graph URLs are lowercase but DD's UI filter is IMAP-flavored.
+async function syncFolderViaGraph(account, folderPath, direction, folderLabel) {
   const { ingestMessage } = require('./imap');
   const db = require('../db');
 
@@ -531,7 +538,7 @@ async function syncFolderViaGraph(account, folderPath, direction) {
 
       const parsed = graphToParsed(m, attachments);
       try {
-        const ok = await ingestMessage(account, /* uid */ 0, folderPath, parsed, direction);
+        const ok = await ingestMessage(account, /* uid */ 0, folderLabel, parsed, direction);
         if (ok) count += 1;
       } catch (e) {
         // Don't let one corrupt message kill the whole folder walk. Log
@@ -585,10 +592,15 @@ async function syncAccountViaGraph(account) {
   // no need to detect them like IMAP requires.
   let totalCount = 0;
   try {
-    const inbox = await syncFolderViaGraph(account, 'inbox', 'inbound');
+    // folderLabel is what gets written into messages.folder. Match what
+    // the IMAP path produced ('INBOX' uppercase) so DelegationDoer's
+    // INBOX-folder filter on threads picks up Graph-synced messages.
+    // Sent-folder filtering in DD uses direction='outbound' (not folder
+    // name), so the sent label is cosmetic — keep it readable.
+    const inbox = await syncFolderViaGraph(account, 'inbox', 'inbound', 'INBOX');
     totalCount += inbox.count || 0;
     try {
-      const sent = await syncFolderViaGraph(account, 'sentitems', 'outbound');
+      const sent = await syncFolderViaGraph(account, 'sentitems', 'outbound', 'Sent Items');
       totalCount += sent.count || 0;
     } catch (e) {
       // Sent-folder failure is non-fatal — inbox is the priority.

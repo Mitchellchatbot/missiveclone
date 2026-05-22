@@ -357,6 +357,15 @@ const MIGRATIONS = [
   // The two pathways never share state, so it's safe to leave the IMAP
   // columns untouched when a Microsoft account is synced via Graph.
   `ALTER TABLE folder_sync_state ADD COLUMN IF NOT EXISTS delta_link TEXT`,
+  // The first Graph sync release wrote Microsoft's well-known folder
+  // names ('inbox', 'sentitems', lowercase) into messages.folder. The
+  // IMAP path always wrote IMAP-style uppercase names ('INBOX'), and
+  // DelegationDoer's threads filter compares `m.folder = 'INBOX'`
+  // verbatim. Mixed casing meant Graph-synced messages disappeared
+  // from DD's inbox view. Backfill in place; future writes already use
+  // the matching label.
+  `UPDATE messages SET folder = 'INBOX' WHERE folder = 'inbox'`,
+  `UPDATE messages SET folder = 'Sent Items' WHERE folder = 'sentitems'`,
   // imap_pass and smtp_pass were originally NOT NULL; OAuth accounts won't
   // have them, so relax the constraint.
   `ALTER TABLE email_accounts ALTER COLUMN imap_pass DROP NOT NULL`,
