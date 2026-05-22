@@ -484,4 +484,52 @@ router.post('/:id/comments', wrap(async (req, res) => {
   res.json({ ok: true, id });
 }));
 
+// Purge every message in this workspace whose from_addr matches the given
+// sender, plus any threads that become empty as a result. Used when a user
+// is offboarded and their historical mail must be expunged across all
+// mailboxes (i.e. their outbound mail is sitting in OTHER users' inboxes
+// too). Workspace-scoped so a caller can never reach across workspaces.
+router.post('/purge-by-sender', wrap(async (req, res) => {
+  const { sender, dry_run } = req.body || {};
+  if (!sender || typeof sender !== 'string' || !sender.includes('@')) {
+    return res.status(400).json({ error: 'sender (email) required' });
+  }
+  const like = `%${sender}%`;
+  const ws = req.user.workspace_id;
+
+  if (dry_run) {
+    const msgRow = await one(
+      `SELECT COUNT(*)::int AS n FROM messages WHERE workspace_id = $1 AND from_addr ILIKE $2`,
+      [ws, like]
+    );
+    const orphanRow = await one(
+      `SELECT COUNT(*)::int AS n FROM threads t
+       WHERE t.workspace_id = $1
+         AND NOT EXISTS (
+           SELECT 1 FROM messages m
+           WHERE m.thread_id = t.id
+             AND (m.from_addr IS NULL OR m.from_addr NOT ILIKE $2)
+         )`,
+      [ws, like]
+    );
+    return res.json({ dry_run: true, messages_would_delete: msgRow.n, threads_would_delete: orphanRow.n });
+  }
+
+  const delMsgs = await query(
+    `DELETE FROM messages WHERE workspace_id = $1 AND from_addr ILIKE $2`,
+    [ws, like]
+  );
+  const delThreads = await query(
+    `DELETE FROM threads
+     WHERE workspace_id = $1
+       AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = threads.id)`,
+    [ws]
+  );
+  res.json({
+    ok: true,
+    messages_deleted: delMsgs.rowCount,
+    threads_deleted: delThreads.rowCount
+  });
+}));
+
 module.exports = router;
