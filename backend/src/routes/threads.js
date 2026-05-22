@@ -1,7 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const { v4: uuid } = require('uuid');
-const { one, many, query } = require('../db');
+const { one, many, query, tx } = require('../db');
 const { requireAuth } = require('../auth');
 const { sendEmail } = require('../email/smtp');
 const { appendThreadSearchText } = require('../email/imap');
@@ -515,21 +515,26 @@ router.post('/purge-by-sender', wrap(async (req, res) => {
     return res.json({ dry_run: true, messages_would_delete: msgRow.n, threads_would_delete: orphanRow.n });
   }
 
-  const delMsgs = await query(
-    `DELETE FROM messages WHERE workspace_id = $1 AND from_addr ILIKE $2`,
-    [ws, like]
-  );
-  const delThreads = await query(
-    `DELETE FROM threads
-     WHERE workspace_id = $1
-       AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = threads.id)`,
-    [ws]
-  );
-  res.json({
-    ok: true,
-    messages_deleted: delMsgs.rowCount,
-    threads_deleted: delThreads.rowCount
+  // Run inside a transaction so we can bump statement_timeout for just this
+  // operation. The global 15s ceiling (set in db.js) is right for normal
+  // request traffic but too tight for a bulk delete that may cascade to
+  // attachments + thread cleanup. SET LOCAL scope means the bump dies with
+  // the transaction — no global drift.
+  const { msgs, threads } = await tx(async (client) => {
+    await client.query(`SET LOCAL statement_timeout = '5min'`);
+    const dm = await client.query(
+      `DELETE FROM messages WHERE workspace_id = $1 AND from_addr ILIKE $2`,
+      [ws, like]
+    );
+    const dt = await client.query(
+      `DELETE FROM threads
+       WHERE workspace_id = $1
+         AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = threads.id)`,
+      [ws]
+    );
+    return { msgs: dm.rowCount, threads: dt.rowCount };
   });
+  res.json({ ok: true, messages_deleted: msgs, threads_deleted: threads });
 }));
 
 module.exports = router;
