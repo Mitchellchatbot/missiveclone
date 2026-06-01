@@ -4,6 +4,7 @@ const { v4: uuid } = require('uuid');
 const { one, many, query } = require('../db');
 const { decrypt } = require('../crypto');
 const { emitToWorkspace } = require('../sockets');
+const { mergeParticipants } = require('../util/participants');
 const ms = require('../oauth/microsoft');
 
 const watchers = new Map();
@@ -153,13 +154,26 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     (parsed.text || '').slice(0, 4000)
   ].filter(Boolean).join(' ');
 
+  // Keep `participants` current with every message's addresses, not just
+  // the thread's first one. Otherwise clients who only appear on a later
+  // message (CC'd, replying from a new address, or a thread that started
+  // internally) never match downstream client-health / touchpoint
+  // bucketing. See util/participants.js.
+  const existingThread = await one('SELECT participants FROM threads WHERE id = $1', [threadId]);
+  const mergedParticipants = mergeParticipants(existingThread && existingThread.participants, [
+    fromAddr,
+    normalizeAddrList(parsed.to),
+    normalizeAddrList(parsed.cc)
+  ]);
+
   await query(
     `UPDATE threads SET last_message_at = $1,
        status = CASE WHEN status = 'closed' AND $4 = 'inbound' THEN 'open' ELSE status END,
        snoozed_until = CASE WHEN $4 = 'inbound' THEN NULL ELSE snoozed_until END,
-       search_text = coalesce(search_text, '') || ' ' || $2
+       search_text = coalesce(search_text, '') || ' ' || $2,
+       participants = $5
      WHERE id = $3`,
-    [sentAt, searchAdd, threadId, dir]
+    [sentAt, searchAdd, threadId, dir, mergedParticipants]
   );
 
   emitToWorkspace(acc.workspace_id, 'thread:updated', { thread_id: threadId });

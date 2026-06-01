@@ -353,7 +353,48 @@ const MIGRATIONS = [
        messages.to_addrs ILIKE '%' || ea.email || '%'
        OR messages.from_addr ILIKE '%' || ea.email || '%'
        OR messages.cc_addrs ILIKE '%' || ea.email || '%'
-     )`
+     )`,
+  // Repair historical `participants`. The column was frozen at thread
+  // creation (first message's From+To only), so any client who first
+  // appeared on a later message was missing from it — which made
+  // DelegationDoer's client-health / touchpoint matching silently skip
+  // those clients. Going forward imap.js + the reply route keep it
+  // current; this backfills the threads that predate that fix.
+  //
+  // Idempotent: we only append addresses that messages mention but
+  // `participants` doesn't already contain, so a second run finds
+  // nothing missing and updates zero rows. Mirrors the account_id
+  // re-link above (touch only the rows that need it).
+  `WITH thread_addrs AS (
+     SELECT DISTINCT m.thread_id,
+            lower((regexp_matches(
+              coalesce(m.from_addr,'') || ' ' || coalesce(m.to_addrs,'') || ' ' || coalesce(m.cc_addrs,''),
+              '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}', 'g'))[1]) AS addr
+     FROM messages m
+   ),
+   existing_addrs AS (
+     SELECT t.id AS thread_id,
+            lower((regexp_matches(
+              coalesce(t.participants,''),
+              '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}', 'g'))[1]) AS addr
+     FROM threads t
+   ),
+   missing AS (
+     SELECT ta.thread_id, string_agg(ta.addr, '; ' ORDER BY ta.addr) AS add_str
+     FROM thread_addrs ta
+     WHERE NOT EXISTS (
+       SELECT 1 FROM existing_addrs e
+       WHERE e.thread_id = ta.thread_id AND e.addr = ta.addr
+     )
+     GROUP BY ta.thread_id
+   )
+   UPDATE threads t
+   SET participants = CASE
+         WHEN coalesce(t.participants,'') = '' THEN m.add_str
+         ELSE t.participants || '; ' || m.add_str
+       END
+   FROM missing m
+   WHERE t.id = m.thread_id`
 ];
 
 function ensurePool() {

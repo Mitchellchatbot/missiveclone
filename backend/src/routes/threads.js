@@ -5,6 +5,7 @@ const { one, many, query } = require('../db');
 const { requireAuth } = require('../auth');
 const { sendEmail } = require('../email/smtp');
 const { emitToWorkspace } = require('../sockets');
+const { mergeParticipants } = require('../util/participants');
 const wrap = require('../util/wrap');
 
 const router = express.Router();
@@ -427,11 +428,17 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
     );
   }
 
+  // Fold the reply's recipients into `participants` so a client first
+  // looped in via this reply (to/cc) is matchable downstream — same
+  // reasoning as the IMAP ingest path. See util/participants.js.
+  const mergedParticipants = mergeParticipants(t.participants, [replyTo, cc || '']);
+
   await query(
     `UPDATE threads SET last_message_at = $1,
-       search_text = coalesce(search_text, '') || ' ' || $2
+       search_text = coalesce(search_text, '') || ' ' || $2,
+       participants = $4
      WHERE id = $3`,
-    [now, [replySubject, replyTo, body_text || ''].join(' '), t.id]
+    [now, [replySubject, replyTo, body_text || ''].join(' '), t.id, mergedParticipants]
   );
 
   // Successful send: clear this user's draft for the thread.
