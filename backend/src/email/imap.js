@@ -309,8 +309,16 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
   // Split into two updates so a tsvector overflow on the GIN index can't
   // abort ingestMessage. The non-search fields always succeed; search_text
   // is best-effort via appendThreadSearchText.
+  //
+  // last_message_at only ever advances — never regresses. Messages can be
+  // ingested out of chronological order (separate INBOX/Sent sync passes,
+  // UID-reset backfills re-fetching from UID 1, delayed/forwarded mail that
+  // threads by subject). An unconditional assignment lets an older message
+  // clobber a newer thread timestamp, stranding active threads low in the
+  // inbox list (which orders by last_message_at DESC). GREATEST keeps the
+  // thread stamped with its newest message regardless of ingest order.
   await query(
-    `UPDATE threads SET last_message_at = $1,
+    `UPDATE threads SET last_message_at = GREATEST(last_message_at, $1),
        status = CASE WHEN status = 'closed' AND $3 = 'inbound' THEN 'open' ELSE status END,
        snoozed_until = CASE WHEN $3 = 'inbound' THEN NULL ELSE snoozed_until END
      WHERE id = $2`,
