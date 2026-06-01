@@ -304,7 +304,13 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
       workspace_id: acc.workspace_id,
       account_id: acc.id,
       thread_id: threadId,
-      message_id: id
+      message_id: id,
+      // Sent along so DelegationDoer can auto-apply per-client labels
+      // without a second HTTP round-trip to fetch the message. Same
+      // shape as messages.from_addr / to_addrs / cc_addrs in the DB.
+      from_addr: fromAddr || null,
+      to_addrs: normalizeAddrList(parsed.to) || null,
+      cc_addrs: normalizeAddrList(parsed.cc) || null
     });
   }
   return true;
