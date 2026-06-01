@@ -23,8 +23,21 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
 // Fire-and-forget webhook to DD when a new message lands. Non-blocking:
 // ingest must complete even if DD is down. Polling on the DD side is
 // the backstop, so we don't retry on failure — just log.
+//
+// Logging is intentionally loud — silent "ingest works but DD never
+// notified" used to be the worst class of bug here. Now every call
+// logs config state, request status, and any non-2xx response so a
+// glance at Railway logs tells you whether the link is alive.
 function fireWebhook(event, payload) {
-  if (!WEBHOOK_URL || !WEBHOOK_SECRET) return;
+  if (!WEBHOOK_URL || !WEBHOOK_SECRET) {
+    console.warn('[webhook] skipped — missing env', {
+      event,
+      hasUrl: !!WEBHOOK_URL,
+      hasSecret: !!WEBHOOK_SECRET,
+      account_id: payload && payload.account_id
+    });
+    return;
+  }
   const body = JSON.stringify({ event, ts: Date.now(), ...payload });
   const sig = crypto.createHmac('sha256', WEBHOOK_SECRET).update(body).digest('hex');
   fetch(WEBHOOK_URL, {
@@ -34,8 +47,26 @@ function fireWebhook(event, payload) {
       'X-Missive-Signature': sig
     },
     body
+  }).then(async (res) => {
+    if (!res.ok) {
+      // 401 here = DD's MISSIVE_WEBHOOK_SECRET doesn't match WEBHOOK_SECRET.
+      // Reading the body up to 200 chars to surface the DD error message.
+      const text = await res.text().catch(() => '');
+      console.warn('[webhook] non-2xx from DD', {
+        event,
+        status: res.status,
+        account_id: payload && payload.account_id,
+        body: text.slice(0, 200)
+      });
+    } else {
+      console.log('[webhook] delivered', {
+        event,
+        status: res.status,
+        account_id: payload && payload.account_id
+      });
+    }
   }).catch((err) => {
-    console.warn('[webhook] fire failed', event, err && err.message);
+    console.warn('[webhook] fire failed (network)', event, err && err.message);
   });
 }
 
