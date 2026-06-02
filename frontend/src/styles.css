@@ -842,6 +842,9 @@ textarea { resize: vertical; }
 .thread-view {
   background: var(--surface);
   overflow-y: auto;
+  /* Email bodies are iframes that resize after load. Let our scroll-to-latest
+     win instead of the browser anchoring the scroll position to older content. */
+  overflow-anchor: none;
   display: flex; flex-direction: column;
 }
 .tv-header {

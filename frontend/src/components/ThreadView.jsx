@@ -90,10 +90,20 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   }, []);
 
   function onScroll(e) {
-    // Email bodies live in iframes that resize after load, so keep re-pinning
-    // to the bottom until the user deliberately scrolls away from it.
+    // Only ever RE-PIN here, when the user is back at the bottom. We must not
+    // unpin from 'scroll': email bodies live in iframes that resize after load,
+    // and both those programmatic scrolls and Chromium's scroll-anchoring fire
+    // 'scroll' with the position briefly away from the bottom. Treating that as
+    // "user left the bottom" was disabling auto-follow before the newest message
+    // finished rendering — i.e. it looked like the scroll never happened.
+    // Unpinning is driven by an explicit user gesture instead (onWheel).
     const el = e.currentTarget;
-    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 80) pinnedRef.current = true;
+  }
+
+  function onWheel(e) {
+    // Explicit scroll-up = "let me read the history" — stop auto-following.
+    if (e.deltaY < 0) pinnedRef.current = false;
   }
 
   const load = useCallback(async () => {
@@ -195,7 +205,7 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   const labelIds = new Set((thread.labels || []).map(l => l.id));
 
   return (
-    <div className="thread-view" onScroll={onScroll}>
+    <div className="thread-view" onScroll={onScroll} onWheel={onWheel}>
       <div className="tv-header">
         <div className="tv-header-top">
           <button
