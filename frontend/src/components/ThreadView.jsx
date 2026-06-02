@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import DOMPurify from 'dompurify';
 import { Star, Mail, Moon, Tag, Reply, Forward, Paperclip, Clock } from 'lucide-react';
 import { api, getApiBase } from '../api';
@@ -74,6 +74,28 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   const [showLabel, setShowLabel] = useState(false);
   const [allLabels, setAllLabels] = useState([]);
 
+  // Messages render oldest-first (sent_at ASC), so the newest reply sits at the
+  // bottom of a potentially very long thread. Open scrolled to it — mirrors the
+  // chat pane (see ChatView listRef) — instead of dumping the user at the top of
+  // a 40-message thread. `endRef` marks the end of the message list; `pinnedRef`
+  // tracks whether we should keep snapping to the bottom (true until the user
+  // scrolls up to read history, false again once they return to the bottom).
+  const endRef = useRef(null);
+  const pinnedRef = useRef(true);
+
+  const scrollToLatest = useCallback(() => {
+    if (pinnedRef.current && endRef.current) {
+      endRef.current.scrollIntoView({ block: 'end' });
+    }
+  }, []);
+
+  function onScroll(e) {
+    // Email bodies live in iframes that resize after load, so keep re-pinning
+    // to the bottom until the user deliberately scrolls away from it.
+    const el = e.currentTarget;
+    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }
+
   const load = useCallback(async () => {
     if (!threadId) { setData(null); return; }
     setLoading(true);
@@ -88,6 +110,14 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   useEffect(() => {
     api('/api/labels').then(r => setAllLabels(r.labels || [])).catch(() => {});
   }, []);
+
+  // Opening a different thread should land on its newest message again.
+  useEffect(() => { pinnedRef.current = true; }, [threadId]);
+
+  // Snap to the latest message once a thread's messages render. Iframe bodies
+  // resize afterwards (see MessageBlock autoResize -> onResize), which re-runs
+  // this while still pinned so we stay at the bottom as the layout settles.
+  useEffect(() => { scrollToLatest(); }, [data, scrollToLatest]);
 
   useEffect(() => {
     if (!threadId) return;
@@ -165,7 +195,7 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   const labelIds = new Set((thread.labels || []).map(l => l.id));
 
   return (
-    <div className="thread-view">
+    <div className="thread-view" onScroll={onScroll}>
       <div className="tv-header">
         <div className="tv-header-top">
           <button
@@ -254,8 +284,10 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
       </div>
 
       <div className="tv-messages">
-        {messages.map(m => <MessageBlock key={m.id} m={m} />)}
+        {messages.map(m => <MessageBlock key={m.id} m={m} onResize={scrollToLatest} />)}
       </div>
+      {/* Anchor for scroll-to-latest — sits just below the newest message. */}
+      <div ref={endRef} />
 
       {showReply && (
         <ComposeReply
@@ -277,7 +309,7 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   );
 }
 
-function MessageBlock({ m }) {
+function MessageBlock({ m, onResize }) {
   const docHtml = useMemo(() => m.body_html ? buildEmailDoc(m.body_html) : null, [m.body_html]);
   const senderName = m.direction === 'outbound' ? (m.from_addr ? nameFromAddr(m.from_addr) : 'You') : nameFromAddr(m.from_addr) || 'Unknown';
 
@@ -292,6 +324,9 @@ function MessageBlock({ m }) {
       // Cross-origin — sandbox without allow-same-origin. Use a safe default.
       e.target.style.height = '500px';
     }
+    // The body just changed height; let the thread re-snap to the latest
+    // message if it's still pinned to the bottom.
+    if (onResize) onResize();
   }
 
   return (
