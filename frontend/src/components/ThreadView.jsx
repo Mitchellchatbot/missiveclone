@@ -82,11 +82,30 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   // scrolls up to read history, false again once they return to the bottom).
   const endRef = useRef(null);
   const pinnedRef = useRef(true);
+  // Coalesces the burst of resize callbacks (one per iframe) into a single
+  // scroll, and remembers whether we've already landed on this thread once.
+  const scrollTimerRef = useRef(0);
+  const didInitialScrollRef = useRef(false);
 
   const scrollToLatest = useCallback(() => {
-    if (pinnedRef.current && endRef.current) {
-      endRef.current.scrollIntoView({ block: 'end' });
-    }
+    if (!pinnedRef.current) return;
+    // Email bodies are iframes that load and resize at staggered times. Each
+    // resize calls in here; scrolling on every one makes the viewport visibly
+    // hop as the thread's total height settles ("the shake"). Instead we debounce:
+    // each call pushes the scroll back, so it fires exactly once — after the
+    // resizes go quiet, i.e. after the content has actually finished rendering.
+    if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
+    scrollTimerRef.current = setTimeout(() => {
+      scrollTimerRef.current = 0;
+      if (!pinnedRef.current || !endRef.current) return;
+      // First landing for a thread is instant (open directly at the newest
+      // message); later updates — a reply arriving while we watch — animate.
+      endRef.current.scrollIntoView({
+        block: 'end',
+        behavior: didInitialScrollRef.current ? 'smooth' : 'auto'
+      });
+      didInitialScrollRef.current = true;
+    }, 120);
   }, []);
 
   function onScroll(e) {
@@ -121,8 +140,13 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
     api('/api/labels').then(r => setAllLabels(r.labels || [])).catch(() => {});
   }, []);
 
-  // Opening a different thread should land on its newest message again.
-  useEffect(() => { pinnedRef.current = true; }, [threadId]);
+  // Opening a different thread should land on its newest message again —
+  // instantly, not with a smooth animation across the previous thread's content.
+  useEffect(() => {
+    pinnedRef.current = true;
+    didInitialScrollRef.current = false;
+    return () => { if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current); };
+  }, [threadId]);
 
   // Snap to the latest message once a thread's messages render. Iframe bodies
   // resize afterwards (see MessageBlock autoResize -> onResize), which re-runs
