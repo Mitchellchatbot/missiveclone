@@ -329,8 +329,11 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
   // Push to DelegationDoer so the sidebar badge + inbox list can refresh
   // in real time instead of waiting on the 30s poll. Only fires for
   // inbound — outbound messages were initiated from DD and the UI
-  // already updated optimistically.
-  if (dir === 'inbound') {
+  // already updated optimistically. Spam/Junk is deliberately excluded:
+  // it's visible in DD's Spam view but must not trigger auto-intake,
+  // routing, or inbound-mail notifications.
+  const isSpamFolder = /spam|junk/i.test(folder || '');
+  if (dir === 'inbound' && !isSpamFolder) {
     fireWebhook('message:new', {
       workspace_id: acc.workspace_id,
       account_id: acc.id,
@@ -369,15 +372,17 @@ async function setFolderState(accountId, folder, lastUid, uidValidity) {
 }
 
 async function detectFolders(client) {
-  // Returns a tuple: { inbox, sent } using IMAP SPECIAL-USE flags when available.
+  // Returns { inbox, sent, junk } using IMAP SPECIAL-USE flags when available.
   const list = await client.list();
   let inbox = 'INBOX';
   let sent = null;
+  let junk = null;
   for (const box of list) {
     const flags = (box.flags && Array.from(box.flags)) || [];
     const su = (box.specialUse || '').toLowerCase();
     if (box.path === 'INBOX') inbox = 'INBOX';
     if (su === '\\sent' || flags.includes('\\Sent')) sent = box.path;
+    if (su === '\\junk' || flags.includes('\\Junk')) junk = box.path;
   }
   // Common fallbacks if SPECIAL-USE isn't reported.
   if (!sent) {
@@ -386,7 +391,14 @@ async function detectFolders(client) {
       if (list.find(b => b.path === c)) { sent = c; break; }
     }
   }
-  return { inbox, sent };
+  if (!junk) {
+    const candidates = ['Junk', 'Junk Email', 'Junk E-mail', 'Spam',
+                        '[Gmail]/Spam', 'INBOX.Junk', 'INBOX.spam', 'Bulk Mail'];
+    for (const c of candidates) {
+      if (list.find(b => b.path === c)) { junk = c; break; }
+    }
+  }
+  return { inbox, sent, junk };
 }
 
 async function syncFolder(client, acc, folder, direction) {
@@ -501,7 +513,7 @@ async function syncAccount(accountId) {
   }
   let count = 0;
   try {
-    const { inbox, sent } = await detectFolders(client);
+    const { inbox, sent, junk } = await detectFolders(client);
     if (sent && sent !== acc.sent_folder) {
       await query('UPDATE email_accounts SET sent_folder = $1 WHERE id = $2', [sent, acc.id]);
       acc.sent_folder = sent;
@@ -510,6 +522,14 @@ async function syncAccount(accountId) {
     if (sent) {
       try { count += await syncFolder(client, acc, sent, 'outbound'); }
       catch (e) { console.warn('sent folder sync failed for', acc.email, '-', e.message); }
+    }
+    // Junk/Spam is inbound mail the provider already filtered out. We sync
+    // it (folder = the provider's junk path) so DelegationDoer can offer a
+    // Spam view, but ingestMessage suppresses the DD webhook for it so spam
+    // never enters the auto-intake/routing/notification pipeline.
+    if (junk) {
+      try { count += await syncFolder(client, acc, junk, 'inbound'); }
+      catch (e) { console.warn('junk folder sync failed for', acc.email, '-', e.message); }
     }
     await query(
       `UPDATE email_accounts

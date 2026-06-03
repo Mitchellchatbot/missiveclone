@@ -149,6 +149,14 @@ router.get('/', wrap(async (req, res) => {
   }
   if (folder === 'SENT') {
     sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id AND m.direction = 'outbound')`;
+  } else if (folder === 'SPAM') {
+    // Spam/Junk isn't a single canonical folder name across providers —
+    // IMAP stores the literal path ('Junk', '[Gmail]/Spam', 'Junk Email',
+    // 'INBOX.Junk'), Graph labels it 'Junk Email'. Match on the substring
+    // so every provider's junk folder maps to this one view. Mirrors how
+    // SENT sidesteps the same naming drift via direction='outbound'.
+    sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id
+                         AND (m.folder ILIKE '%spam%' OR m.folder ILIKE '%junk%'))`;
   } else if (folder) {
     params.push(folder);
     sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id AND m.folder = $${params.length})`;
