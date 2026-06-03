@@ -105,7 +105,6 @@ async function sendAsDraftViaGraph(token, mail, attachments, tag = '[graph]') {
     ccRecipients: parseAddresses(mail.cc),
     bccRecipients: parseAddresses(mail.bcc)
   };
-  if (attachments.length) message.attachments = attachments;
 
   // 1) Create draft. Graph returns the Message resource with both id +
   //    internetMessageId populated.
@@ -119,7 +118,11 @@ async function sendAsDraftViaGraph(token, mail, attachments, tag = '[graph]') {
   const draftId = draft.id;
   const internetMessageId = stripBrackets(draft.internetMessageId);
 
-  // 2) Send.
+  // 2) Attach files after creation so large ones can use an upload session
+  //    (inlining them in the create body caps out at Graph's ~3 MB limit).
+  if (attachments.length) await addAttachmentsToDraft(token, draftId, attachments, tag);
+
+  // 3) Send.
   const sendRes = await fetch(
     `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/send`,
     { method: 'POST', headers: { Authorization: `Bearer ${token}` } }
@@ -164,17 +167,7 @@ async function sendAsReplyViaGraph(token, parentMessageId, mail, attachments, ta
   });
   await assertGraphOk(patchRes, 200, 'PATCH reply draft');
 
-  for (const att of attachments) {
-    const aRes = await fetch(
-      `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/attachments`,
-      {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(att)
-      }
-    );
-    await assertGraphOk(aRes, 201, 'attach to reply draft');
-  }
+  if (attachments.length) await addAttachmentsToDraft(token, draftId, attachments, tag);
 
   // 3) Re-read the draft so we get the post-PATCH internetMessageId
   //    (sometimes Graph regenerates it after subject/body changes).
@@ -207,24 +200,112 @@ function stripBrackets(v) {
   return String(v).replace(/^<|>$/g, '');
 }
 
+// Graph rejects an attachment added in a single request (inline in the
+// message JSON, or POSTed to /attachments) once it exceeds ~3 MB. Anything
+// larger has to go through an upload session (chunked PUTs). We split on
+// this boundary in addAttachmentsToDraft.
+const GRAPH_ATTACHMENT_INLINE_LIMIT = 3 * 1024 * 1024;
+
+// Largest chunk we PUT per upload-session request. Graph requires every
+// chunk except the last to be a multiple of 320 KiB and recommends staying
+// at/under 4 MB; 3.75 MB (320 KiB × 12) satisfies both.
+const GRAPH_UPLOAD_CHUNK = 320 * 1024 * 12;
+
+// Normalize the wire attachment shape ({ filename, content, content_type,
+// size }) into { name, contentType, buffer }. No size cap here — large
+// files are handled via upload sessions when they're attached to a draft.
 function buildAttachments(rawAttachments) {
   const list = Array.isArray(rawAttachments) ? rawAttachments : [];
   if (!list.length) return [];
-  const totalBytes = list.reduce((n, a) => n + (a.size || (a.content ? a.content.length : 0)), 0);
-  if (totalBytes > 3 * 1024 * 1024) {
-    throw new Error(
-      `Total attachment size ${(totalBytes / 1024 / 1024).toFixed(1)} MB exceeds Graph's 3 MB inline limit. ` +
-      `Use smaller files or split across messages.`
-    );
-  }
   return list.map(a => ({
-    '@odata.type': '#microsoft.graph.fileAttachment',
     name: a.filename || 'attachment',
     contentType: a.content_type || 'application/octet-stream',
-    contentBytes: Buffer.isBuffer(a.content)
-      ? a.content.toString('base64')
-      : Buffer.from(a.content || '').toString('base64')
+    buffer: Buffer.isBuffer(a.content)
+      ? a.content
+      : Buffer.from(a.content || '')
   }));
+}
+
+// Shape a normalized attachment as a Graph fileAttachment for single-request
+// (inline) upload.
+function toFileAttachment(att) {
+  return {
+    '@odata.type': '#microsoft.graph.fileAttachment',
+    name: att.name,
+    contentType: att.contentType,
+    contentBytes: att.buffer.toString('base64')
+  };
+}
+
+// Attach every file to an already-created draft. Small files go in a single
+// POST /attachments; files over the inline limit go through an upload
+// session so we can send screenshots, PDFs, etc. up to Graph's 150 MB cap.
+async function addAttachmentsToDraft(token, draftId, attachments, tag) {
+  for (const att of attachments) {
+    if (att.buffer.length <= GRAPH_ATTACHMENT_INLINE_LIMIT) {
+      const aRes = await fetch(
+        `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/attachments`,
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(toFileAttachment(att))
+        }
+      );
+      await assertGraphOk(aRes, 201, 'attach to draft');
+    } else {
+      await uploadAttachmentViaSession(token, draftId, att, tag);
+    }
+  }
+}
+
+// Upload a large attachment to a draft via Graph's upload-session protocol:
+// open a session, then PUT the bytes in chunks with Content-Range headers.
+// The session uploadUrl is pre-authorized, so chunk PUTs must NOT carry the
+// Authorization header.
+async function uploadAttachmentViaSession(token, draftId, att, tag = '[graph]') {
+  const total = att.buffer.length;
+  const sessionRes = await fetch(
+    `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/attachments/createUploadSession`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        AttachmentItem: {
+          attachmentType: 'file',
+          name: att.name,
+          contentType: att.contentType,
+          size: total
+        }
+      })
+    }
+  );
+  await assertGraphOk(sessionRes, 201, 'create attachment upload session');
+  const { uploadUrl } = await sessionRes.json();
+  if (!uploadUrl) throw new Error('Graph create attachment upload session: no uploadUrl returned');
+
+  for (let start = 0; start < total; start += GRAPH_UPLOAD_CHUNK) {
+    const end = Math.min(start + GRAPH_UPLOAD_CHUNK, total) - 1;
+    const chunk = att.buffer.subarray(start, end + 1);
+    const putRes = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Length': String(chunk.length),
+        'Content-Range': `bytes ${start}-${end}/${total}`
+      },
+      body: chunk
+    });
+    // Intermediate chunks return 200 (with nextExpectedRanges); the final
+    // chunk returns 201 Created (the attachment resource). Anything else is
+    // a failure.
+    if (putRes.status !== 200 && putRes.status !== 201) {
+      const detail = await putRes.text().catch(() => '');
+      throw new Error(
+        `Graph attachment upload chunk failed (bytes ${start}-${end}/${total}): ` +
+        `${putRes.status} ${detail.slice(0, 200)}`
+      );
+    }
+  }
+  console.log(`${tag} uploaded large attachment "${att.name}" (${(total / 1024 / 1024).toFixed(1)} MB) via session`);
 }
 
 async function assertGraphOk(res, expectedStatus, op) {
