@@ -167,11 +167,29 @@ router.get('/', wrap(async (req, res) => {
     // instead), mirroring how Gmail/Outlook un-spam a thread you engage
     // with. Without the NOT EXISTS guard, one junked message would drag an
     // active Sent/Inbox thread into Spam while it also showed elsewhere.
+    //
+    // Digest suppression: the providers' junk folders are dominated by
+    // automated machine mail (security-quarantine digests, no-reply
+    // notifications, newsletters) that nobody triages. Hide a junk thread
+    // when EVERY message is from such a sender — i.e. only keep junk that
+    // still has at least one human sender worth a glance. Same from_addr
+    // patterns the 'newsletters' smart-filter uses, so the two stay in
+    // sync. One human message keeps the thread visible.
     sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id
                          AND (m.folder ILIKE '%spam%' OR m.folder ILIKE '%junk%'))
              AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id
                          AND coalesce(m.folder, '') NOT ILIKE '%spam%'
-                         AND coalesce(m.folder, '') NOT ILIKE '%junk%')`;
+                         AND coalesce(m.folder, '') NOT ILIKE '%junk%')
+             AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id
+                         AND NOT (
+                              m.from_addr ILIKE '%noreply%'   OR m.from_addr ILIKE '%no-reply%'
+                           OR m.from_addr ILIKE '%no_reply%'  OR m.from_addr ILIKE '%donotreply%'
+                           OR m.from_addr ILIKE '%do-not-reply%' OR m.from_addr ILIKE '%newsletter%'
+                           OR m.from_addr ILIKE '%mailer@%'   OR m.from_addr ILIKE '%mailer-daemon%'
+                           OR m.from_addr ILIKE '%notifications@%' OR m.from_addr ILIKE '%alerts@%'
+                           OR m.from_addr ILIKE '%marketing@%' OR m.from_addr ILIKE '%updates@%'
+                           OR m.from_addr ILIKE '%digest@%'
+                         ))`;
   } else if (folder) {
     params.push(folder);
     sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id AND m.folder = $${params.length})`;
