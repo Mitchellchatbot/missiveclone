@@ -157,10 +157,21 @@ router.get('/', wrap(async (req, res) => {
     // Spam/Junk isn't a single canonical folder name across providers —
     // IMAP stores the literal path ('Junk', '[Gmail]/Spam', 'Junk Email',
     // 'INBOX.Junk'), Graph labels it 'Junk Email'. Match on the substring
-    // so every provider's junk folder maps to this one view. Mirrors how
-    // SENT sidesteps the same naming drift via direction='outbound'.
+    // so every provider's junk folder maps to this one view.
+    //
+    // Quarantine semantics: a thread belongs in Spam only when EVERY
+    // message is in junk/spam. The moment any message lands elsewhere —
+    // the provider also delivered it to the inbox, or the team sent a
+    // reply (folder 'Sent', direction outbound) — it's a real
+    // conversation and drops out of Spam (showing under Inbox/Sent
+    // instead), mirroring how Gmail/Outlook un-spam a thread you engage
+    // with. Without the NOT EXISTS guard, one junked message would drag an
+    // active Sent/Inbox thread into Spam while it also showed elsewhere.
     sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id
-                         AND (m.folder ILIKE '%spam%' OR m.folder ILIKE '%junk%'))`;
+                         AND (m.folder ILIKE '%spam%' OR m.folder ILIKE '%junk%'))
+             AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id
+                         AND coalesce(m.folder, '') NOT ILIKE '%spam%'
+                         AND coalesce(m.folder, '') NOT ILIKE '%junk%')`;
   } else if (folder) {
     params.push(folder);
     sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id AND m.folder = $${params.length})`;
