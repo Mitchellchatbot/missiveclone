@@ -606,6 +606,16 @@ async function syncAccountViaGraph(account) {
       // Sent-folder failure is non-fatal — inbox is the priority.
       console.warn(`[graph] sentitems sync failed for ${account.email}: ${e.message}`);
     }
+    try {
+      // Junk/Spam → DD's Spam view. folderLabel contains 'Junk' so
+      // ingestMessage's spam guard keeps it out of the intake pipeline,
+      // and DD's SPAM folder filter matches it via ILIKE '%junk%'.
+      const junk = await syncFolderViaGraph(account, 'junkemail', 'inbound', 'Junk Email');
+      totalCount += junk.count || 0;
+    } catch (e) {
+      // Junk-folder failure is non-fatal — inbox is the priority.
+      console.warn(`[graph] junkemail sync failed for ${account.email}: ${e.message}`);
+    }
     await db.query(
       `UPDATE email_accounts
          SET last_synced_at = $1, last_sync_error = NULL, last_sync_error_at = NULL
