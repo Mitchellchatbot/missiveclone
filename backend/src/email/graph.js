@@ -475,53 +475,43 @@ function graphToParsed(msg, attachments) {
 async function fetchAttachmentsForMessage(token, messageGraphId) {
   const base =
     `${GRAPH_BASE}/me/messages/${encodeURIComponent(messageGraphId)}/attachments`;
-  const listUrl =
-    `${base}?$select=id,name,contentType,size,contentId,isInline,@odata.type` +
-    // Inline the binary for small fileAttachments in the same call.
-    `&$expand=microsoft.graph.fileAttachment/contentBytes`;
 
-  let json;
-  try {
-    json = await graphGet(listUrl, token);
-  } catch (e) {
-    // Some Graph tenants don't support $expand on attachment content (400).
-    // Drop the $expand and rely on the per-attachment fetch below.
-    if (e.status === 400) {
-      json = await graphGet(
-        `${base}?$select=id,name,contentType,size,contentId,isInline,@odata.type`,
-        token
-      );
-    } else {
-      throw e;
-    }
-  }
+  // 1) List attachment metadata only — NOT the bytes. We deliberately do
+  //    NOT use $expand=microsoft.graph.fileAttachment/contentBytes: Graph
+  //    omits contentBytes from the collection for files larger than ~3 MB,
+  //    so expanding it can't be relied on and silently dropped large
+  //    attachments. Keep the list lean; fetch bytes per-item below.
+  const list = await graphGet(
+    `${base}?$select=id,name,contentType,size,contentId,isInline`,
+    token
+  );
 
   const out = [];
-  for (const a of (json.value || [])) {
-    if (a['@odata.type'] !== '#microsoft.graph.fileAttachment') continue;
-
-    // The attachments collection OMITS contentBytes for large file
-    // attachments (roughly >3 MB) even with $expand — Graph requires a
-    // direct GET on the individual attachment to retrieve the bytes.
-    // Without this, large inbound attachments were silently dropped here
-    // (the message synced but with zero attachment rows).
-    let contentBytes = a.contentBytes;
-    if (!contentBytes) {
-      try {
-        const full = await graphGet(`${base}/${encodeURIComponent(a.id)}`, token);
-        contentBytes = full.contentBytes;
-      } catch (e) {
-        console.warn(`[graph] per-attachment fetch failed for ${a.id}: ${e.message}`);
-      }
+  for (const meta of (list.value || [])) {
+    // 2) Fetch each attachment individually. A single-attachment GET returns
+    //    the full resource — @odata.type plus, for a fileAttachment,
+    //    contentBytes regardless of size (up to Graph's 150 MB cap). This is
+    //    the ONLY method that reliably yields bytes for large attachments;
+    //    the collection endpoint won't.
+    let full;
+    try {
+      full = await graphGet(`${base}/${encodeURIComponent(meta.id)}`, token);
+    } catch (e) {
+      console.warn(`[graph] attachment ${meta.id} fetch failed: ${e.message}`);
+      continue;
     }
-    if (!contentBytes) continue;
+    // fileAttachment is the only type that carries bytes. itemAttachment
+    // (a nested message) and referenceAttachment (a cloud-storage link)
+    // have no contentBytes — skip them.
+    if (full['@odata.type'] !== '#microsoft.graph.fileAttachment') continue;
+    if (!full.contentBytes) continue;
 
     out.push({
-      filename: a.name || 'attachment',
-      contentType: a.contentType || 'application/octet-stream',
-      size: a.size || 0,
-      cid: a.contentId || '',
-      content: Buffer.from(contentBytes, 'base64')
+      filename: full.name || 'attachment',
+      contentType: full.contentType || 'application/octet-stream',
+      size: full.size || 0,
+      cid: full.contentId || '',
+      content: Buffer.from(full.contentBytes, 'base64')
     });
   }
   return out;
@@ -616,6 +606,10 @@ async function syncFolderViaGraph(account, folderPath, direction, folderLabel) {
           // a "redownload" path later if needed.
           console.warn(`[graph] attachment fetch failed for ${m.id} (${account.email}): ${e.message}`);
         }
+        // Diagnostic: a message Graph flagged hasAttachments that yields 0
+        // stored attachments means the fetch dropped them. Seeing this line
+        // at all also confirms THIS build (not an older deploy) is running.
+        console.log(`[graph] ${account.email} ${folderLabel}: hasAttachments msg → fetched ${attachments.length} attachment(s)`);
       }
 
       const parsed = graphToParsed(m, attachments);
