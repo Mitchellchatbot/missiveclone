@@ -12,9 +12,13 @@ const wrap = require('../util/wrap');
 const router = express.Router();
 router.use(requireAuth);
 
+// fileSize caps a single attachment; 150 MB matches Graph's upload-session
+// ceiling — files over the ~3 MB inline limit get chunked (see graph.js
+// uploadAttachmentViaSession). memoryStorage holds the whole file in RAM,
+// so this cap is also the guard against unbounded uploads.
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024, fieldSize: 10 * 1024 * 1024 }
+  limits: { fileSize: 150 * 1024 * 1024, fieldSize: 10 * 1024 * 1024 }
 });
 
 // Parse Gmail-style search operators out of a query string.
