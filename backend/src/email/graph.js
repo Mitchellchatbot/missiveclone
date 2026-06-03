@@ -473,54 +473,55 @@ function graphToParsed(msg, attachments) {
 // is the only common type; itemAttachment (nested message) and
 // referenceAttachment (OneDrive link) are exotic enough to skip for now.
 async function fetchAttachmentsForMessage(token, messageGraphId) {
-  const url =
-    `${GRAPH_BASE}/me/messages/${encodeURIComponent(messageGraphId)}/attachments` +
-    `?$select=id,name,contentType,size,contentId,isInline,@odata.type` +
-    // Include the binary content for fileAttachment in the same call.
+  const base =
+    `${GRAPH_BASE}/me/messages/${encodeURIComponent(messageGraphId)}/attachments`;
+  const listUrl =
+    `${base}?$select=id,name,contentType,size,contentId,isInline,@odata.type` +
+    // Inline the binary for small fileAttachments in the same call.
     `&$expand=microsoft.graph.fileAttachment/contentBytes`;
+
   let json;
   try {
-    json = await graphGet(url, token);
+    json = await graphGet(listUrl, token);
   } catch (e) {
-    // Some Graph tenants don't support $expand on attachment content.
-    // Fall back to per-attachment fetch.
+    // Some Graph tenants don't support $expand on attachment content (400).
+    // Drop the $expand and rely on the per-attachment fetch below.
     if (e.status === 400) {
-      const list = await graphGet(
-        `${GRAPH_BASE}/me/messages/${encodeURIComponent(messageGraphId)}/attachments`
-          + `?$select=id,name,contentType,size,contentId,isInline,@odata.type`,
+      json = await graphGet(
+        `${base}?$select=id,name,contentType,size,contentId,isInline,@odata.type`,
         token
       );
-      const out = [];
-      for (const a of (list.value || [])) {
-        if (a['@odata.type'] !== '#microsoft.graph.fileAttachment') continue;
-        const full = await graphGet(
-          `${GRAPH_BASE}/me/messages/${encodeURIComponent(messageGraphId)}/attachments/${encodeURIComponent(a.id)}`,
-          token
-        );
-        if (full.contentBytes) {
-          out.push({
-            filename: full.name || 'attachment',
-            contentType: full.contentType || 'application/octet-stream',
-            size: full.size || 0,
-            cid: full.contentId || '',
-            content: Buffer.from(full.contentBytes, 'base64')
-          });
-        }
-      }
-      return out;
+    } else {
+      throw e;
     }
-    throw e;
   }
+
   const out = [];
   for (const a of (json.value || [])) {
     if (a['@odata.type'] !== '#microsoft.graph.fileAttachment') continue;
-    if (!a.contentBytes) continue;
+
+    // The attachments collection OMITS contentBytes for large file
+    // attachments (roughly >3 MB) even with $expand — Graph requires a
+    // direct GET on the individual attachment to retrieve the bytes.
+    // Without this, large inbound attachments were silently dropped here
+    // (the message synced but with zero attachment rows).
+    let contentBytes = a.contentBytes;
+    if (!contentBytes) {
+      try {
+        const full = await graphGet(`${base}/${encodeURIComponent(a.id)}`, token);
+        contentBytes = full.contentBytes;
+      } catch (e) {
+        console.warn(`[graph] per-attachment fetch failed for ${a.id}: ${e.message}`);
+      }
+    }
+    if (!contentBytes) continue;
+
     out.push({
       filename: a.name || 'attachment',
       contentType: a.contentType || 'application/octet-stream',
       size: a.size || 0,
       cid: a.contentId || '',
-      content: Buffer.from(a.contentBytes, 'base64')
+      content: Buffer.from(contentBytes, 'base64')
     });
   }
   return out;
