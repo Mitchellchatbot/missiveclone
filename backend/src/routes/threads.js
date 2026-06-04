@@ -96,7 +96,7 @@ const CATEGORY_CLAUSES = {
 
 router.get('/', wrap(async (req, res) => {
   const { status, assignee, q, folder, team_space_id, snoozed, label_id,
-          mine, mailbox_id, category, starred } = req.query;
+          mine, mailbox_id, mailbox_ids, category, starred } = req.query;
   const params = [req.user.workspace_id];
   let sql = `SELECT t.*, u.name AS assignee_name,
                     coalesce(
@@ -141,6 +141,19 @@ router.get('/', wrap(async (req, res) => {
   if (mailbox_id) {
     params.push(mailbox_id);
     sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND mm.account_id = $${params.length})`;
+  }
+
+  // mailbox_ids: filter to threads touching ANY of a set of connected
+  // accounts (comma-separated ids). Used by the combined "all inboxes"
+  // view to scope server-side to exactly the inboxes the caller is
+  // allowed to see — instead of fetching the whole workspace and
+  // filtering in the app, which broke offset/hasMore pagination.
+  if (mailbox_ids) {
+    const ids = String(mailbox_ids).split(',').map((s) => s.trim()).filter(Boolean);
+    if (ids.length) {
+      params.push(ids);
+      sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND mm.account_id = ANY($${params.length}::text[]))`;
+    }
   }
 
   // category: smart filter (codes / newsletters / receipts / etc.)
