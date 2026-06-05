@@ -87,10 +87,11 @@ async function graphGet(url, token) {
     console.log(`  graph id:          ${m.id}`);
 
     // Always list attachments, regardless of the flag — that's the whole
-    // point of the probe.
+    // point of the probe. No `$select`: `contentId` is fileAttachment-only and
+    // `@odata.type` isn't selectable, so selecting them 400s the whole request
+    // on the base `attachment` collection (the bug this probe exists to find).
     const attUrl =
-      `${GRAPH_BASE}/me/messages/${encodeURIComponent(m.id)}/attachments` +
-      `?$select=id,name,contentType,size,contentId,isInline,@odata.type`;
+      `${GRAPH_BASE}/me/messages/${encodeURIComponent(m.id)}/attachments`;
     let att;
     try {
       att = await graphGet(attUrl, token);
