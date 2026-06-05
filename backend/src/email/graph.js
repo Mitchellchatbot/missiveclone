@@ -3,6 +3,22 @@ const ms = require('../oauth/microsoft');
 const GRAPH_SCOPE = 'https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Mail.ReadWrite offline_access';
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 
+// Cheap HTML → plaintext. Graph hands us the full body as HTML; we derive the
+// text part from it ourselves (Graph's own bodyPreview is truncated to ~255
+// chars). Mirrors the IMAP path, where mailparser supplies a full text part.
+function htmlToText(html) {
+  return String(html || '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // Find the Graph message id for a given RFC Message-ID header value, by
 // searching Inbox + Sent across the mailbox. Returns null if not found
 // (e.g. the parent message hasn't synced into the mailbox yet, or it
@@ -438,7 +454,14 @@ function graphToParsed(msg, attachments) {
   const bodyContent = (msg.body && msg.body.content) || '';
   const bodyType = (msg.body && msg.body.contentType || '').toLowerCase();
   const html = bodyType === 'html' ? bodyContent : '';
-  const text = bodyType === 'text' ? bodyContent : (msg.bodyPreview || '');
+  // For HTML mail, Graph's bodyPreview is truncated to ~255 chars, which
+  // starved DelegationDoer's email-intake classifier (it reads body_text) and
+  // limited full-text search to the preview. Derive the full plaintext from
+  // the HTML body instead, matching the IMAP/mailparser path; fall back to the
+  // preview only if stripping yields nothing.
+  const text = bodyType === 'text'
+    ? bodyContent
+    : (htmlToText(bodyContent) || msg.bodyPreview || '');
 
   // Microsoft strips angle brackets from internetMessageId in storage but
   // adds them back on read. Either way ingestMessage strips them, so
@@ -630,21 +653,36 @@ async function syncFolderViaGraph(account, folderPath, direction, folderLabel) {
       // so skip and move on. Same as IMAP path's behavior.
       if (m['@removed']) continue;
 
+      // Graph's per-message `hasAttachments` flag is unreliable: a message
+      // whose attachments were added AFTER its draft was created can carry a
+      // real MIME attachment while the flag stays false. That's exactly our
+      // own Graph send path (sendAsDraftViaGraph: create draft → add
+      // attachment → send), so DelegationDoer-sent mail arrived with
+      // hasAttachments=false and the old `if (m.hasAttachments)` gate skipped
+      // the fetch — silently dropping the file for the recipient, even though
+      // OWA (which reads the attachment collection, not the flag) showed it.
+      // So always probe and trust the actual /attachments listing. The delta
+      // stream only returns CHANGED messages, so this is one extra lightweight
+      // GET per new message, bounded per poll and throttled per-user by Graph.
+      // External-sender mail (the previously-working path) sets the flag
+      // correctly and behaves identically to before.
       let attachments = [];
-      if (m.hasAttachments) {
-        try {
-          attachments = await fetchAttachmentsForMessage(token, m.id);
-        } catch (e) {
-          // One bad attachment fetch shouldn't strand the whole message.
-          // Log and continue with empty attachments — the message body
-          // still goes in and the user can re-fetch the attachment via
-          // a "redownload" path later if needed.
-          console.warn(`[graph] attachment fetch failed for ${m.id} (${account.email}): ${e.message}`);
-        }
-        // Diagnostic: a message Graph flagged hasAttachments that yields 0
-        // stored attachments means the fetch dropped them. Seeing this line
-        // at all also confirms THIS build (not an older deploy) is running.
-        console.log(`[graph] ${account.email} ${folderLabel}: hasAttachments msg → fetched ${attachments.length} attachment(s)`);
+      try {
+        attachments = await fetchAttachmentsForMessage(token, m.id);
+      } catch (e) {
+        // One bad attachment fetch shouldn't strand the whole message.
+        // Log and continue with empty attachments — the message body
+        // still goes in and the user can re-fetch the attachment via
+        // a "redownload" path later if needed.
+        console.warn(`[graph] attachment fetch failed for ${m.id} (${account.email}): ${e.message}`);
+      }
+      // Diagnostic: print when the flag and the actual fetch disagree, or
+      // whenever we stored attachments. `hasAttachments=false → fetched N>0`
+      // is the stale-flag bug this probe-always change fixes;
+      // `hasAttachments=true → fetched 0` would instead point at a fetch gap
+      // inside fetchAttachmentsForMessage.
+      if (m.hasAttachments || attachments.length) {
+        console.log(`[graph] ${account.email} ${folderLabel}: hasAttachments=${!!m.hasAttachments} → fetched ${attachments.length} attachment(s)`);
       }
 
       const parsed = graphToParsed(m, attachments);
