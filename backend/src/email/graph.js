@@ -518,21 +518,18 @@ async function fetchAttachmentsForMessage(token, messageGraphId) {
   const base =
     `${GRAPH_BASE}/me/messages/${encodeURIComponent(messageGraphId)}/attachments`;
 
-  // List attachment metadata only — NO `$expand` of contentBytes. We used to
-  // inline contentBytes for small (<=3 MB) files via
-  // `$expand=microsoft.graph.fileAttachment/contentBytes`, but that shortcut
-  // silently dropped small attachments on some messages — notably our own
-  // Graph-sent files like a 201 KB PDF: the file was delivered (OWA showed
-  // it) yet never reached the synced copy, while a 7.6 MB image in the same
-  // thread synced fine. Large files always took the $value path below and
-  // worked, so pull EVERY file's bytes via the per-attachment $value endpoint
-  // — the proven-reliable path for all sizes (matches commit 3fc4ae7's
-  // "per-attachment GET (all sizes)" intent). Costs one extra GET per
-  // attachment, but only for messages that actually carry attachments.
-  const json = await graphGet(
-    `${base}?$select=id,name,contentType,size,contentId,isInline,@odata.type`,
-    token
-  );
+  // List the attachment collection WITHOUT `$select`. The previous
+  // `$select=...,contentId,...,@odata.type` 400'd on every message —
+  // `contentId` lives only on the derived `microsoft.graph.fileAttachment`
+  // type (not the base `microsoft.graph.attachment` the collection is typed
+  // as) and `@odata.type` isn't a selectable term, so Graph rejected the
+  // whole request ("Could not find a property named 'contentId' on type
+  // 'microsoft.graph.attachment'"). syncFolderViaGraph swallowed the error
+  // and stored the message with ZERO attachments — every inbound file
+  // silently dropped, even though OWA and the outbound (send-time) copy
+  // showed it. The bare GET returns the full polymorphic objects, including
+  // `@odata.type`, `contentId`, `isInline`, and `contentBytes` inline.
+  const json = await graphGet(base, token);
 
   const out = [];
   for (const a of (json.value || [])) {
@@ -541,12 +538,21 @@ async function fetchAttachmentsForMessage(token, messageGraphId) {
     // $value payload, so skip them.
     if (a['@odata.type'] !== '#microsoft.graph.fileAttachment') continue;
 
+    // Prefer the bytes the listing already returned (reliable for all sizes
+    // on a bare GET — verified for a 274 KB PDF and a 10.6 MB image), and
+    // fall back to the per-attachment $value endpoint when contentBytes is
+    // absent. $value remains the proven path for any message where Graph
+    // omits inline bytes (commit 3fc4ae7's "per-attachment GET, all sizes").
     let content;
-    try {
-      content = await fetchAttachmentValue(token, messageGraphId, a.id);
-    } catch (e) {
-      console.warn(`[graph] $value fetch failed for ${a.id}: ${e.message}`);
-      continue;
+    if (a.contentBytes) {
+      content = Buffer.from(a.contentBytes, 'base64');
+    } else {
+      try {
+        content = await fetchAttachmentValue(token, messageGraphId, a.id);
+      } catch (e) {
+        console.warn(`[graph] $value fetch failed for ${a.id}: ${e.message}`);
+        continue;
+      }
     }
     if (!content || !content.length) continue;
 
