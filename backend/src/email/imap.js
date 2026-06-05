@@ -214,6 +214,35 @@ async function appendThreadSearchText(threadId, fragment) {
   }
 }
 
+// Insert attachment rows for a message. Shared by the normal ingest path and
+// the dup-backfill branch in ingestMessage so both build the multi-row INSERT
+// identically. Bytes (att.content) are stored inline in the `data` column.
+async function insertAttachmentRows(messageId, workspaceId, attRows) {
+  if (!attRows.length) return;
+  const nowMs = Date.now();
+  const values = [];
+  const params = [];
+  for (const att of attRows) {
+    const base = params.length;
+    values.push(`($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, $${base+8}, $${base+9})`);
+    params.push(
+      uuid(), messageId, workspaceId,
+      att.filename || 'attachment',
+      att.contentType || 'application/octet-stream',
+      att.size || (att.content && att.content.length) || 0,
+      (att.cid || '').replace(/[<>]/g, '') || null,
+      att.content,
+      nowMs
+    );
+  }
+  await query(
+    `INSERT INTO attachments
+      (id, message_id, workspace_id, filename, content_type, size_bytes, content_id, data, created_at)
+     VALUES ${values.join(', ')}`,
+    params
+  );
+}
+
 async function ingestMessage(acc, uid, folder, parsed, direction) {
   const messageId = (parsed.messageId || '').replace(/[<>]/g, '');
   const fromAddr = parsed.from ? parsed.from.text : '';
@@ -243,7 +272,30 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
           AND direction = $3`,
       [messageId, acc.id, dir]
     );
-    if (dup) return false;
+    if (dup) {
+      // Backfill attachments onto a message we already stored without them.
+      // Anything synced before the inbound attachment fixes (the
+      // hasAttachments-gate removal + $value-for-all in graph.js) was ingested
+      // with zero attachment rows, and this dup short-circuit would otherwise
+      // skip it forever. A rescan (accounts.js /rescan-all clears the delta
+      // cursor, re-walking every message) now self-heals those rows here.
+      // Guarded so it only fires when the stored row has NO attachments and we
+      // now have some — it never duplicates rows or re-touches complete ones.
+      const incoming = (Array.isArray(parsed.attachments) ? parsed.attachments : [])
+        .filter(a => a.content);
+      if (incoming.length) {
+        const have = await one(
+          'SELECT COUNT(*)::int AS n FROM attachments WHERE message_id = $1',
+          [dup.id]
+        );
+        if (have && have.n === 0) {
+          await insertAttachmentRows(dup.id, acc.workspace_id, incoming);
+          await query('UPDATE messages SET has_attachments = 1 WHERE id = $1', [dup.id]);
+          console.log(`[ingest] backfilled ${incoming.length} attachment(s) onto existing message ${messageId} (${acc.email})`);
+        }
+      }
+      return false;
+    }
   }
 
   const threadId = await findOrCreateThread(acc.workspace_id, parsed, acc.team_space_id, acc.id);
@@ -271,31 +323,7 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     ]
   );
 
-  const attRows = attachments.filter(a => a.content);
-  if (attRows.length) {
-    const nowMs = Date.now();
-    const values = [];
-    const params = [];
-    for (const att of attRows) {
-      const base = params.length;
-      values.push(`($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, $${base+8}, $${base+9})`);
-      params.push(
-        uuid(), id, acc.workspace_id,
-        att.filename || 'attachment',
-        att.contentType || 'application/octet-stream',
-        att.size || (att.content && att.content.length) || 0,
-        (att.cid || '').replace(/[<>]/g, '') || null,
-        att.content,
-        nowMs
-      );
-    }
-    await query(
-      `INSERT INTO attachments
-        (id, message_id, workspace_id, filename, content_type, size_bytes, content_id, data, created_at)
-       VALUES ${values.join(', ')}`,
-      params
-    );
-  }
+  await insertAttachmentRows(id, acc.workspace_id, attachments.filter(a => a.content));
 
   // Update thread search text + bump last_message_at.
   const searchAdd = [
