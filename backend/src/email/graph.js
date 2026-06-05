@@ -518,49 +518,35 @@ async function fetchAttachmentsForMessage(token, messageGraphId) {
   const base =
     `${GRAPH_BASE}/me/messages/${encodeURIComponent(messageGraphId)}/attachments`;
 
-  // List attachments, inlining contentBytes for SMALL files via $expand.
-  // This is the original, proven path — small attachments come back with
-  // their bytes already and need no extra round-trip. (Large files come
-  // back with contentBytes omitted; handled via $value below.)
-  const url =
-    `${base}?$select=id,name,contentType,size,contentId,isInline,@odata.type` +
-    `&$expand=microsoft.graph.fileAttachment/contentBytes`;
-  let json;
-  try {
-    json = await graphGet(url, token);
-  } catch (e) {
-    // Some tenants reject $expand on attachment content (400). Drop it and
-    // pull every file's bytes via $value below.
-    if (e.status === 400) {
-      json = await graphGet(
-        `${base}?$select=id,name,contentType,size,contentId,isInline,@odata.type`,
-        token
-      );
-    } else {
-      throw e;
-    }
-  }
+  // List attachment metadata only — NO `$expand` of contentBytes. We used to
+  // inline contentBytes for small (<=3 MB) files via
+  // `$expand=microsoft.graph.fileAttachment/contentBytes`, but that shortcut
+  // silently dropped small attachments on some messages — notably our own
+  // Graph-sent files like a 201 KB PDF: the file was delivered (OWA showed
+  // it) yet never reached the synced copy, while a 7.6 MB image in the same
+  // thread synced fine. Large files always took the $value path below and
+  // worked, so pull EVERY file's bytes via the per-attachment $value endpoint
+  // — the proven-reliable path for all sizes (matches commit 3fc4ae7's
+  // "per-attachment GET (all sizes)" intent). Costs one extra GET per
+  // attachment, but only for messages that actually carry attachments.
+  const json = await graphGet(
+    `${base}?$select=id,name,contentType,size,contentId,isInline,@odata.type`,
+    token
+  );
 
   const out = [];
   for (const a of (json.value || [])) {
-    // fileAttachment is the only type that carries bytes; skip itemAttachment
-    // (nested message) and referenceAttachment (cloud-storage link).
+    // fileAttachment is the only type that carries raw bytes; itemAttachment
+    // (nested message) and referenceAttachment (cloud-storage link) have no
+    // $value payload, so skip them.
     if (a['@odata.type'] !== '#microsoft.graph.fileAttachment') continue;
 
     let content;
-    if (a.contentBytes) {
-      // Small attachment — bytes already inlined by $expand. Identical to the
-      // original behavior, so previously-working attachments stay working.
-      content = Buffer.from(a.contentBytes, 'base64');
-    } else {
-      // Large attachment — Graph omitted contentBytes; stream the raw bytes.
-      // This is what was dropping every >3 MB inbound attachment.
-      try {
-        content = await fetchAttachmentValue(token, messageGraphId, a.id);
-      } catch (e) {
-        console.warn(`[graph] $value fetch failed for ${a.id}: ${e.message}`);
-        continue;
-      }
+    try {
+      content = await fetchAttachmentValue(token, messageGraphId, a.id);
+    } catch (e) {
+      console.warn(`[graph] $value fetch failed for ${a.id}: ${e.message}`);
+      continue;
     }
     if (!content || !content.length) continue;
 
