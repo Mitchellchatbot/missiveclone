@@ -276,8 +276,13 @@ async function addAttachmentsToDraft(token, draftId, attachments, tag) {
 
 // Upload a large attachment to a draft via Graph's upload-session protocol:
 // open a session, then PUT the bytes in chunks with Content-Range headers.
-// The session uploadUrl is pre-authorized, so chunk PUTs must NOT carry the
-// Authorization header.
+//
+// The uploadUrl Graph hands back is pre-authenticated: it points at the
+// outlook.office.com host and carries its own `?authtoken=` JWT in the query
+// string. The chunk PUTs must therefore send NO Authorization header — adding
+// our graph.microsoft.com bearer token would be an audience mismatch and
+// Graph answers it with a 401. (Microsoft docs: "Attach large files to
+// Outlook messages" → "Do not specify an Authorization request header.")
 async function uploadAttachmentViaSession(token, draftId, att, tag = '[graph]') {
   const total = att.buffer.length;
   const sessionRes = await fetch(
@@ -304,7 +309,10 @@ async function uploadAttachmentViaSession(token, draftId, att, tag = '[graph]') 
     const chunk = att.buffer.subarray(start, end + 1);
     const putRes = await fetch(uploadUrl, {
       method: 'PUT',
+      // No Authorization header — uploadUrl is pre-authenticated (see above).
+      // Content-Type is required by the upload-session API.
       headers: {
+        'Content-Type': 'application/octet-stream',
         'Content-Length': String(chunk.length),
         'Content-Range': `bytes ${start}-${end}/${total}`
       },
