@@ -98,7 +98,7 @@ export default function ComposeNew({ accounts, defaultAccountId, initial, onClos
           <input value={subject} onChange={e => setSubject(e.target.value)} required />
         </div>
 
-        <RichEditor html={html} onChange={setHtml} placeholder="Write your message…" />
+        <RichEditor html={html} onChange={setHtml} onAttachFiles={addFiles} placeholder="Write your message…" />
 
         <input
           ref={fileInput}
