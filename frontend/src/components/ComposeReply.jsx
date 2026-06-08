@@ -138,7 +138,7 @@ export default function ComposeReply({ threadId, accounts, onSent, onCancel }) {
         </div>
       </div>
 
-      <RichEditor html={html} onChange={setHtml} />
+      <RichEditor html={html} onChange={setHtml} onAttachFiles={addFiles} />
 
       <input
         ref={fileInput}

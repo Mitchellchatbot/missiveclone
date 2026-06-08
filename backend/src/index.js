@@ -102,6 +102,18 @@ if (fs.existsSync(distPath)) {
 
 app.use((err, _req, res, _next) => {
   console.error('[express error]', err);
+  // multer rejects oversized uploads/fields during multipart parsing, before
+  // the route runs. Surface a clear, actionable message instead of a generic
+  // 500 — the common case is a body bloated by pasted screenshots.
+  if (err && err.name === 'MulterError') {
+    const map = {
+      LIMIT_FIELD_VALUE: 'The message is too large to send. If you pasted images into the body, attach them as files instead.',
+      LIMIT_FILE_SIZE: 'An attachment is too large (max 150 MB each).',
+      LIMIT_FILE_COUNT: 'Too many attachments (max 10).',
+      LIMIT_UNEXPECTED_FILE: 'Unexpected upload field.'
+    };
+    return res.status(413).json({ error: map[err.code] || ('Upload error: ' + err.message) });
+  }
   res.status(500).json({ error: err.message || 'server error' });
 });
 
