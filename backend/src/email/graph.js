@@ -307,29 +307,77 @@ async function uploadAttachmentViaSession(token, draftId, att, tag = '[graph]') 
   for (let start = 0; start < total; start += GRAPH_UPLOAD_CHUNK) {
     const end = Math.min(start + GRAPH_UPLOAD_CHUNK, total) - 1;
     const chunk = att.buffer.subarray(start, end + 1);
-    const putRes = await fetch(uploadUrl, {
-      method: 'PUT',
-      // No Authorization header — uploadUrl is pre-authenticated (see above).
-      // Content-Type is required by the upload-session API.
-      headers: {
-        'Content-Type': 'application/octet-stream',
-        'Content-Length': String(chunk.length),
-        'Content-Range': `bytes ${start}-${end}/${total}`
-      },
-      body: chunk
-    });
+    const contentRange = `bytes ${start}-${end}/${total}`;
+    const putRes = await putUploadChunk(uploadUrl, chunk, contentRange, tag);
     // Intermediate chunks return 200 (with nextExpectedRanges); the final
     // chunk returns 201 Created (the attachment resource). Anything else is
     // a failure.
     if (putRes.status !== 200 && putRes.status !== 201) {
       const detail = await putRes.text().catch(() => '');
+      // Surface the headers Outlook/Graph use to explain an auth failure so a
+      // future regression isn't an opaque empty-body 401 again.
+      const diag = [
+        `www-authenticate=${putRes.headers.get('www-authenticate') || '-'}`,
+        `x-ms-diagnostics=${putRes.headers.get('x-ms-diagnostics') || '-'}`,
+        `request-id=${putRes.headers.get('request-id') || '-'}`
+      ].join(' ');
       throw new Error(
-        `Graph attachment upload chunk failed (bytes ${start}-${end}/${total}): ` +
-        `${putRes.status} ${detail.slice(0, 200)}`
+        `Graph attachment upload chunk failed (${contentRange}): ` +
+        `${putRes.status} ${detail.slice(0, 200)} [${diag}]`
       );
     }
   }
   console.log(`${tag} uploaded large attachment "${att.name}" (${(total / 1024 / 1024).toFixed(1)} MB) via session`);
+}
+
+// PUT one chunk to the pre-authenticated upload-session URL, driving redirects
+// by hand.
+//
+// Why not let fetch follow them: Node's global fetch (undici) auto-follows
+// 3xx, and the outlook.office.com attachment-session endpoint can redirect the
+// PUT to a region-specific host. The redirect Location is a path that does NOT
+// echo the `?authtoken=` query string the original uploadUrl carries, so when
+// undici re-issues the request it arrives with no credential and Outlook
+// answers with an empty-body 401 — the failure we saw in the field. We set
+// `redirect: 'manual'`, then re-attach the authtoken before following so the
+// next hop stays authenticated. (Verified: auto-follow 401s, manual+re-attach
+// succeeds.)
+async function putUploadChunk(uploadUrl, chunk, contentRange, tag = '[graph]') {
+  let url = uploadUrl;
+  for (let hop = 0; hop < 4; hop++) {
+    const res = await fetch(url, {
+      method: 'PUT',
+      redirect: 'manual',
+      // No Authorization header — the URL is pre-authenticated. Adding our
+      // graph.microsoft.com bearer here is an audience mismatch → 401.
+      // Content-Type is required by the upload-session API.
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(chunk.length),
+        'Content-Range': contentRange
+      },
+      body: chunk
+    });
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get('location');
+      if (!location) return res; // nothing to follow; let caller report it
+      url = withAuthToken(new URL(location, url), uploadUrl).toString();
+      console.warn(`${tag} upload chunk redirected (${res.status}) → following ${new URL(url).host}`);
+      continue;
+    }
+    return res;
+  }
+  throw new Error('Graph attachment upload chunk: too many redirects');
+}
+
+// Copy the `authtoken` query parameter from the original pre-authenticated
+// uploadUrl onto a redirect target that lost it. Returns `target`.
+function withAuthToken(target, originalUrl) {
+  if (!target.searchParams.has('authtoken')) {
+    const tok = new URL(originalUrl).searchParams.get('authtoken');
+    if (tok) target.searchParams.set('authtoken', tok);
+  }
+  return target;
 }
 
 async function assertGraphOk(res, expectedStatus, op) {
