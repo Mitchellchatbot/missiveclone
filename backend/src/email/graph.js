@@ -56,21 +56,37 @@ async function findGraphMessageIdByInternetId(token, internetMessageId) {
 }
 
 // Parse "Name <addr>, addr2, addr3" into Graph's recipient shape.
+// Accepts every separator real clients/users emit — commas, semicolons
+// (Outlook's default), and bare whitespace between addresses — because the
+// compose UI takes free-text To/Cc fields. Splitting only on commas made a
+// space- or semicolon-separated list collapse into a single bogus recipient,
+// which Graph rejects with "<the whole string> is not resolved. All
+// recipients must be resolved before a message can be submitted."
 function parseAddresses(s) {
   if (!s) return [];
-  const parts = String(s).split(',').map(a => a.trim()).filter(Boolean);
-  return parts.map(a => {
-    const m = a.match(/(.*)<([^>]+)>/);
+  // Split on commas/semicolons first so a "Name <addr>" group stays intact —
+  // a display name may legitimately contain spaces.
+  const groups = String(s).split(/[,;]+/).map(a => a.trim()).filter(Boolean);
+  const out = [];
+  for (const g of groups) {
+    const m = g.match(/(.*)<([^>]+)>/);
     if (m) {
-      return {
+      out.push({
         emailAddress: {
           name: m[1].trim().replace(/^"|"$/g, ''),
           address: m[2].trim()
         }
-      };
+      });
+    } else {
+      // Bare address(es): one group may still hold several whitespace-
+      // separated addresses (e.g. "a@x.com b@y.com"). Bare addresses can't
+      // contain spaces, so splitting on whitespace here is safe.
+      for (const addr of g.split(/\s+/).filter(Boolean)) {
+        out.push({ emailAddress: { address: addr } });
+      }
     }
-    return { emailAddress: { address: a } };
-  });
+  }
+  return out;
 }
 
 /**
