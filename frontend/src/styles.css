@@ -710,6 +710,7 @@ textarea { resize: vertical; }
   background: var(--surface);
   border-right: 1px solid var(--border);
   overflow-y: auto;
+  min-width: 0;
 }
 .thread-row {
   display: flex; gap: 12px;
@@ -846,6 +847,12 @@ textarea { resize: vertical; }
      win instead of the browser anchoring the scroll position to older content. */
   overflow-anchor: none;
   display: flex; flex-direction: column;
+  /* Grid items default to min-width:auto, so a wide email (tables, the body
+     iframe) would force this 1fr column past the viewport; with .mail-grid
+     overflow:hidden that clips the layout and the list/window appear to shift.
+     min-width:0 keeps the pane in its track and makes wide bodies scroll inside
+     the iframe instead — the standard reading-pane behaviour. */
+  min-width: 0;
 }
 .tv-header {
   position: sticky; top: 0;
@@ -914,6 +921,33 @@ textarea { resize: vertical; }
 }
 .msg-body p:first-child { margin-top: 0; }
 .msg-body p:last-child { margin-bottom: 0; }
+
+/* Collapsed message stub (Gmail-style — older messages in a thread) */
+.msg-collapsed {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  transition: background var(--transition);
+}
+.msg-collapsed:hover { background: #f6f8fb; }
+.msg-collapsed.msg-outbound { background: #f6faff; border-color: #cfe0ff; }
+.msg-collapsed-main {
+  min-width: 0; flex: 1;
+  display: flex; align-items: baseline; gap: 8px;
+  overflow: hidden; white-space: nowrap;
+}
+.msg-collapsed-from { font-weight: 600; font-size: 13px; flex: 0 0 auto; }
+.msg-collapsed-snippet {
+  min-width: 0; flex: 1;
+  color: var(--text-muted); font-size: 13px;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.msg-collapsed-clip { color: var(--text-faint); flex: 0 0 auto; }
+.msg-collapsed-date { color: var(--text-faint); font-size: 11.5px; flex: 0 0 auto; }
 
 /* =====  Attachments  ===== */
 .att-list {

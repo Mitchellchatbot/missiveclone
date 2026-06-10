@@ -55,6 +55,12 @@ function nameFromAddr(s) {
   return (a > 0 ? s.slice(0, a) : s).trim().replace(/"/g, '');
 }
 
+// One-line preview for a collapsed message stub, from the stored plaintext body.
+function msgSnippet(m) {
+  const t = (m.body_text || '').replace(/\s+/g, ' ').trim();
+  return t.length > 140 ? t.slice(0, 140) + '…' : t;
+}
+
 function escapeAttr(s) {
   return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -73,6 +79,22 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   const [showSnooze, setShowSnooze] = useState(false);
   const [showLabel, setShowLabel] = useState(false);
   const [allLabels, setAllLabels] = useState([]);
+
+  // Gmail-style thread collapse: a thread can hold many messages, and rendering
+  // every one fully expanded turns it into a wall of email. Instead we show only
+  // the latest message expanded and collapse the rest into one-line header stubs
+  // the user can click open. `expandedIds` is the set of message ids shown
+  // expanded; `null` means "not initialised yet — default to the latest".
+  const [expandedIds, setExpandedIds] = useState(null);
+  const toggleMsg = useCallback((id, lastId) => {
+    setExpandedIds(prev => {
+      // Seed from the default (latest expanded) the first time, so collapsing the
+      // latest message works even before the init effect has run.
+      const next = new Set(prev || (lastId != null ? [lastId] : []));
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
 
   // Messages render oldest-first (sent_at ASC), so the newest reply sits at the
   // bottom of a potentially very long thread. Open scrolled to it — mirrors the
@@ -152,6 +174,20 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   // resize afterwards (see MessageBlock autoResize -> onResize), which re-runs
   // this while still pinned so we stay at the bottom as the layout settles.
   useEffect(() => { scrollToLatest(); }, [data, scrollToLatest]);
+
+  // Default the collapse state to "latest message expanded, rest collapsed"
+  // whenever the thread switches or a new message arrives. We key on the message
+  // id list (not the whole `data` object) so unrelated reloads — starring,
+  // labelling, status changes, all of which re-fetch — DON'T discard the user's
+  // manual expand/collapse choices.
+  const msgSigRef = useRef('');
+  useEffect(() => {
+    const msgs = (data && data.messages) || [];
+    const sig = threadId + ':' + msgs.map(m => m.id).join(',');
+    if (sig === msgSigRef.current) return;
+    msgSigRef.current = sig;
+    setExpandedIds(msgs.length ? new Set([msgs[msgs.length - 1].id]) : null);
+  }, [threadId, data]);
 
   useEffect(() => {
     if (!threadId) return;
@@ -318,7 +354,21 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
       </div>
 
       <div className="tv-messages">
-        {messages.map(m => <MessageBlock key={m.id} m={m} onResize={scrollToLatest} />)}
+        {messages.map((m, i) => {
+          const lastId = messages[messages.length - 1].id;
+          // Before the init effect runs, expandedIds is null — fall back to
+          // "latest only" so the newest message is open on first paint.
+          const expanded = expandedIds ? expandedIds.has(m.id) : i === messages.length - 1;
+          return (
+            <MessageBlock
+              key={m.id}
+              m={m}
+              expanded={expanded}
+              onToggle={() => toggleMsg(m.id, lastId)}
+              onResize={scrollToLatest}
+            />
+          );
+        })}
       </div>
       {/* Anchor for scroll-to-latest — sits just below the newest message. */}
       <div ref={endRef} />
@@ -343,9 +393,28 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   );
 }
 
-function MessageBlock({ m, onResize }) {
+function MessageBlock({ m, expanded, onToggle, onResize }) {
   const docHtml = useMemo(() => m.body_html ? buildEmailDoc(m.body_html) : null, [m.body_html]);
   const senderName = m.direction === 'outbound' ? (m.from_addr ? nameFromAddr(m.from_addr) : 'You') : nameFromAddr(m.from_addr) || 'Unknown';
+
+  // Collapsed: a compact, clickable one-line stub (Gmail-style). The body iframe
+  // is not mounted at all while collapsed, which also speeds up opening long
+  // threads (only the expanded message renders an iframe).
+  if (!expanded) {
+    return (
+      <div className={'msg-collapsed msg-' + m.direction} onClick={onToggle} title="Expand">
+        <Avatar name={senderName} size={28} />
+        <div className="msg-collapsed-main">
+          <span className="msg-collapsed-from">{senderName}</span>
+          <span className="msg-collapsed-snippet">{msgSnippet(m)}</span>
+        </div>
+        {m.attachments && m.attachments.length > 0 && (
+          <Paperclip size={13} className="msg-collapsed-clip" />
+        )}
+        <span className="msg-collapsed-date">{fmtFull(m.sent_at)}</span>
+      </div>
+    );
+  }
 
   function autoResize(e) {
     try {
@@ -365,7 +434,7 @@ function MessageBlock({ m, onResize }) {
 
   return (
     <div className={'msg msg-' + m.direction}>
-      <div className="msg-head">
+      <div className="msg-head" onClick={onToggle} style={{ cursor: 'pointer' }} title="Collapse">
         <Avatar name={senderName} size={36} />
         <div className="msg-head-main">
           <div><strong>{senderName}</strong> <span className="muted small">to {m.to_addrs}</span></div>
