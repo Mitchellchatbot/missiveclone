@@ -22,11 +22,92 @@ function sanitizeForIframe(html) {
   });
 }
 
+// Gmail-style quote collapsing. Email clients append the entire prior thread
+// to every reply (Gmail blockquotes, Outlook "From:/Sent:" header blocks, etc).
+// Rendering that verbatim makes a thread repeat itself and look jumbled. Like
+// Gmail, we keep the full body but detect where the quoted history begins and
+// hide everything from there behind a "•••" toggle, so each message shows only
+// its new content by default. Operates on the already-sanitized HTML string and
+// returns { html, hasQuote }. Any parse failure falls back to the input
+// untouched so an edge case can never blank out a message.
+const QUOTE_TEXT_RE = /^\s*(On .+ wrote:|From:\s.+Sent:\s.+|-{2,}\s*Original Message\s*-{2,})/is;
+
+function collapseQuotedHistory(safeHtml) {
+  try {
+    const doc = new DOMParser().parseFromString(safeHtml, 'text/html');
+    const body = doc.body;
+    if (!body) return { html: safeHtml, hasQuote: false };
+
+    // Find the earliest boundary node in document order, preferring structural
+    // markers (reliable) over text heuristics (last resort).
+    let boundary =
+      doc.querySelector('blockquote.gmail_quote, div.gmail_quote') ||
+      doc.querySelector('blockquote[type="cite"]') ||
+      doc.querySelector('#divRplyFwdMsg, #appendonsend');
+
+    // Outlook divider: a border-top div immediately followed by a "From:" block.
+    if (!boundary) {
+      for (const div of doc.querySelectorAll('div[style*="border-top"]')) {
+        if (/From:/i.test(div.textContent || '') || /From:/i.test(div.nextElementSibling?.textContent || '')) {
+          boundary = div;
+          break;
+        }
+      }
+    }
+
+    // Generic top-level blockquote (Apple Mail and others).
+    if (!boundary) boundary = body.querySelector(':scope > blockquote');
+
+    // Text fallback: first block-level child whose text opens a quoted header.
+    if (!boundary) {
+      for (const el of body.children) {
+        if (QUOTE_TEXT_RE.test(el.textContent || '')) { boundary = el; break; }
+      }
+    }
+
+    if (!boundary) return { html: safeHtml, hasQuote: false };
+
+    // Walk up to the boundary's body-level ancestor so we collapse it together
+    // with all following siblings (the rest of the quoted thread).
+    let top = boundary;
+    while (top.parentNode && top.parentNode !== body) top = top.parentNode;
+    if (top.parentNode !== body) return { html: safeHtml, hasQuote: false };
+
+    // False-positive guard: only collapse if there is real content BEFORE the
+    // boundary. A genuine reply always has new text above the quote; if the
+    // quote is the very first content, the "quote" is the whole message (e.g. a
+    // bare forward or an over-eager text match) — show it all rather than hiding
+    // an entire legitimate email behind a tiny toggle.
+    let hasPreceding = false;
+    for (let n = top.previousSibling; n; n = n.previousSibling) {
+      if (n.nodeType === 1 || (n.nodeType === 3 && (n.textContent || '').trim())) { hasPreceding = true; break; }
+    }
+    if (!hasPreceding) return { html: safeHtml, hasQuote: false };
+
+    // Wrap the boundary + everything after it in a native <details> disclosure.
+    // This is intentionally script-free: the message iframe is sandboxed WITHOUT
+    // allow-scripts, so no injected JS would run. <details>/<summary> toggles
+    // natively in that sandbox. Closed by default → only the "•••" summary shows.
+    const details = doc.createElement('details');
+    details.className = 'dd-quote';
+    const summary = doc.createElement('summary');
+    summary.className = 'dd-quote-toggle';
+    summary.textContent = '•••';
+    details.appendChild(summary);
+    body.insertBefore(details, top);
+    while (details.nextSibling) details.appendChild(details.nextSibling);
+
+    return { html: body.innerHTML, hasQuote: true };
+  } catch {
+    return { html: safeHtml, hasQuote: false };
+  }
+}
+
 // Wrap the sanitized HTML into a complete document so the iframe renders it
 // with our base styles. <base target="_blank"> makes every link open in a
 // new tab, which is what email clients do.
 function buildEmailDoc(rawHtml) {
-  const safe = sanitizeForIframe(rawHtml || '');
+  const { html: safe } = collapseQuotedHistory(sanitizeForIframe(rawHtml || ''));
   return `<!doctype html><html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -38,6 +119,11 @@ function buildEmailDoc(rawHtml) {
   a { color: #2f6feb; }
   pre, code { white-space: pre-wrap; word-break: break-word; }
   blockquote { border-left: 3px solid #d0d7de; padding-left: 10px; color: #59636e; margin: 8px 0; }
+  details.dd-quote { margin: 6px 0; }
+  summary.dd-quote-toggle { display: inline-block; width: fit-content; margin: 2px 0; padding: 2px 10px; line-height: 1; font-size: 14px; letter-spacing: 1px; color: #59636e; background: #eef1f4; border: 1px solid #d0d7de; border-radius: 12px; cursor: pointer; list-style: none; user-select: none; }
+  summary.dd-quote-toggle::-webkit-details-marker { display: none; }
+  summary.dd-quote-toggle::marker { content: ''; }
+  summary.dd-quote-toggle:hover { background: #e3e7ec; }
 </style>
 </head><body>${safe}</body></html>`;
 }
@@ -53,6 +139,12 @@ function nameFromAddr(s) {
   if (!s) return '';
   const a = s.indexOf('<');
   return (a > 0 ? s.slice(0, a) : s).trim().replace(/"/g, '');
+}
+
+// One-line preview for a collapsed message stub, from the stored plaintext body.
+function msgSnippet(m) {
+  const t = (m.body_text || '').replace(/\s+/g, ' ').trim();
+  return t.length > 140 ? t.slice(0, 140) + '…' : t;
 }
 
 function escapeAttr(s) {
@@ -73,6 +165,22 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   const [showSnooze, setShowSnooze] = useState(false);
   const [showLabel, setShowLabel] = useState(false);
   const [allLabels, setAllLabels] = useState([]);
+
+  // Gmail-style thread collapse: a thread can hold many messages, and rendering
+  // every one fully expanded turns it into a wall of email. Instead we show only
+  // the latest message expanded and collapse the rest into one-line header stubs
+  // the user can click open. `expandedIds` is the set of message ids shown
+  // expanded; `null` means "not initialised yet — default to the latest".
+  const [expandedIds, setExpandedIds] = useState(null);
+  const toggleMsg = useCallback((id, lastId) => {
+    setExpandedIds(prev => {
+      // Seed from the default (latest expanded) the first time, so collapsing the
+      // latest message works even before the init effect has run.
+      const next = new Set(prev || (lastId != null ? [lastId] : []));
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
 
   // Messages render oldest-first (sent_at ASC), so the newest reply sits at the
   // bottom of a potentially very long thread. Open scrolled to it — mirrors the
@@ -152,6 +260,20 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   // resize afterwards (see MessageBlock autoResize -> onResize), which re-runs
   // this while still pinned so we stay at the bottom as the layout settles.
   useEffect(() => { scrollToLatest(); }, [data, scrollToLatest]);
+
+  // Default the collapse state to "latest message expanded, rest collapsed"
+  // whenever the thread switches or a new message arrives. We key on the message
+  // id list (not the whole `data` object) so unrelated reloads — starring,
+  // labelling, status changes, all of which re-fetch — DON'T discard the user's
+  // manual expand/collapse choices.
+  const msgSigRef = useRef('');
+  useEffect(() => {
+    const msgs = (data && data.messages) || [];
+    const sig = threadId + ':' + msgs.map(m => m.id).join(',');
+    if (sig === msgSigRef.current) return;
+    msgSigRef.current = sig;
+    setExpandedIds(msgs.length ? new Set([msgs[msgs.length - 1].id]) : null);
+  }, [threadId, data]);
 
   useEffect(() => {
     if (!threadId) return;
@@ -318,7 +440,21 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
       </div>
 
       <div className="tv-messages">
-        {messages.map(m => <MessageBlock key={m.id} m={m} onResize={scrollToLatest} />)}
+        {messages.map((m, i) => {
+          const lastId = messages[messages.length - 1].id;
+          // Before the init effect runs, expandedIds is null — fall back to
+          // "latest only" so the newest message is open on first paint.
+          const expanded = expandedIds ? expandedIds.has(m.id) : i === messages.length - 1;
+          return (
+            <MessageBlock
+              key={m.id}
+              m={m}
+              expanded={expanded}
+              onToggle={() => toggleMsg(m.id, lastId)}
+              onResize={scrollToLatest}
+            />
+          );
+        })}
       </div>
       {/* Anchor for scroll-to-latest — sits just below the newest message. */}
       <div ref={endRef} />
@@ -343,29 +479,57 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   );
 }
 
-function MessageBlock({ m, onResize }) {
+function MessageBlock({ m, expanded, onToggle, onResize }) {
   const docHtml = useMemo(() => m.body_html ? buildEmailDoc(m.body_html) : null, [m.body_html]);
   const senderName = m.direction === 'outbound' ? (m.from_addr ? nameFromAddr(m.from_addr) : 'You') : nameFromAddr(m.from_addr) || 'Unknown';
 
+  // Collapsed: a compact, clickable one-line stub (Gmail-style). The body iframe
+  // is not mounted at all while collapsed, which also speeds up opening long
+  // threads (only the expanded message renders an iframe).
+  if (!expanded) {
+    return (
+      <div className={'msg-collapsed msg-' + m.direction} onClick={onToggle} title="Expand">
+        <Avatar name={senderName} size={28} />
+        <div className="msg-collapsed-main">
+          <span className="msg-collapsed-from">{senderName}</span>
+          <span className="msg-collapsed-snippet">{msgSnippet(m)}</span>
+        </div>
+        {m.attachments && m.attachments.length > 0 && (
+          <Paperclip size={13} className="msg-collapsed-clip" />
+        )}
+        <span className="msg-collapsed-date">{fmtFull(m.sent_at)}</span>
+      </div>
+    );
+  }
+
   function autoResize(e) {
-    try {
-      const doc = e.target.contentDocument;
-      if (doc && doc.body) {
-        const h = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
-        e.target.style.height = Math.min(h + 24, 1500) + 'px';
+    const iframe = e.target;
+    function fit() {
+      try {
+        const doc = iframe.contentDocument;
+        if (doc && doc.body) {
+          const h = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
+          iframe.style.height = Math.min(h + 24, 1500) + 'px';
+        }
+      } catch {
+        // Cross-origin — sandbox without allow-same-origin. Use a safe default.
+        iframe.style.height = '500px';
       }
-    } catch {
-      // Cross-origin — sandbox without allow-same-origin. Use a safe default.
-      e.target.style.height = '500px';
+      // The body just changed height; let the thread re-snap to the latest
+      // message if it's still pinned to the bottom.
+      if (onResize) onResize();
     }
-    // The body just changed height; let the thread re-snap to the latest
-    // message if it's still pinned to the bottom.
-    if (onResize) onResize();
+    fit();
+    // The quoted-history "•••" disclosure is a script-free <details> (the iframe
+    // sandbox has no allow-scripts). Expanding it grows the content, so re-fit
+    // the iframe height from here, the parent. `toggle` doesn't bubble, so we
+    // listen in the capture phase. The listener dies with the iframe document.
+    try { iframe.contentDocument.addEventListener('toggle', fit, true); } catch {}
   }
 
   return (
     <div className={'msg msg-' + m.direction}>
-      <div className="msg-head">
+      <div className="msg-head" onClick={onToggle} style={{ cursor: 'pointer' }} title="Collapse">
         <Avatar name={senderName} size={36} />
         <div className="msg-head-main">
           <div><strong>{senderName}</strong> <span className="muted small">to {m.to_addrs}</span></div>
