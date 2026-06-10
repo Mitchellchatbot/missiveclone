@@ -22,11 +22,92 @@ function sanitizeForIframe(html) {
   });
 }
 
+// Gmail-style quote collapsing. Email clients append the entire prior thread
+// to every reply (Gmail blockquotes, Outlook "From:/Sent:" header blocks, etc).
+// Rendering that verbatim makes a thread repeat itself and look jumbled. Like
+// Gmail, we keep the full body but detect where the quoted history begins and
+// hide everything from there behind a "•••" toggle, so each message shows only
+// its new content by default. Operates on the already-sanitized HTML string and
+// returns { html, hasQuote }. Any parse failure falls back to the input
+// untouched so an edge case can never blank out a message.
+const QUOTE_TEXT_RE = /^\s*(On .+ wrote:|From:\s.+Sent:\s.+|-{2,}\s*Original Message\s*-{2,})/is;
+
+function collapseQuotedHistory(safeHtml) {
+  try {
+    const doc = new DOMParser().parseFromString(safeHtml, 'text/html');
+    const body = doc.body;
+    if (!body) return { html: safeHtml, hasQuote: false };
+
+    // Find the earliest boundary node in document order, preferring structural
+    // markers (reliable) over text heuristics (last resort).
+    let boundary =
+      doc.querySelector('blockquote.gmail_quote, div.gmail_quote') ||
+      doc.querySelector('blockquote[type="cite"]') ||
+      doc.querySelector('#divRplyFwdMsg, #appendonsend');
+
+    // Outlook divider: a border-top div immediately followed by a "From:" block.
+    if (!boundary) {
+      for (const div of doc.querySelectorAll('div[style*="border-top"]')) {
+        if (/From:/i.test(div.textContent || '') || /From:/i.test(div.nextElementSibling?.textContent || '')) {
+          boundary = div;
+          break;
+        }
+      }
+    }
+
+    // Generic top-level blockquote (Apple Mail and others).
+    if (!boundary) boundary = body.querySelector(':scope > blockquote');
+
+    // Text fallback: first block-level child whose text opens a quoted header.
+    if (!boundary) {
+      for (const el of body.children) {
+        if (QUOTE_TEXT_RE.test(el.textContent || '')) { boundary = el; break; }
+      }
+    }
+
+    if (!boundary) return { html: safeHtml, hasQuote: false };
+
+    // Walk up to the boundary's body-level ancestor so we collapse it together
+    // with all following siblings (the rest of the quoted thread).
+    let top = boundary;
+    while (top.parentNode && top.parentNode !== body) top = top.parentNode;
+    if (top.parentNode !== body) return { html: safeHtml, hasQuote: false };
+
+    // False-positive guard: only collapse if there is real content BEFORE the
+    // boundary. A genuine reply always has new text above the quote; if the
+    // quote is the very first content, the "quote" is the whole message (e.g. a
+    // bare forward or an over-eager text match) — show it all rather than hiding
+    // an entire legitimate email behind a tiny toggle.
+    let hasPreceding = false;
+    for (let n = top.previousSibling; n; n = n.previousSibling) {
+      if (n.nodeType === 1 || (n.nodeType === 3 && (n.textContent || '').trim())) { hasPreceding = true; break; }
+    }
+    if (!hasPreceding) return { html: safeHtml, hasQuote: false };
+
+    // Wrap the boundary + everything after it in a native <details> disclosure.
+    // This is intentionally script-free: the message iframe is sandboxed WITHOUT
+    // allow-scripts, so no injected JS would run. <details>/<summary> toggles
+    // natively in that sandbox. Closed by default → only the "•••" summary shows.
+    const details = doc.createElement('details');
+    details.className = 'dd-quote';
+    const summary = doc.createElement('summary');
+    summary.className = 'dd-quote-toggle';
+    summary.textContent = '•••';
+    details.appendChild(summary);
+    body.insertBefore(details, top);
+    while (details.nextSibling) details.appendChild(details.nextSibling);
+
+    return { html: body.innerHTML, hasQuote: true };
+  } catch {
+    return { html: safeHtml, hasQuote: false };
+  }
+}
+
 // Wrap the sanitized HTML into a complete document so the iframe renders it
 // with our base styles. <base target="_blank"> makes every link open in a
 // new tab, which is what email clients do.
 function buildEmailDoc(rawHtml) {
-  const safe = sanitizeForIframe(rawHtml || '');
+  const { html: safe } = collapseQuotedHistory(sanitizeForIframe(rawHtml || ''));
   return `<!doctype html><html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -38,6 +119,11 @@ function buildEmailDoc(rawHtml) {
   a { color: #2f6feb; }
   pre, code { white-space: pre-wrap; word-break: break-word; }
   blockquote { border-left: 3px solid #d0d7de; padding-left: 10px; color: #59636e; margin: 8px 0; }
+  details.dd-quote { margin: 6px 0; }
+  summary.dd-quote-toggle { display: inline-block; width: fit-content; margin: 2px 0; padding: 2px 10px; line-height: 1; font-size: 14px; letter-spacing: 1px; color: #59636e; background: #eef1f4; border: 1px solid #d0d7de; border-radius: 12px; cursor: pointer; list-style: none; user-select: none; }
+  summary.dd-quote-toggle::-webkit-details-marker { display: none; }
+  summary.dd-quote-toggle::marker { content: ''; }
+  summary.dd-quote-toggle:hover { background: #e3e7ec; }
 </style>
 </head><body>${safe}</body></html>`;
 }
@@ -417,19 +503,28 @@ function MessageBlock({ m, expanded, onToggle, onResize }) {
   }
 
   function autoResize(e) {
-    try {
-      const doc = e.target.contentDocument;
-      if (doc && doc.body) {
-        const h = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
-        e.target.style.height = Math.min(h + 24, 1500) + 'px';
+    const iframe = e.target;
+    function fit() {
+      try {
+        const doc = iframe.contentDocument;
+        if (doc && doc.body) {
+          const h = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
+          iframe.style.height = Math.min(h + 24, 1500) + 'px';
+        }
+      } catch {
+        // Cross-origin — sandbox without allow-same-origin. Use a safe default.
+        iframe.style.height = '500px';
       }
-    } catch {
-      // Cross-origin — sandbox without allow-same-origin. Use a safe default.
-      e.target.style.height = '500px';
+      // The body just changed height; let the thread re-snap to the latest
+      // message if it's still pinned to the bottom.
+      if (onResize) onResize();
     }
-    // The body just changed height; let the thread re-snap to the latest
-    // message if it's still pinned to the bottom.
-    if (onResize) onResize();
+    fit();
+    // The quoted-history "•••" disclosure is a script-free <details> (the iframe
+    // sandbox has no allow-scripts). Expanding it grows the content, so re-fit
+    // the iframe height from here, the parent. `toggle` doesn't bubble, so we
+    // listen in the capture phase. The listener dies with the iframe document.
+    try { iframe.contentDocument.addEventListener('toggle', fit, true); } catch {}
   }
 
   return (
