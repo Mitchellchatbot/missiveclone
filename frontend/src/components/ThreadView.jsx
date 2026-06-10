@@ -22,11 +22,107 @@ function sanitizeForIframe(html) {
   });
 }
 
+// Gmail-style quote collapsing. Email clients append the entire prior thread
+// to every reply (Gmail blockquotes, Outlook "From:/Sent:" header blocks, etc).
+// Rendering that verbatim makes a thread repeat itself and look jumbled. Like
+// Gmail, we keep the full body but detect where the quoted history begins and
+// hide everything from there behind a "•••" toggle, so each message shows only
+// its new content by default. Operates on the already-sanitized HTML string and
+// returns { html, hasQuote }. Any parse failure falls back to the input
+// untouched so an edge case can never blank out a message.
+const QUOTE_TEXT_RE = /^\s*(On .+ wrote:|From:\s.+Sent:\s.+|-{2,}\s*Original Message\s*-{2,})/is;
+
+function collapseQuotedHistory(safeHtml) {
+  try {
+    const doc = new DOMParser().parseFromString(safeHtml, 'text/html');
+    const body = doc.body;
+    if (!body) return { html: safeHtml, hasQuote: false };
+
+    // Find the earliest boundary node in document order, preferring structural
+    // markers (reliable) over text heuristics (last resort).
+    let boundary =
+      doc.querySelector('blockquote.gmail_quote, div.gmail_quote') ||
+      doc.querySelector('blockquote[type="cite"]') ||
+      doc.querySelector('#divRplyFwdMsg, #appendonsend');
+
+    // Outlook divider: a border-top div immediately followed by a "From:" block.
+    if (!boundary) {
+      for (const div of doc.querySelectorAll('div[style*="border-top"]')) {
+        if (/From:/i.test(div.textContent || '') || /From:/i.test(div.nextElementSibling?.textContent || '')) {
+          boundary = div;
+          break;
+        }
+      }
+    }
+
+    // Generic top-level blockquote (Apple Mail and others).
+    if (!boundary) boundary = body.querySelector(':scope > blockquote');
+
+    // Text fallback: first block-level child whose text opens a quoted header.
+    if (!boundary) {
+      for (const el of body.children) {
+        if (QUOTE_TEXT_RE.test(el.textContent || '')) { boundary = el; break; }
+      }
+    }
+
+    if (!boundary) return { html: safeHtml, hasQuote: false };
+
+    // Walk up to the boundary's body-level ancestor so we collapse it together
+    // with all following siblings (the rest of the quoted thread).
+    let top = boundary;
+    while (top.parentNode && top.parentNode !== body) top = top.parentNode;
+    if (top.parentNode !== body) return { html: safeHtml, hasQuote: false };
+
+    const wrapper = doc.createElement('div');
+    wrapper.className = 'dd-quote-collapsed';
+    wrapper.setAttribute('hidden', '');
+    body.insertBefore(wrapper, top);
+    while (wrapper.nextSibling) wrapper.appendChild(wrapper.nextSibling);
+
+    const toggle = doc.createElement('button');
+    toggle.className = 'dd-quote-toggle';
+    toggle.setAttribute('type', 'button');
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.textContent = '•••';
+    body.insertBefore(toggle, wrapper);
+
+    return { html: body.innerHTML, hasQuote: true };
+  } catch {
+    return { html: safeHtml, hasQuote: false };
+  }
+}
+
+// Inline toggle script for the iframe. It lives in the wrapper doc we control
+// (not the DOMPurify-sanitized email content), so it is trusted; the sandbox
+// still blocks the email's own scripts. Because the iframe is same-origin
+// (srcDoc + allow-same-origin) it can resize itself via window.frameElement,
+// mirroring autoResize's math, after expand/collapse.
+const QUOTE_TOGGLE_SCRIPT = `
+  var btn = document.querySelector('.dd-quote-toggle');
+  var quoted = document.querySelector('.dd-quote-collapsed');
+  function fit() {
+    try {
+      var fe = window.frameElement;
+      if (!fe) return;
+      var h = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
+      fe.style.height = Math.min(h + 24, 1500) + 'px';
+    } catch (e) {}
+  }
+  if (btn && quoted) {
+    btn.addEventListener('click', function () {
+      var open = quoted.hasAttribute('hidden');
+      if (open) quoted.removeAttribute('hidden'); else quoted.setAttribute('hidden', '');
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      fit();
+    });
+  }
+`;
+
 // Wrap the sanitized HTML into a complete document so the iframe renders it
 // with our base styles. <base target="_blank"> makes every link open in a
 // new tab, which is what email clients do.
 function buildEmailDoc(rawHtml) {
-  const safe = sanitizeForIframe(rawHtml || '');
+  const { html: safe, hasQuote } = collapseQuotedHistory(sanitizeForIframe(rawHtml || ''));
   return `<!doctype html><html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -38,8 +134,11 @@ function buildEmailDoc(rawHtml) {
   a { color: #2f6feb; }
   pre, code { white-space: pre-wrap; word-break: break-word; }
   blockquote { border-left: 3px solid #d0d7de; padding-left: 10px; color: #59636e; margin: 8px 0; }
+  .dd-quote-toggle { display: inline-block; margin: 6px 0; padding: 2px 10px; line-height: 1; font-size: 14px; letter-spacing: 1px; color: #59636e; background: #eef1f4; border: 1px solid #d0d7de; border-radius: 12px; cursor: pointer; }
+  .dd-quote-toggle:hover { background: #e3e7ec; }
+  .dd-quote-collapsed[hidden] { display: none; }
 </style>
-</head><body>${safe}</body></html>`;
+</head><body>${safe}${hasQuote ? `<script>${QUOTE_TOGGLE_SCRIPT}</script>` : ''}</body></html>`;
 }
 
 function fmtSize(b) {
