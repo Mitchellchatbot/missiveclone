@@ -73,18 +73,29 @@ function collapseQuotedHistory(safeHtml) {
     while (top.parentNode && top.parentNode !== body) top = top.parentNode;
     if (top.parentNode !== body) return { html: safeHtml, hasQuote: false };
 
-    const wrapper = doc.createElement('div');
-    wrapper.className = 'dd-quote-collapsed';
-    wrapper.setAttribute('hidden', '');
-    body.insertBefore(wrapper, top);
-    while (wrapper.nextSibling) wrapper.appendChild(wrapper.nextSibling);
+    // False-positive guard: only collapse if there is real content BEFORE the
+    // boundary. A genuine reply always has new text above the quote; if the
+    // quote is the very first content, the "quote" is the whole message (e.g. a
+    // bare forward or an over-eager text match) — show it all rather than hiding
+    // an entire legitimate email behind a tiny toggle.
+    let hasPreceding = false;
+    for (let n = top.previousSibling; n; n = n.previousSibling) {
+      if (n.nodeType === 1 || (n.nodeType === 3 && (n.textContent || '').trim())) { hasPreceding = true; break; }
+    }
+    if (!hasPreceding) return { html: safeHtml, hasQuote: false };
 
-    const toggle = doc.createElement('button');
-    toggle.className = 'dd-quote-toggle';
-    toggle.setAttribute('type', 'button');
-    toggle.setAttribute('aria-expanded', 'false');
-    toggle.textContent = '•••';
-    body.insertBefore(toggle, wrapper);
+    // Wrap the boundary + everything after it in a native <details> disclosure.
+    // This is intentionally script-free: the message iframe is sandboxed WITHOUT
+    // allow-scripts, so no injected JS would run. <details>/<summary> toggles
+    // natively in that sandbox. Closed by default → only the "•••" summary shows.
+    const details = doc.createElement('details');
+    details.className = 'dd-quote';
+    const summary = doc.createElement('summary');
+    summary.className = 'dd-quote-toggle';
+    summary.textContent = '•••';
+    details.appendChild(summary);
+    body.insertBefore(details, top);
+    while (details.nextSibling) details.appendChild(details.nextSibling);
 
     return { html: body.innerHTML, hasQuote: true };
   } catch {
@@ -92,37 +103,11 @@ function collapseQuotedHistory(safeHtml) {
   }
 }
 
-// Inline toggle script for the iframe. It lives in the wrapper doc we control
-// (not the DOMPurify-sanitized email content), so it is trusted; the sandbox
-// still blocks the email's own scripts. Because the iframe is same-origin
-// (srcDoc + allow-same-origin) it can resize itself via window.frameElement,
-// mirroring autoResize's math, after expand/collapse.
-const QUOTE_TOGGLE_SCRIPT = `
-  var btn = document.querySelector('.dd-quote-toggle');
-  var quoted = document.querySelector('.dd-quote-collapsed');
-  function fit() {
-    try {
-      var fe = window.frameElement;
-      if (!fe) return;
-      var h = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
-      fe.style.height = Math.min(h + 24, 1500) + 'px';
-    } catch (e) {}
-  }
-  if (btn && quoted) {
-    btn.addEventListener('click', function () {
-      var open = quoted.hasAttribute('hidden');
-      if (open) quoted.removeAttribute('hidden'); else quoted.setAttribute('hidden', '');
-      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
-      fit();
-    });
-  }
-`;
-
 // Wrap the sanitized HTML into a complete document so the iframe renders it
 // with our base styles. <base target="_blank"> makes every link open in a
 // new tab, which is what email clients do.
 function buildEmailDoc(rawHtml) {
-  const { html: safe, hasQuote } = collapseQuotedHistory(sanitizeForIframe(rawHtml || ''));
+  const { html: safe } = collapseQuotedHistory(sanitizeForIframe(rawHtml || ''));
   return `<!doctype html><html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -134,11 +119,13 @@ function buildEmailDoc(rawHtml) {
   a { color: #2f6feb; }
   pre, code { white-space: pre-wrap; word-break: break-word; }
   blockquote { border-left: 3px solid #d0d7de; padding-left: 10px; color: #59636e; margin: 8px 0; }
-  .dd-quote-toggle { display: inline-block; margin: 6px 0; padding: 2px 10px; line-height: 1; font-size: 14px; letter-spacing: 1px; color: #59636e; background: #eef1f4; border: 1px solid #d0d7de; border-radius: 12px; cursor: pointer; }
-  .dd-quote-toggle:hover { background: #e3e7ec; }
-  .dd-quote-collapsed[hidden] { display: none; }
+  details.dd-quote { margin: 6px 0; }
+  summary.dd-quote-toggle { display: inline-block; width: fit-content; margin: 2px 0; padding: 2px 10px; line-height: 1; font-size: 14px; letter-spacing: 1px; color: #59636e; background: #eef1f4; border: 1px solid #d0d7de; border-radius: 12px; cursor: pointer; list-style: none; user-select: none; }
+  summary.dd-quote-toggle::-webkit-details-marker { display: none; }
+  summary.dd-quote-toggle::marker { content: ''; }
+  summary.dd-quote-toggle:hover { background: #e3e7ec; }
 </style>
-</head><body>${safe}${hasQuote ? `<script>${QUOTE_TOGGLE_SCRIPT}</script>` : ''}</body></html>`;
+</head><body>${safe}</body></html>`;
 }
 
 function fmtSize(b) {
@@ -447,19 +434,28 @@ function MessageBlock({ m, onResize }) {
   const senderName = m.direction === 'outbound' ? (m.from_addr ? nameFromAddr(m.from_addr) : 'You') : nameFromAddr(m.from_addr) || 'Unknown';
 
   function autoResize(e) {
-    try {
-      const doc = e.target.contentDocument;
-      if (doc && doc.body) {
-        const h = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
-        e.target.style.height = Math.min(h + 24, 1500) + 'px';
+    const iframe = e.target;
+    function fit() {
+      try {
+        const doc = iframe.contentDocument;
+        if (doc && doc.body) {
+          const h = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
+          iframe.style.height = Math.min(h + 24, 1500) + 'px';
+        }
+      } catch {
+        // Cross-origin — sandbox without allow-same-origin. Use a safe default.
+        iframe.style.height = '500px';
       }
-    } catch {
-      // Cross-origin — sandbox without allow-same-origin. Use a safe default.
-      e.target.style.height = '500px';
+      // The body just changed height; let the thread re-snap to the latest
+      // message if it's still pinned to the bottom.
+      if (onResize) onResize();
     }
-    // The body just changed height; let the thread re-snap to the latest
-    // message if it's still pinned to the bottom.
-    if (onResize) onResize();
+    fit();
+    // The quoted-history "•••" disclosure is a script-free <details> (the iframe
+    // sandbox has no allow-scripts). Expanding it grows the content, so re-fit
+    // the iframe height from here, the parent. `toggle` doesn't bubble, so we
+    // listen in the capture phase. The listener dies with the iframe document.
+    try { iframe.contentDocument.addEventListener('toggle', fit, true); } catch {}
   }
 
   return (
