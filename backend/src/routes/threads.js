@@ -394,7 +394,7 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
   let data;
   try { data = JSON.parse(req.body.payload || '{}'); }
   catch { return res.status(400).json({ error: 'payload must be JSON' }); }
-  const { account_id, body_text, body_html, to, cc, subject } = data;
+  const { account_id, body_text, body_html, to, cc, subject, in_reply_to } = data;
 
   const t = await one(
     'SELECT * FROM threads WHERE id = $1 AND workspace_id = $2',
@@ -413,6 +413,20 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
      WHERE thread_id = $1 ORDER BY sent_at DESC LIMIT 1`,
     [t.id]
   );
+  // Reply target: when the caller pins a specific message (by its RFC
+  // Message-ID), thread under THAT message instead of the latest. We resolve
+  // it within this thread so a stale/foreign id can't redirect the reply.
+  // Falls back to `last` when omitted or not found — preserving the old
+  // always-reply-to-latest behaviour.
+  let target = last;
+  if (in_reply_to) {
+    const pinned = await one(
+      `SELECT message_id, subject, from_addr, to_addrs, cc_addrs FROM messages
+       WHERE thread_id = $1 AND message_id = $2 LIMIT 1`,
+      [t.id, in_reply_to]
+    );
+    if (pinned) target = pinned;
+  }
   const refsRows = await many(
     `SELECT message_id FROM messages WHERE thread_id = $1 AND message_id IS NOT NULL ORDER BY sent_at ASC`,
     [t.id]
@@ -420,11 +434,11 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
   const references = refsRows.map(r => r.message_id);
 
   const replySubject = subject ||
-    (last && last.subject ? (last.subject.match(/^re:/i) ? last.subject : `Re: ${last.subject}`) : t.subject || '');
-  const replyTo = to || (last ? last.from_addr : '');
+    (target && target.subject ? (target.subject.match(/^re:/i) ? target.subject : `Re: ${target.subject}`) : t.subject || '');
+  const replyTo = to || (target ? target.from_addr : '');
   // Carry over the prior message's CC when the caller didn't specify one.
   // An explicit '' from the composer means "no CC" and is respected.
-  const replyCc = (cc !== undefined && cc !== null) ? cc : (last ? last.cc_addrs : '');
+  const replyCc = (cc !== undefined && cc !== null) ? cc : (target ? target.cc_addrs : '');
 
   const files = (req.files || []).map(f => ({
     filename: f.originalname,
@@ -436,7 +450,7 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
   const sent = await sendEmail(acc.id, {
     to: replyTo, cc: replyCc, subject: replySubject,
     text: body_text || '', html: body_html || '',
-    inReplyTo: last ? last.message_id : null,
+    inReplyTo: target ? target.message_id : null,
     references,
     attachments: files
   });
@@ -453,7 +467,7 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
       VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
     [
       id, t.id, acc.id, req.user.workspace_id, sent.messageId,
-      last ? last.message_id : null, replySubject,
+      target ? target.message_id : null, replySubject,
       '', replyTo, replyCc || '', body_text || '', body_html || '', now,
       files.length ? 1 : 0, now
     ]
