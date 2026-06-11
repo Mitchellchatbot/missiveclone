@@ -469,6 +469,7 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
           threadId={threadId}
           accounts={accounts}
           replyTarget={replyTarget}
+          quoteSource={replyTarget || (messages.length ? messages[messages.length - 1] : null)}
           defaultTo={messages.length ? messages[messages.length - 1].from_addr : ''}
           defaultCc={messages.length ? messages[messages.length - 1].cc_addrs : ''}
           onClearReplyTarget={() => setReplyTarget(null)}
