@@ -12,10 +12,14 @@ function isEmptyHtml(html) {
   return !htmlToText(html || '').trim();
 }
 
-export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc, onSent, onCancel }) {
+export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc, replyTarget, onClearReplyTarget, onSent, onCancel }) {
   const [accountId, setAccountId] = useState(accounts[0]?.id || '');
   const [to, setTo] = useState(defaultTo || '');
   const [cc, setCc] = useState(defaultCc || '');
+  // RFC Message-ID of the message we're replying to, when the user pinned a
+  // specific one via its per-message Reply button. null = thread under the
+  // latest message (server default).
+  const [inReplyTo, setInReplyTo] = useState(null);
   const [html, setHtml] = useState('');
   const [files, setFiles] = useState([]);
   const [canned, setCanned] = useState([]);
@@ -51,6 +55,20 @@ export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc,
       loadedRef.current = true;
     }).catch(() => { loadedRef.current = true; });
   }, [threadId]);
+
+  // When the user clicks "Reply" on a specific message, pre-fill the To field
+  // from THAT message and pin threading to it — without touching the body they
+  // may already have typed. Keyed on the target's id so it only fires when a
+  // different message is picked.
+  useEffect(() => {
+    if (!replyTarget) return;
+    // Outbound = a message we sent; replying should go back to its original
+    // recipients, not to ourselves.
+    setTo(replyTarget.direction === 'outbound' ? (replyTarget.to_addrs || '') : (replyTarget.from_addr || ''));
+    setCc('');
+    setInReplyTo(replyTarget.message_id || null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [replyTarget?.id]);
 
   // Debounced autosave.
   useEffect(() => {
@@ -98,7 +116,8 @@ export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc,
         to,
         cc,
         body_text: text,
-        body_html: html
+        body_html: html,
+        in_reply_to: inReplyTo || null
       }));
       for (const f of files) fd.append('files', f);
 
@@ -111,7 +130,7 @@ export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc,
       const body = await res.json();
       if (!res.ok) throw new Error(body.error || 'send failed');
 
-      setHtml(''); setFiles([]); setTo(''); setCc(''); setSavedAt(null); setSavingState('idle');
+      setHtml(''); setFiles([]); setTo(''); setCc(''); setInReplyTo(null); setSavedAt(null); setSavingState('idle');
       onSent && onSent();
     } catch (e) { setErr(e.message); }
     finally { setBusy(false); }
@@ -119,13 +138,27 @@ export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc,
 
   async function discard() {
     if (!confirm('Discard draft?')) return;
-    setHtml(''); setFiles([]); setTo(''); setCc(''); setSavedAt(null); setSavingState('idle');
+    setHtml(''); setFiles([]); setTo(''); setCc(''); setInReplyTo(null); setSavedAt(null); setSavingState('idle');
     try { await api(`/api/drafts/${threadId}`, { method: 'DELETE' }); } catch {}
     onCancel && onCancel();
   }
 
   return (
     <div className="composer">
+      {replyTarget && (
+        <div className="composer-row">
+          <span className="muted small">
+            Replying to {replyTarget.direction === 'outbound' ? (replyTarget.to_addrs || 'recipients') : (replyTarget.from_addr || 'this message')}
+          </span>
+          <button
+            type="button"
+            className="link"
+            onClick={() => { setTo(defaultTo || ''); setCc(defaultCc || ''); setInReplyTo(null); onClearReplyTarget && onClearReplyTarget(); }}
+          >
+            reply to latest instead
+          </button>
+        </div>
+      )}
       <div className="composer-row">
         <label>From:</label>
         <select value={accountId} onChange={e => setAccountId(e.target.value)}>

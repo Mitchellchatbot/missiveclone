@@ -162,6 +162,10 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [showReply, setShowReply] = useState(false);
+  // Which message the user clicked "Reply" on. null = the thread-level Reply
+  // button, which threads under the latest message (the prior behaviour).
+  // Picking a specific message pins the composer to it.
+  const [replyTarget, setReplyTarget] = useState(null);
   const [showSnooze, setShowSnooze] = useState(false);
   const [showLabel, setShowLabel] = useState(false);
   const [allLabels, setAllLabels] = useState([]);
@@ -366,7 +370,7 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
           <button className="ghost icon-text" onClick={forwardLast} title="Forward last message">
             <Forward size={14} /> Forward
           </button>
-          <button className="tv-reply-btn icon-text" onClick={() => setShowReply(s => !s)}>
+          <button className="tv-reply-btn icon-text" onClick={() => { setReplyTarget(null); setShowReply(s => !s); }}>
             <Reply size={14} /> Reply
           </button>
         </div>
@@ -451,6 +455,7 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
               m={m}
               expanded={expanded}
               onToggle={() => toggleMsg(m.id, lastId)}
+              onReply={() => { setReplyTarget(m); setShowReply(true); }}
               onResize={scrollToLatest}
             />
           );
@@ -463,10 +468,12 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
         <ComposeReply
           threadId={threadId}
           accounts={accounts}
+          replyTarget={replyTarget}
           defaultTo={messages.length ? messages[messages.length - 1].from_addr : ''}
           defaultCc={messages.length ? messages[messages.length - 1].cc_addrs : ''}
-          onSent={() => { setShowReply(false); load(); onChanged && onChanged(); }}
-          onCancel={() => setShowReply(false)}
+          onClearReplyTarget={() => setReplyTarget(null)}
+          onSent={() => { setShowReply(false); setReplyTarget(null); load(); onChanged && onChanged(); }}
+          onCancel={() => { setShowReply(false); setReplyTarget(null); }}
         />
       )}
 
@@ -481,7 +488,7 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
   );
 }
 
-function MessageBlock({ m, expanded, onToggle, onResize }) {
+function MessageBlock({ m, expanded, onToggle, onReply, onResize }) {
   const docHtml = useMemo(() => m.body_html ? buildEmailDoc(m.body_html) : null, [m.body_html]);
   const senderName = m.direction === 'outbound' ? (m.from_addr ? nameFromAddr(m.from_addr) : 'You') : nameFromAddr(m.from_addr) || 'Unknown';
 
@@ -545,6 +552,17 @@ function MessageBlock({ m, expanded, onToggle, onResize }) {
             )}
           </div>
         </div>
+        {/* Reply to THIS specific message — threads the reply under it (and
+            pre-fills its sender) instead of always the latest. stopPropagation
+            keeps the header's collapse toggle from firing. */}
+        <button
+          className="ghost icon-text"
+          style={{ marginLeft: 'auto' }}
+          onClick={(e) => { e.stopPropagation(); onReply && onReply(); }}
+          title="Reply to this email"
+        >
+          <Reply size={13} /> Reply
+        </button>
       </div>
       {docHtml
         ? (
