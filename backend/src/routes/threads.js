@@ -422,6 +422,9 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
   const replySubject = subject ||
     (last && last.subject ? (last.subject.match(/^re:/i) ? last.subject : `Re: ${last.subject}`) : t.subject || '');
   const replyTo = to || (last ? last.from_addr : '');
+  // Carry over the prior message's CC when the caller didn't specify one.
+  // An explicit '' from the composer means "no CC" and is respected.
+  const replyCc = (cc !== undefined && cc !== null) ? cc : (last ? last.cc_addrs : '');
 
   const files = (req.files || []).map(f => ({
     filename: f.originalname,
@@ -431,7 +434,7 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
   }));
 
   const sent = await sendEmail(acc.id, {
-    to: replyTo, cc, subject: replySubject,
+    to: replyTo, cc: replyCc, subject: replySubject,
     text: body_text || '', html: body_html || '',
     inReplyTo: last ? last.message_id : null,
     references,
@@ -451,7 +454,7 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
     [
       id, t.id, acc.id, req.user.workspace_id, sent.messageId,
       last ? last.message_id : null, replySubject,
-      '', replyTo, cc || '', body_text || '', body_html || '', now,
+      '', replyTo, replyCc || '', body_text || '', body_html || '', now,
       files.length ? 1 : 0, now
     ]
   );
