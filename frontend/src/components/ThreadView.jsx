@@ -463,6 +463,8 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
         <ComposeReply
           threadId={threadId}
           accounts={accounts}
+          defaultTo={messages.length ? messages[messages.length - 1].from_addr : ''}
+          defaultCc={messages.length ? messages[messages.length - 1].cc_addrs : ''}
           onSent={() => { setShowReply(false); load(); onChanged && onChanged(); }}
           onCancel={() => setShowReply(false)}
         />

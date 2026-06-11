@@ -12,8 +12,10 @@ function isEmptyHtml(html) {
   return !htmlToText(html || '').trim();
 }
 
-export default function ComposeReply({ threadId, accounts, onSent, onCancel }) {
+export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc, onSent, onCancel }) {
   const [accountId, setAccountId] = useState(accounts[0]?.id || '');
+  const [to, setTo] = useState(defaultTo || '');
+  const [cc, setCc] = useState(defaultCc || '');
   const [html, setHtml] = useState('');
   const [files, setFiles] = useState([]);
   const [canned, setCanned] = useState([]);
@@ -42,6 +44,8 @@ export default function ComposeReply({ threadId, accounts, onSent, onCancel }) {
       if (r && r.draft) {
         if (r.draft.body_html) setHtml(r.draft.body_html);
         if (r.draft.account_id) setAccountId(r.draft.account_id);
+        if (r.draft.to_addrs) setTo(r.draft.to_addrs);
+        if (r.draft.cc_addrs) setCc(r.draft.cc_addrs);
         if (r.draft.updated_at) setSavedAt(Number(r.draft.updated_at));
       }
       loadedRef.current = true;
@@ -60,7 +64,9 @@ export default function ComposeReply({ threadId, accounts, onSent, onCancel }) {
           body: JSON.stringify({
             account_id: accountId,
             body_text: htmlToText(html),
-            body_html: html
+            body_html: html,
+            to_addrs: to,
+            cc_addrs: cc
           })
         });
         if (r && r.updated_at) setSavedAt(Number(r.updated_at));
@@ -70,7 +76,7 @@ export default function ComposeReply({ threadId, accounts, onSent, onCancel }) {
       }
     }, 700);
     return () => clearTimeout(t);
-  }, [html, accountId, threadId]);
+  }, [html, accountId, threadId, to, cc]);
 
   function addFiles(list) { setFiles(prev => [...prev, ...Array.from(list || [])]); }
   function removeFile(idx) { setFiles(prev => prev.filter((_, i) => i !== idx)); }
@@ -89,6 +95,8 @@ export default function ComposeReply({ threadId, accounts, onSent, onCancel }) {
       const fd = new FormData();
       fd.append('payload', JSON.stringify({
         account_id: accountId,
+        to,
+        cc,
         body_text: text,
         body_html: html
       }));
@@ -103,7 +111,7 @@ export default function ComposeReply({ threadId, accounts, onSent, onCancel }) {
       const body = await res.json();
       if (!res.ok) throw new Error(body.error || 'send failed');
 
-      setHtml(''); setFiles([]); setSavedAt(null); setSavingState('idle');
+      setHtml(''); setFiles([]); setTo(''); setCc(''); setSavedAt(null); setSavingState('idle');
       onSent && onSent();
     } catch (e) { setErr(e.message); }
     finally { setBusy(false); }
@@ -111,7 +119,7 @@ export default function ComposeReply({ threadId, accounts, onSent, onCancel }) {
 
   async function discard() {
     if (!confirm('Discard draft?')) return;
-    setHtml(''); setFiles([]); setSavedAt(null); setSavingState('idle');
+    setHtml(''); setFiles([]); setTo(''); setCc(''); setSavedAt(null); setSavingState('idle');
     try { await api(`/api/drafts/${threadId}`, { method: 'DELETE' }); } catch {}
     onCancel && onCancel();
   }
@@ -136,6 +144,15 @@ export default function ComposeReply({ threadId, accounts, onSent, onCancel }) {
             <span className="muted small">Saved {new Date(savedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
           )}
         </div>
+      </div>
+
+      <div className="composer-row">
+        <label>To:</label>
+        <input value={to} onChange={e => setTo(e.target.value)} placeholder="recipient@example.com" />
+      </div>
+      <div className="composer-row">
+        <label>Cc:</label>
+        <input value={cc} onChange={e => setCc(e.target.value)} placeholder="optional" />
       </div>
 
       <RichEditor html={html} onChange={setHtml} onAttachFiles={addFiles} />
