@@ -43,6 +43,35 @@ function buildReplyQuoteHtml(m) {
     `</div>`;
 }
 
+// Remove any quoted-history block from a body. We keep the quote OUT of the
+// editable area (it lives behind the "•••" toggle and is re-appended on send),
+// so when loading a draft — including one saved by the earlier inline-quote
+// build — we strip the gmail_quote so the editor shows only the user's text and
+// the reply can't end up double-quoted.
+function stripQuotedBlock(html) {
+  if (!html) return '';
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    doc.querySelectorAll('div.gmail_quote, blockquote.gmail_quote').forEach(n => n.remove());
+    // Drop now-trailing <br>s left where the quote used to be.
+    let out = doc.body.innerHTML.replace(/(?:\s|&nbsp;|<br\s*\/?>)+$/i, '');
+    return out;
+  } catch {
+    return html;
+  }
+}
+
+// Wrap the quote HTML in a minimal sandboxed document for the composer preview.
+// A real <iframe srcDoc> (no allow-scripts) isolates the quoted email's own CSS
+// so it can't leak into and break the composer layout.
+function buildQuoteDoc(quoteHtml) {
+  return `<!doctype html><html><head><meta charset="utf-8"><base target="_blank"><style>
+    body{margin:0;padding:8px 10px;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;font-size:13px;line-height:1.5;color:#475467}
+    img{max-width:100% !important;height:auto !important} a{color:#2f6feb}
+    blockquote{border-left:1px solid #ccc;margin:0 0 0 .8ex;padding-left:1ex}
+  </style></head><body>${quoteHtml || ''}</body></html>`;
+}
+
 export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc, replyTarget, quoteSource, onClearReplyTarget, onSent, onCancel }) {
   const [accountId, setAccountId] = useState(accounts[0]?.id || '');
   const [to, setTo] = useState(defaultTo || '');
@@ -51,7 +80,12 @@ export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc,
   // specific one via its per-message Reply button. null = thread under the
   // latest message (server default).
   const [inReplyTo, setInReplyTo] = useState(null);
+  // `html` is the user's reply text ONLY. The quoted original is kept separate
+  // (`quoteHtml`), shown below the editor behind a collapsed "•••" toggle, and
+  // appended to the body on send — so the composer stays clean like Gmail's.
   const [html, setHtml] = useState('');
+  const [quoteHtml, setQuoteHtml] = useState('');
+  const [quoteOpen, setQuoteOpen] = useState(false);
   const [files, setFiles] = useState([]);
   const [canned, setCanned] = useState([]);
   const [busy, setBusy] = useState(false);
@@ -60,12 +94,6 @@ export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc,
   const [savingState, setSavingState] = useState('idle');  // idle | saving | saved
   const fileInput = useRef(null);
   const loadedRef = useRef(false);
-  // Mirror of `html` read by the quote effect without re-running it on every
-  // keystroke; `autoQuoteRef` holds the exact quote block we last auto-inserted
-  // so we can tell "untouched auto-quote" (safe to replace) from real edits.
-  const htmlRef = useRef('');
-  const autoQuoteRef = useRef('');
-  useEffect(() => { htmlRef.current = html; });
 
   // Pick a default account once accounts load.
   useEffect(() => {
@@ -83,7 +111,9 @@ export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc,
     loadedRef.current = false;
     api(`/api/drafts/${threadId}`).then(r => {
       if (r && r.draft) {
-        if (r.draft.body_html) setHtml(r.draft.body_html);
+        // Strip any quote the draft may carry (older drafts embedded it inline);
+        // the quote is managed separately and re-appended on send.
+        if (r.draft.body_html) setHtml(stripQuotedBlock(r.draft.body_html));
         if (r.draft.account_id) setAccountId(r.draft.account_id);
         if (r.draft.to_addrs) setTo(r.draft.to_addrs);
         if (r.draft.cc_addrs) setCc(r.draft.cc_addrs);
@@ -107,29 +137,21 @@ export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [replyTarget?.id]);
 
-  // Pre-fill the editor with a quote of the message being replied to (the
-  // pinned target, or the latest message for a thread-level reply). Keyed on
-  // the quote source's id so switching targets swaps the quote — but only while
-  // the body is still empty or holds nothing but our prior auto-quote, so a
-  // loaded draft or text the user has typed is never clobbered.
+  // Derive the quoted-original block for the message being replied to (the
+  // pinned target, or the latest message for a thread-level reply) and collapse
+  // it by default. Kept OUT of the editor — switching targets just swaps the
+  // quote and never touches what the user has typed.
   useEffect(() => {
-    if (!quoteSource) return;
-    const q = buildReplyQuoteHtml(quoteSource);
-    if (isEmptyHtml(htmlRef.current) || htmlRef.current === autoQuoteRef.current) {
-      setHtml(q);
-      autoQuoteRef.current = q;
-    }
+    setQuoteHtml(quoteSource ? buildReplyQuoteHtml(quoteSource) : '');
+    setQuoteOpen(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [quoteSource?.id]);
 
-  // Debounced autosave.
+  // Debounced autosave. Persists only the user's reply text (`html`); the quote
+  // is re-derived from the thread, so drafts stay clean.
   useEffect(() => {
     if (!threadId || !loadedRef.current) return;
     if (isEmptyHtml(html)) return;
-    // Body is nothing but the auto-inserted quote (the user hasn't written
-    // anything yet) — don't persist a quote-only draft. Keeps opening/retargeting
-    // a reply from littering the Drafts folder; we save once real text is added.
-    if (html === autoQuoteRef.current) return;
     setSavingState('saving');
     const t = setTimeout(async () => {
       try {
@@ -165,14 +187,18 @@ export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc,
     if (!accountId) { setErr('Connect an email account first'); return; }
     setBusy(true); setErr('');
     try {
-      const text = htmlToText(html);
+      // The body is the user's text with the quoted original appended below —
+      // the same shape the editor used to hold inline, so the wire output is
+      // unchanged (and the reading pane / recipient still collapse the quote).
+      const fullHtml = (html || '') + (quoteHtml || '');
+      const text = htmlToText(fullHtml);
       const fd = new FormData();
       fd.append('payload', JSON.stringify({
         account_id: accountId,
         to,
         cc,
         body_text: text,
-        body_html: html,
+        body_html: fullHtml,
         in_reply_to: inReplyTo || null
       }));
       for (const f of files) fd.append('files', f);
@@ -187,7 +213,7 @@ export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc,
       if (!res.ok) throw new Error(body.error || 'send failed');
 
       setHtml(''); setFiles([]); setTo(''); setCc(''); setInReplyTo(null); setSavedAt(null); setSavingState('idle');
-      autoQuoteRef.current = '';
+      setQuoteOpen(false);
       onSent && onSent();
     } catch (e) { setErr(e.message); }
     finally { setBusy(false); }
@@ -196,7 +222,7 @@ export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc,
   async function discard() {
     if (!confirm('Discard draft?')) return;
     setHtml(''); setFiles([]); setTo(''); setCc(''); setInReplyTo(null); setSavedAt(null); setSavingState('idle');
-    autoQuoteRef.current = '';
+    setQuoteOpen(false);
     try { await api(`/api/drafts/${threadId}`, { method: 'DELETE' }); } catch {}
     onCancel && onCancel();
   }
@@ -254,6 +280,36 @@ export default function ComposeReply({ threadId, accounts, defaultTo, defaultCc,
       </div>
 
       <RichEditor html={html} onChange={setHtml} onAttachFiles={addFiles} />
+
+      {/* Quoted original — collapsed behind a "•••" toggle like Gmail's compose,
+          so the editor above stays clean. The quote is appended to the body on
+          send; here it's a read-only, sandboxed preview. */}
+      {quoteHtml && (
+        <div className="composer-quote" style={{ marginTop: 6 }}>
+          <button
+            type="button"
+            onClick={() => setQuoteOpen(o => !o)}
+            title={quoteOpen ? 'Hide quoted text' : 'Show quoted text'}
+            aria-expanded={quoteOpen}
+            style={{
+              display: 'inline-block', padding: '2px 10px', lineHeight: 1, fontSize: 14,
+              letterSpacing: 1, color: '#59636e', background: '#eef1f4',
+              border: '1px solid #d0d7de', borderRadius: 12, cursor: 'pointer'
+            }}
+          >•••</button>
+          {quoteOpen && (
+            <iframe
+              title="Quoted message"
+              sandbox="allow-popups allow-popups-to-escape-sandbox"
+              srcDoc={buildQuoteDoc(quoteHtml)}
+              style={{
+                width: '100%', height: 200, marginTop: 6, border: '1px solid #e2e8f0',
+                borderRadius: 8, background: '#fff', display: 'block'
+              }}
+            />
+          )}
+        </div>
+      )}
 
       <input
         ref={fileInput}
