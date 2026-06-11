@@ -409,7 +409,7 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
   if (!acc) return res.status(400).json({ error: 'account_id invalid' });
 
   const last = await one(
-    `SELECT message_id, subject, from_addr, to_addrs, cc_addrs FROM messages
+    `SELECT message_id, subject, from_addr, to_addrs, cc_addrs, sent_at FROM messages
      WHERE thread_id = $1 ORDER BY sent_at DESC LIMIT 1`,
     [t.id]
   );
@@ -421,16 +421,32 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
   let target = last;
   if (in_reply_to) {
     const pinned = await one(
-      `SELECT message_id, subject, from_addr, to_addrs, cc_addrs FROM messages
+      `SELECT message_id, subject, from_addr, to_addrs, cc_addrs, sent_at FROM messages
        WHERE thread_id = $1 AND message_id = $2 LIMIT 1`,
       [t.id, in_reply_to]
     );
     if (pinned) target = pinned;
   }
-  const refsRows = await many(
-    `SELECT message_id FROM messages WHERE thread_id = $1 AND message_id IS NOT NULL ORDER BY sent_at ASC`,
-    [t.id]
-  );
+  // References = the ancestor chain ending with the message we're replying to
+  // (RFC 5322 §3.6.4): scope to messages sent at or before the target so a
+  // reply to an older message doesn't list messages sent AFTER it, and the
+  // header ends with the replied-to message. When the target IS the latest
+  // (thread-level reply), this is the whole thread — unchanged from before.
+  // Guard a missing sent_at by falling back to the full chain so `references`
+  // is never accidentally emptied. (Only used by the SMTP path; Graph threads
+  // via createReply and ignores it.)
+  const refsRows = (target && target.sent_at != null)
+    ? await many(
+        `SELECT message_id FROM messages
+         WHERE thread_id = $1 AND message_id IS NOT NULL AND sent_at <= $2::bigint
+         ORDER BY sent_at ASC`,
+        [t.id, target.sent_at]
+      )
+    : await many(
+        `SELECT message_id FROM messages
+         WHERE thread_id = $1 AND message_id IS NOT NULL ORDER BY sent_at ASC`,
+        [t.id]
+      );
   const references = refsRows.map(r => r.message_id);
 
   const replySubject = subject ||
