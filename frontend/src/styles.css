@@ -826,6 +826,7 @@ textarea { resize: vertical; }
 }
 .empty-illust { font-size: 48px; opacity: .5; }
 .loading { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-muted); }
+.thread-list-foot { padding: 12px; text-align: center; color: var(--text-muted); font-size: 13px; }
 
 /* =====  Badges  ===== */
 .badge {
