@@ -28,8 +28,15 @@ const statusBadge = (s) => <span className={`badge badge-${s}`}>{s}</span>;
 export default function ThreadList({
   threads, selectedId, onSelect,
   onCloseThread, onSnoozeThread, onToggleStar,
-  selectedIds = new Set(), onToggleSelect
+  selectedIds = new Set(), onToggleSelect,
+  onLoadMore, hasMore = false, loadingMore = false
 }) {
+  function onScroll(e) {
+    if (!hasMore || loadingMore || !onLoadMore) return;
+    const el = e.currentTarget;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 200) onLoadMore();
+  }
+
   function quick(action, t, e) {
     e.stopPropagation();
     if (action === 'close') onCloseThread && onCloseThread(t);
@@ -43,7 +50,7 @@ export default function ThreadList({
   }
 
   return (
-    <div className="thread-list">
+    <div className="thread-list" onScroll={onScroll}>
       {threads.length === 0 && <div className="empty">No conversations</div>}
       {threads.map(t => {
         const fp = firstParticipant(t.participants);
@@ -126,6 +133,7 @@ export default function ThreadList({
           </div>
         );
       })}
+      {loadingMore && <div className="thread-list-foot">Loading…</div>}
     </div>
   );
 }

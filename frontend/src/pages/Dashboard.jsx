@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import Sidebar from '../components/Sidebar.jsx';
 import TopBar from '../components/TopBar.jsx';
 import ThreadList from '../components/ThreadList.jsx';
@@ -23,6 +23,8 @@ import InboxSearchBar from '../components/InboxSearchBar.jsx';
 import { api } from '../api';
 import { getSocket, disconnectSocket } from '../socket';
 
+const PAGE_SIZE = 50;
+
 export default function Dashboard({ me, onLogout }) {
   const [view, setView] = useState('mail');  // mail | chat | tasks | drafts | scheduled
   const [filter, setFilter] = useState({ status: 'open', assignee: null, folder: null });
@@ -30,6 +32,13 @@ export default function Dashboard({ me, onLogout }) {
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [threads, setThreads] = useState([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Current loaded rows, read inside callbacks without making them a dependency
+  // (which would re-trigger the load effect on every list change).
+  const threadsRef = useRef([]);
+  // Synchronous in-flight guard for loadMore (see note there).
+  const loadingMoreRef = useRef(false);
   const [selectedId, setSelectedId] = useState(null);
   const [accounts, setAccounts] = useState([]);
   const [team, setTeam] = useState([]);
@@ -68,7 +77,12 @@ export default function Dashboard({ me, onLogout }) {
     return () => clearTimeout(t);
   }, [search]);
 
-  const loadThreads = useCallback(async () => {
+  // Keep a ref of the loaded rows so loadThreads/loadMore can read the current
+  // count at call time without depending on `threads` (which would loop the
+  // load effect below).
+  useEffect(() => { threadsRef.current = threads; }, [threads]);
+
+  const buildThreadParams = useCallback(() => {
     const params = new URLSearchParams();
     if (filter.status) params.set('status', filter.status);
     if (filter.assignee) params.set('assignee', filter.assignee);
@@ -81,9 +95,49 @@ export default function Dashboard({ me, onLogout }) {
     if (filter.starred) params.set('starred', 'true');
     if (currentTeamSpaceId) params.set('team_space_id', currentTeamSpaceId);
     if (debouncedSearch) params.set('q', debouncedSearch);
+    return params;
+  }, [filter, currentTeamSpaceId, debouncedSearch]);
+
+  // Reset/refresh path: reload page 0 but keep the depth the user has already
+  // scrolled to, so socket events and mutations don't collapse the list back to
+  // the first 50 rows (and reset scroll position).
+  const loadThreads = useCallback(async () => {
+    const params = buildThreadParams();
+    const limit = Math.min(200, Math.max(PAGE_SIZE, threadsRef.current.length));
+    params.set('limit', String(limit));
+    params.set('offset', '0');
     const res = await api('/api/threads?' + params.toString());
     setThreads(res.threads);
-  }, [filter, currentTeamSpaceId, debouncedSearch]);
+    setHasMore(res.hasMore);
+  }, [buildThreadParams]);
+
+  // Infinite scroll: append the next page of older conversations.
+  const loadMore = useCallback(async () => {
+    // Guard on the ref, not the `loadingMore` state: the scroll event fires
+    // many times before the setLoadingMore re-render lands, so a state guard
+    // would let several identical fetches through for the same offset and
+    // append the same rows repeatedly.
+    if (loadingMoreRef.current || !hasMore) return;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    try {
+      const params = buildThreadParams();
+      params.set('limit', String(PAGE_SIZE));
+      params.set('offset', String(threadsRef.current.length));
+      const res = await api('/api/threads?' + params.toString());
+      // De-dupe by id: offset pagination can overlap at a page boundary when a
+      // thread is bumped to the top by a new message between fetches; appending
+      // blindly would produce duplicate React keys.
+      setThreads(prev => {
+        const seen = new Set(prev.map(t => t.id));
+        return [...prev, ...res.threads.filter(t => !seen.has(t.id))];
+      });
+      setHasMore(res.hasMore);
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+    }
+  }, [buildThreadParams, hasMore]);
 
   const loadAccounts = useCallback(async () => {
     const r = await api('/api/accounts');
@@ -349,6 +403,9 @@ export default function Dashboard({ me, onLogout }) {
                 onToggleStar={toggleStar}
                 selectedIds={selectedThreadIds}
                 onToggleSelect={toggleSelect}
+                onLoadMore={loadMore}
+                hasMore={hasMore}
+                loadingMore={loadingMore}
               />
               <ThreadView
                 threadId={selectedId}
