@@ -74,24 +74,59 @@ function getAccount(id) {
   return one('SELECT * FROM email_accounts WHERE id = $1', [id]);
 }
 
-async function buildClient(acc) {
+// Mirrors SMTP_TIMEOUTS in smtp.js. socketTimeout applies only to transient
+// sync/append clients — the long-lived IDLE watcher keeps imapflow's 5-min
+// default (it recovers IDLE via NOOP on timeout; a short value would churn it).
+const IMAP_TIMEOUTS = {
+  connectionTimeout: 20 * 1000,
+  greetingTimeout:   20 * 1000,
+  socketTimeout:     60 * 1000
+};
+
+// imapflow's emitError() emits 'error' on the client for any post-connect
+// socket failure (TCP/TLS timeout, RST). With zero 'error' listeners Node
+// rethrows it as an uncaughtException — exactly what the listener-less
+// transient sync/append clients were doing on outlook.office365.com socket
+// timeouts. The IDLE watcher attaches its own onDead handler; this guard
+// covers every other (transient) client so no socket error can crash the process.
+function attachErrorGuard(client, acc) {
+  client.on('error', (err) => {
+    console.warn('[imap] client error for', acc.email, '-', err && err.message);
+  });
+}
+
+async function buildClient(acc, { idle = false } = {}) {
+  // socketTimeout only on transient clients; IDLE watcher keeps the 5-min default.
+  const timeouts = {
+    connectionTimeout: IMAP_TIMEOUTS.connectionTimeout,
+    greetingTimeout: IMAP_TIMEOUTS.greetingTimeout,
+    ...(idle ? {} : { socketTimeout: IMAP_TIMEOUTS.socketTimeout })
+  };
+  let client;
   if (acc.provider === 'microsoft') {
     const accessToken = await ms.ensureFreshAccessToken(acc);
-    return new ImapFlow({
+    client = new ImapFlow({
       host: acc.imap_host || 'outlook.office365.com',
       port: acc.imap_port || 993,
       secure: true,
       auth: { user: acc.email, accessToken },
-      logger: false
+      logger: false,
+      ...timeouts
+    });
+  } else {
+    client = new ImapFlow({
+      host: acc.imap_host,
+      port: acc.imap_port,
+      secure: !!acc.imap_secure,
+      auth: { user: acc.imap_user, pass: decrypt(acc.imap_pass) },
+      logger: false,
+      ...timeouts
     });
   }
-  return new ImapFlow({
-    host: acc.imap_host,
-    port: acc.imap_port,
-    secure: !!acc.imap_secure,
-    auth: { user: acc.imap_user, pass: decrypt(acc.imap_pass) },
-    logger: false
-  });
+  // The IDLE watcher owns its own error handling (onDead) and reconnect backoff,
+  // so only guard transient clients here to avoid duplicate 'error' logging.
+  if (!idle) attachErrorGuard(client, acc);
+  return client;
 }
 
 function normalizeAddrList(list) {
@@ -688,7 +723,7 @@ async function startWatching(accountId) {
   if (acc.provider === 'microsoft') return;
   let client;
   try {
-    client = await buildClient(acc);
+    client = await buildClient(acc, { idle: true });
   } catch (e) {
     console.error('buildClient failed for', acc.email, '-', e.message);
     const prev = retryState.get(accountId);
@@ -747,7 +782,9 @@ function stopWatching(accountId) {
 }
 
 async function startAllWatchers() {
-  const rows = await many('SELECT id FROM email_accounts');
+  // Watchers are IMAP-IDLE only. Microsoft accounts sync via the 30s Graph
+  // poll and bail inside startWatching anyway, so skip them at the source.
+  const rows = await many("SELECT id FROM email_accounts WHERE provider IS DISTINCT FROM 'microsoft'");
   for (const r of rows) {
     startWatching(r.id).catch(() => {});
   }
@@ -761,7 +798,10 @@ async function startAllWatchers() {
 function startWatchdog() {
   setInterval(async () => {
     try {
-      const rows = await many('SELECT id, email FROM email_accounts');
+      // Microsoft accounts never get an IMAP watcher (they bail inside
+      // startWatching), so they'd otherwise be re-flagged every tick — logging
+      // "re-attaching watcher" forever without ever opening a connection.
+      const rows = await many("SELECT id, email FROM email_accounts WHERE provider IS DISTINCT FROM 'microsoft'");
       for (const r of rows) {
         if (!watchers.has(r.id) && !retryState.has(r.id)) {
           console.warn('[watchdog] re-attaching watcher for', r.email);
