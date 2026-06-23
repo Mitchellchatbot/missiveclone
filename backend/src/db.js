@@ -299,6 +299,25 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_scheduled_pending ON scheduled_messages(status, send_at);
 CREATE INDEX IF NOT EXISTS idx_scheduled_workspace ON scheduled_messages(workspace_id, status);
+
+-- Attachments for not-yet-sent scheduled messages. Mirrors the attachments
+-- table but hangs off scheduled_messages (which has no messages row yet). When
+-- the dispatcher sends a due message it reads these, attaches them, then copies
+-- them into the attachments table against the materialized message and deletes
+-- them here. ON DELETE CASCADE means cancelling a scheduled send (or its expiry)
+-- cleans these up automatically.
+CREATE TABLE IF NOT EXISTS scheduled_attachments (
+  id TEXT PRIMARY KEY,
+  scheduled_message_id TEXT NOT NULL REFERENCES scheduled_messages(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  content_type TEXT,
+  size_bytes INTEGER NOT NULL,
+  content_id TEXT,
+  data BYTEA NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sched_attachments_msg ON scheduled_attachments(scheduled_message_id);
 `;
 
 const MIGRATIONS = [

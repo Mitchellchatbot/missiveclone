@@ -1,7 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const { v4: uuid } = require('uuid');
-const { one, query } = require('../db');
+const { one, query, tx } = require('../db');
 const { requireAuth } = require('../auth');
 const { sendEmail } = require('../email/smtp');
 const { fireWebhook } = require('../email/imap');
@@ -46,22 +46,36 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
     size: f.size
   }));
 
-  // Scheduled send branch — store and return.
+  // Scheduled send branch — store and return. Attachments are stashed in
+  // scheduled_attachments and replayed by the dispatcher (index.js) when the
+  // message comes due. The message row + its attachments go in one tx so the
+  // HTTP success only returns once the whole queued send is durable.
   if (send_at && Number(send_at) > Date.now() + 30000) {
-    if (files.length) return res.status(400).json({ error: 'attachments with scheduled send not supported in MVP' });
     const id = uuid();
-    await query(
-      `INSERT INTO scheduled_messages
-        (id, workspace_id, user_id, account_id, thread_id, to_addrs, cc_addrs,
-         subject, body_text, body_html, in_reply_to, send_at, status, created_at)
-       VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, NULL, $10, 'pending', $11)`,
-      [
-        id, req.user.workspace_id, req.user.id, acc.id,
-        to, cc || '', subject, body_text || '', body_html || '',
-        Number(send_at), Date.now()
-      ]
-    );
-    return res.json({ ok: true, scheduled_id: id, scheduled_for: Number(send_at) });
+    const now = Date.now();
+    await tx(async (client) => {
+      await client.query(
+        `INSERT INTO scheduled_messages
+          (id, workspace_id, user_id, account_id, thread_id, to_addrs, cc_addrs,
+           subject, body_text, body_html, in_reply_to, send_at, status, created_at)
+         VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, NULL, $10, 'pending', $11)`,
+        [
+          id, req.user.workspace_id, req.user.id, acc.id,
+          to, cc || '', subject, body_text || '', body_html || '',
+          Number(send_at), now
+        ]
+      );
+      for (const f of files) {
+        await client.query(
+          `INSERT INTO scheduled_attachments
+            (id, scheduled_message_id, workspace_id, filename, content_type, size_bytes, content_id, data, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [uuid(), id, req.user.workspace_id, f.filename, f.content_type, f.size, f.content_id || null, f.content, now]
+        );
+      }
+    });
+    console.log(`[scheduled] queued ${id} with ${files.length} attachment(s) for ${new Date(Number(send_at)).toISOString()}`);
+    return res.json({ ok: true, scheduled_id: id, scheduled_for: Number(send_at), attachments: files.length });
   }
 
   // Immediate send.
