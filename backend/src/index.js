@@ -204,7 +204,7 @@ server.listen(PORT, '0.0.0.0', () => {
                 [threadId, s.workspace_id,
                  s.subject || '', [s.to_addrs, s.cc_addrs].filter(Boolean).join('; '),
                  now, sent.messageId || null,
-                 (s.subject || '') + ' ' + (s.to_addrs || '') + ' ' + (s.body_text || '').slice(0, 2000),
+                 (s.subject || '') + ' ' + [s.to_addrs, s.cc_addrs].filter(Boolean).join(' '),
                  now]
               );
               await query(

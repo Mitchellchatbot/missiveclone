@@ -208,6 +208,10 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id, account_i
 // Append a new fragment to threads.search_text under a character cap,
 // resilient to the GIN to_tsvector trigger's 1 MB-per-tsvector ceiling.
 //
+// Callers must pass IDENTITY FIELDS ONLY (subject + sender/recipients), never
+// message body — search_text backs the inbox tsvector search and body text
+// caused false matches (a name in a quote/signature matched the whole thread).
+//
 // Why the retry: to_tsvector emits a lexeme + position list per occurrence,
 // so for token-dense content (URLs, IDs, code) the output tsvector can
 // exceed the input string in bytes. A cap on the input doesn't guarantee
@@ -361,12 +365,19 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
   await insertAttachmentRows(id, acc.workspace_id, attachments.filter(a => a.content));
 
   // Update thread search text + bump last_message_at.
+  //
+  // search_text holds IDENTITY FIELDS ONLY — subject + sender/recipients
+  // (from/to/cc), accumulated across the thread's messages. Deliberately NO
+  // message body: inbox search matches this column via tsvector, and including
+  // body text made a name buried in a signature, quoted reply, or footer match
+  // the entire thread — surfacing conversations the search term doesn't visibly
+  // belong to. Don't re-add body here (or in compose.js / threads.js reply /
+  // index.js scheduled send) without reintroducing that bug.
   const searchAdd = [
     parsed.subject || '',
     fromAddr,
     normalizeAddrList(parsed.to),
-    normalizeAddrList(parsed.cc),
-    (parsed.text || '').slice(0, 4000)
+    normalizeAddrList(parsed.cc)
   ].filter(Boolean).join(' ');
 
   // Split into two updates so a tsvector overflow on the GIN index can't
