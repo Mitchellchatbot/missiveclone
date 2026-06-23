@@ -108,7 +108,16 @@ router.get('/', wrap(async (req, res) => {
                       (SELECT json_agg(DISTINCT jsonb_build_object('email', ea.email, 'name', ea.display_name))
                        FROM messages m JOIN email_accounts ea ON ea.id = m.account_id
                        WHERE m.thread_id = t.id), '[]'::json
-                    ) AS account_emails
+                    ) AS account_emails,
+                    (SELECT m.from_addr FROM messages m
+                      WHERE m.thread_id = t.id
+                      ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) AS last_from,
+                    (SELECT left(btrim(regexp_replace(
+                              regexp_replace(coalesce(m.body_text, m.body_html, ''), '<[^>]+>', ' ', 'g'),
+                              '\\s+', ' ', 'g')), 200)
+                       FROM messages m
+                      WHERE m.thread_id = t.id
+                      ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) AS last_snippet
              FROM threads t
              LEFT JOIN users u ON u.id = t.assignee_id
              WHERE t.workspace_id = $1`;
