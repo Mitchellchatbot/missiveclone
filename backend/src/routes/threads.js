@@ -403,7 +403,7 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
   if (!t) return res.status(404).json({ error: 'thread not found' });
 
   const acc = await one(
-    'SELECT id FROM email_accounts WHERE id = $1 AND workspace_id = $2',
+    'SELECT id, email FROM email_accounts WHERE id = $1 AND workspace_id = $2',
     [account_id, req.user.workspace_id]
   );
   if (!acc) return res.status(400).json({ error: 'account_id invalid' });
@@ -507,7 +507,9 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
     `UPDATE threads SET last_message_at = $1 WHERE id = $2`,
     [now, t.id]
   );
-  await appendThreadSearchText(t.id, [replySubject, replyTo, body_text || ''].join(' '));
+  // Identity fields only (subject + sender + recipients) — never body_text;
+  // see appendThreadSearchText in email/imap.js for why.
+  await appendThreadSearchText(t.id, [replySubject, acc.email, replyTo, replyCc].filter(Boolean).join(' '));
 
   // Successful send: clear this user's draft for the thread.
   await query('DELETE FROM drafts WHERE user_id = $1 AND thread_id = $2', [req.user.id, t.id]);

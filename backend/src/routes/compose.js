@@ -85,7 +85,7 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
      VALUES ($1, $2, $3, $4, $5, $6, 'open', $7, $8, $9)`,
     [threadId, req.user.workspace_id, acc.team_space_id || null,
      cleanSubj || subject, participants, now, messageId || null,
-     (cleanSubj || subject) + ' ' + participants + ' ' + (body_text || '').slice(0, 2000),
+     (cleanSubj || subject) + ' ' + participants,
      now]
   );
 
