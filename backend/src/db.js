@@ -387,7 +387,15 @@ const MIGRATIONS = [
        messages.to_addrs ILIKE '%' || ea.email || '%'
        OR messages.from_addr ILIKE '%' || ea.email || '%'
        OR messages.cc_addrs ILIKE '%' || ea.email || '%'
-     )`
+     )`,
+  // Bulk/automated outbound marker. Set when DelegationDoer's bulk-email
+  // tool sends a templated blast; DD's touchpoint sync skips threads whose
+  // latest OUTBOUND message carries this, so a mass send doesn't reset every
+  // client's "last contacted". Defaults 0 → existing rows + normal mail are
+  // unaffected. Lives on messages (per-message) and scheduled_messages (so a
+  // scheduled blast stays marked when it materializes into a real message).
+  `ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_automated INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS is_automated INTEGER NOT NULL DEFAULT 0`
 ];
 
 function ensurePool() {

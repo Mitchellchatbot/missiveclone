@@ -210,11 +210,11 @@ server.listen(PORT, '0.0.0.0', () => {
               await query(
                 `INSERT INTO messages (id, thread_id, account_id, workspace_id, direction, folder,
                   message_id, subject, from_addr, to_addrs, cc_addrs, body_text, body_html,
-                  sent_at, created_at)
-                 VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, '', $7, $8, $9, $10, $11, $12)`,
+                  sent_at, created_at, is_automated)
+                 VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, '', $7, $8, $9, $10, $11, $12, $13)`,
                 [msgId, threadId, s.account_id, s.workspace_id, sent.messageId,
                  s.subject || '', s.to_addrs || '', s.cc_addrs || '',
-                 s.body_text || '', s.body_html || '', now, now]
+                 s.body_text || '', s.body_html || '', now, now, s.is_automated ? 1 : 0]
               );
 
               await query(`UPDATE scheduled_messages SET status = 'sent', thread_id = $1 WHERE id = $2`, [threadId, s.id]);

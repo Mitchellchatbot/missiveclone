@@ -108,7 +108,10 @@ router.get('/', wrap(async (req, res) => {
                       (SELECT json_agg(DISTINCT jsonb_build_object('email', ea.email, 'name', ea.display_name))
                        FROM messages m JOIN email_accounts ea ON ea.id = m.account_id
                        WHERE m.thread_id = t.id), '[]'::json
-                    ) AS account_emails
+                    ) AS account_emails,
+                    (SELECT m.is_automated FROM messages m
+                      WHERE m.thread_id = t.id AND m.direction = 'outbound'
+                      ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) AS automated
              FROM threads t
              LEFT JOIN users u ON u.id = t.assignee_id
              WHERE t.workspace_id = $1`;
