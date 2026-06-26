@@ -117,7 +117,12 @@ router.get('/', wrap(async (req, res) => {
                               '\\s+', ' ', 'g')), 200)
                        FROM messages m
                       WHERE m.thread_id = t.id
-                      ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) AS last_snippet
+                      ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) AS last_snippet,
+                    coalesce((
+                      SELECT m2.is_automated FROM messages m2
+                      WHERE m2.thread_id = t.id AND m2.direction = 'outbound'
+                      ORDER BY m2.sent_at DESC LIMIT 1
+                    ), 0) AS automated
              FROM threads t
              LEFT JOIN users u ON u.id = t.assignee_id
              WHERE t.workspace_id = $1`;
@@ -272,7 +277,12 @@ router.get('/:id', wrap(async (req, res) => {
               (SELECT json_agg(DISTINCT jsonb_build_object('email', ea.email, 'name', ea.display_name))
                FROM messages m JOIN email_accounts ea ON ea.id = m.account_id
                WHERE m.thread_id = t.id), '[]'::json
-            ) AS account_emails
+            ) AS account_emails,
+            coalesce((
+              SELECT m2.is_automated FROM messages m2
+              WHERE m2.thread_id = t.id AND m2.direction = 'outbound'
+              ORDER BY m2.sent_at DESC LIMIT 1
+            ), 0) AS automated
      FROM threads t LEFT JOIN users u ON u.id = t.assignee_id
      WHERE t.id = $1 AND t.workspace_id = $2`,
     [req.params.id, req.user.workspace_id]
