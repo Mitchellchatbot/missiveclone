@@ -109,6 +109,15 @@ router.get('/', wrap(async (req, res) => {
                        FROM messages m JOIN email_accounts ea ON ea.id = m.account_id
                        WHERE m.thread_id = t.id), '[]'::json
                     ) AS account_emails,
+                    (SELECT m.from_addr FROM messages m
+                      WHERE m.thread_id = t.id
+                      ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) AS last_from,
+                    (SELECT left(btrim(regexp_replace(
+                              regexp_replace(coalesce(m.body_text, m.body_html, ''), '<[^>]+>', ' ', 'g'),
+                              '\\s+', ' ', 'g')), 200)
+                       FROM messages m
+                      WHERE m.thread_id = t.id
+                      ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) AS last_snippet,
                     coalesce((
                       SELECT m2.is_automated FROM messages m2
                       WHERE m2.thread_id = t.id AND m2.direction = 'outbound'
