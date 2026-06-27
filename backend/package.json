@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "diagnose": "node scripts/diagnose-empty-inboxes.js"
+    "diagnose": "node scripts/diagnose-empty-inboxes.js",
+    "verify:scheduled-attachments": "node scripts/verify-scheduled-attachments.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

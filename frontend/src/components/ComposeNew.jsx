@@ -57,9 +57,7 @@ export default function ComposeNew({ accounts, defaultAccountId, initial, onClos
         body_text: text, body_html: html,
         send_at: scheduledMs || null
       }));
-      if (!scheduledMs) {
-        for (const f of files) fd.append('files', f);
-      }
+      for (const f of files) fd.append('files', f);
       const token = getToken();
       const res = await fetch(getApiBase() + '/api/compose', {
         method: 'POST', body: fd,

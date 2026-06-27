@@ -170,10 +170,10 @@ server.listen(PORT, '0.0.0.0', () => {
       // Scheduled-send dispatcher — every 30s, send any due messages.
       const { sendEmail } = require('./email/smtp');
       const { v4: uuid } = require('uuid');
-      const { query, emitToWorkspace } = (() => {
+      const { query, tx, emitToWorkspace } = (() => {
         const dbm = require('./db');
         const sock = require('./sockets');
-        return { query: dbm.query, emitToWorkspace: sock.emitToWorkspace };
+        return { query: dbm.query, tx: dbm.tx, emitToWorkspace: sock.emitToWorkspace };
       })();
       setInterval(async () => {
         try {
@@ -182,40 +182,92 @@ server.listen(PORT, '0.0.0.0', () => {
             [Date.now()]
           );
           for (const s of due) {
+            let attachments = [];
+            let sent;
+            // Phase 1 — actually send. A throw here means the email never went
+            // out, so marking the row 'failed' is correct.
             try {
               await query(`UPDATE scheduled_messages SET status = 'sending' WHERE id = $1`, [s.id]);
-              const sent = await sendEmail(s.account_id, {
+
+              // Replay any attachments stashed at schedule time. BYTEA comes
+              // back from pg as a Buffer, which is exactly what sendEmail (SMTP
+              // + Graph) expects in attachments[].content.
+              const atts = await query(
+                `SELECT filename, content_type, content_id, data
+                   FROM scheduled_attachments WHERE scheduled_message_id = $1`,
+                [s.id]
+              );
+              attachments = atts.rows.map(r => ({
+                filename: r.filename,
+                content: r.data,
+                content_type: r.content_type,
+                content_id: r.content_id || undefined
+              }));
+
+              console.log(`[scheduled] sending ${s.id} with ${attachments.length} attachment(s)`);
+              sent = await sendEmail(s.account_id, {
                 to: s.to_addrs,
                 cc: s.cc_addrs,
                 subject: s.subject,
                 text: s.body_text || '',
                 html: s.body_html || '',
-                inReplyTo: s.in_reply_to || null
+                inReplyTo: s.in_reply_to || null,
+                attachments
               });
+            } catch (e) {
+              console.error('[scheduled] send failed', s.id, e.message);
+              await query(
+                `UPDATE scheduled_messages SET status = 'failed', error = $1 WHERE id = $2`,
+                [e.message, s.id]
+              );
+              continue;
+            }
 
+            // Phase 2 — the email is already out. A DB failure here must NOT
+            // mark the row 'failed': that would misreport a sent email and
+            // could prompt a manual resend. Only the inbox copy + live events
+            // are at stake; record 'sent' regardless.
+            try {
               // Materialize as a thread/message so it shows up in the inbox.
+              // One tx so the inbox copy is all-or-nothing (the send already
+              // happened above — never wrap that network call in a tx).
               const threadId = uuid();
               const msgId = uuid();
               const now = Date.now();
-              await query(
-                `INSERT INTO threads (id, workspace_id, subject, participants,
-                                      last_message_at, status, message_id_root, search_text, created_at)
-                 VALUES ($1, $2, $3, $4, $5, 'open', $6, $7, $8)`,
-                [threadId, s.workspace_id,
-                 s.subject || '', [s.to_addrs, s.cc_addrs].filter(Boolean).join('; '),
-                 now, sent.messageId || null,
-                 (s.subject || '') + ' ' + [s.to_addrs, s.cc_addrs].filter(Boolean).join(' '),
-                 now]
-              );
-              await query(
-                `INSERT INTO messages (id, thread_id, account_id, workspace_id, direction, folder,
-                  message_id, subject, from_addr, to_addrs, cc_addrs, body_text, body_html,
-                  sent_at, is_automated, created_at)
-                 VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, '', $7, $8, $9, $10, $11, $12, $13)`,
-                [msgId, threadId, s.account_id, s.workspace_id, sent.messageId,
-                 s.subject || '', s.to_addrs || '', s.cc_addrs || '',
-                 s.body_text || '', s.body_html || '', now, s.is_automated || 0, now]
-              );
+              await tx(async (client) => {
+                await client.query(
+                  `INSERT INTO threads (id, workspace_id, subject, participants,
+                                        last_message_at, status, message_id_root, search_text, created_at)
+                   VALUES ($1, $2, $3, $4, $5, 'open', $6, $7, $8)`,
+                  [threadId, s.workspace_id,
+                   s.subject || '', [s.to_addrs, s.cc_addrs].filter(Boolean).join('; '),
+                   now, sent.messageId || null,
+                   (s.subject || '') + ' ' + [s.to_addrs, s.cc_addrs].filter(Boolean).join(' '),
+                   now]
+                );
+                await client.query(
+                  `INSERT INTO messages (id, thread_id, account_id, workspace_id, direction, folder,
+                    message_id, subject, from_addr, to_addrs, cc_addrs, body_text, body_html,
+                    sent_at, has_attachments, is_automated, created_at)
+                   VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, '', $7, $8, $9, $10, $11, $12, $13, $14)`,
+                  [msgId, threadId, s.account_id, s.workspace_id, sent.messageId,
+                   s.subject || '', s.to_addrs || '', s.cc_addrs || '',
+                   s.body_text || '', s.body_html || '', now, attachments.length ? 1 : 0, s.is_automated || 0, now]
+                );
+                for (const a of attachments) {
+                  await client.query(
+                    `INSERT INTO attachments (id, message_id, workspace_id, filename, content_type, size_bytes, content_id, data, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                    [uuid(), msgId, s.workspace_id, a.filename, a.content_type,
+                     a.content ? a.content.length : 0, a.content_id || null, a.content, now]
+                  );
+                }
+              });
+
+              // The bytes now live in `attachments` against the real message;
+              // drop the scheduled copy to reclaim BYTEA, keeping the 'sent'
+              // status row so ScheduledView still shows the history.
+              await query(`DELETE FROM scheduled_attachments WHERE scheduled_message_id = $1`, [s.id]);
 
               await query(`UPDATE scheduled_messages SET status = 'sent', thread_id = $1 WHERE id = $2`, [threadId, s.id]);
               emitToWorkspace(s.workspace_id, 'thread:updated', { thread_id: threadId, account_id: s.account_id });
@@ -230,11 +282,18 @@ server.listen(PORT, '0.0.0.0', () => {
                 message_id: msgId
               });
             } catch (e) {
-              console.error('scheduled send failed', s.id, e.message);
-              await query(
-                `UPDATE scheduled_messages SET status = 'failed', error = $1 WHERE id = $2`,
-                [e.message, s.id]
-              );
+              // Already sent — never 'failed'. Best-effort mark 'sent' so the
+              // dispatcher (which only re-picks 'pending') never resends it; a
+              // row stuck in 'sending' is likewise never re-picked.
+              console.error('[scheduled] sent but post-send bookkeeping failed', s.id, e.message);
+              try {
+                await query(
+                  `UPDATE scheduled_messages SET status = 'sent', error = $1 WHERE id = $2`,
+                  ['post-send bookkeeping failed: ' + e.message, s.id]
+                );
+              } catch (e2) {
+                console.error('[scheduled] could not mark sent after bookkeeping failure', s.id, e2.message);
+              }
             }
           }
         } catch (e) {
