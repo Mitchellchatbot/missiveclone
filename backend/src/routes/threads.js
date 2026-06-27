@@ -108,7 +108,21 @@ router.get('/', wrap(async (req, res) => {
                       (SELECT json_agg(DISTINCT jsonb_build_object('email', ea.email, 'name', ea.display_name))
                        FROM messages m JOIN email_accounts ea ON ea.id = m.account_id
                        WHERE m.thread_id = t.id), '[]'::json
-                    ) AS account_emails
+                    ) AS account_emails,
+                    (SELECT m.from_addr FROM messages m
+                      WHERE m.thread_id = t.id
+                      ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) AS last_from,
+                    (SELECT left(btrim(regexp_replace(
+                              regexp_replace(coalesce(m.body_text, m.body_html, ''), '<[^>]+>', ' ', 'g'),
+                              '\\s+', ' ', 'g')), 200)
+                       FROM messages m
+                      WHERE m.thread_id = t.id
+                      ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) AS last_snippet,
+                    coalesce((
+                      SELECT m2.is_automated FROM messages m2
+                      WHERE m2.thread_id = t.id AND m2.direction = 'outbound'
+                      ORDER BY m2.sent_at DESC LIMIT 1
+                    ), 0) AS automated
              FROM threads t
              LEFT JOIN users u ON u.id = t.assignee_id
              WHERE t.workspace_id = $1`;
@@ -263,7 +277,12 @@ router.get('/:id', wrap(async (req, res) => {
               (SELECT json_agg(DISTINCT jsonb_build_object('email', ea.email, 'name', ea.display_name))
                FROM messages m JOIN email_accounts ea ON ea.id = m.account_id
                WHERE m.thread_id = t.id), '[]'::json
-            ) AS account_emails
+            ) AS account_emails,
+            coalesce((
+              SELECT m2.is_automated FROM messages m2
+              WHERE m2.thread_id = t.id AND m2.direction = 'outbound'
+              ORDER BY m2.sent_at DESC LIMIT 1
+            ), 0) AS automated
      FROM threads t LEFT JOIN users u ON u.id = t.assignee_id
      WHERE t.id = $1 AND t.workspace_id = $2`,
     [req.params.id, req.user.workspace_id]
@@ -403,7 +422,7 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
   if (!t) return res.status(404).json({ error: 'thread not found' });
 
   const acc = await one(
-    'SELECT id FROM email_accounts WHERE id = $1 AND workspace_id = $2',
+    'SELECT id, email FROM email_accounts WHERE id = $1 AND workspace_id = $2',
     [account_id, req.user.workspace_id]
   );
   if (!acc) return res.status(400).json({ error: 'account_id invalid' });
@@ -507,7 +526,9 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
     `UPDATE threads SET last_message_at = $1 WHERE id = $2`,
     [now, t.id]
   );
-  await appendThreadSearchText(t.id, [replySubject, replyTo, body_text || ''].join(' '));
+  // Identity fields only (subject + sender + recipients) — never body_text;
+  // see appendThreadSearchText in email/imap.js for why.
+  await appendThreadSearchText(t.id, [replySubject, acc.email, replyTo, replyCc].filter(Boolean).join(' '));
 
   // Successful send: clear this user's draft for the thread.
   await query('DELETE FROM drafts WHERE user_id = $1 AND thread_id = $2', [req.user.id, t.id]);

@@ -325,6 +325,12 @@ const MIGRATIONS = [
   `ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS sent_folder TEXT`,
   `ALTER TABLE messages ADD COLUMN IF NOT EXISTS folder TEXT`,
   `ALTER TABLE messages ADD COLUMN IF NOT EXISTS has_attachments INTEGER NOT NULL DEFAULT 0`,
+  // Bulk/automated outbound marker. DelegationDoer's bulk-email tool sets
+  // payload.automated=true on /api/compose; the thread list exposes the
+  // newest outbound message's value as `automated` so DD's touchpoint-sync
+  // can exclude mass sends from client health.
+  `ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_automated INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS is_automated INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE threads ADD COLUMN IF NOT EXISTS search_text TEXT`,
   `ALTER TABLE email_accounts DROP COLUMN IF EXISTS last_sync_uid`,
   // Team-space columns:

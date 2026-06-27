@@ -242,17 +242,17 @@ server.listen(PORT, '0.0.0.0', () => {
                   [threadId, s.workspace_id,
                    s.subject || '', [s.to_addrs, s.cc_addrs].filter(Boolean).join('; '),
                    now, sent.messageId || null,
-                   (s.subject || '') + ' ' + (s.to_addrs || '') + ' ' + (s.body_text || '').slice(0, 2000),
+                   (s.subject || '') + ' ' + [s.to_addrs, s.cc_addrs].filter(Boolean).join(' '),
                    now]
                 );
                 await client.query(
                   `INSERT INTO messages (id, thread_id, account_id, workspace_id, direction, folder,
                     message_id, subject, from_addr, to_addrs, cc_addrs, body_text, body_html,
-                    sent_at, has_attachments, created_at)
-                   VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, '', $7, $8, $9, $10, $11, $12, $13)`,
+                    sent_at, has_attachments, is_automated, created_at)
+                   VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, '', $7, $8, $9, $10, $11, $12, $13, $14)`,
                   [msgId, threadId, s.account_id, s.workspace_id, sent.messageId,
                    s.subject || '', s.to_addrs || '', s.cc_addrs || '',
-                   s.body_text || '', s.body_html || '', now, attachments.length ? 1 : 0, now]
+                   s.body_text || '', s.body_html || '', now, attachments.length ? 1 : 0, s.is_automated || 0, now]
                 );
                 for (const a of attachments) {
                   await client.query(
