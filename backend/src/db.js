@@ -331,6 +331,13 @@ const MIGRATIONS = [
   // can exclude mass sends from client health.
   `ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_automated INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS is_automated INTEGER NOT NULL DEFAULT 0`,
+  // Weekly-SEO-update marker. The inbox composer sets payload.weekly_update=true
+  // on /api/compose; DD's webhook handler reads it and clears the recipient
+  // client's pending EOD work from the "Who needs an email" card. Distinct from
+  // is_automated (which excludes bulk blasts from touchpoint health) — a weekly
+  // update is a real personal touchpoint that just also clears the EOD queue.
+  `ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_weekly_update INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS is_weekly_update INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE threads ADD COLUMN IF NOT EXISTS search_text TEXT`,
   `ALTER TABLE email_accounts DROP COLUMN IF EXISTS last_sync_uid`,
   // Team-space columns:

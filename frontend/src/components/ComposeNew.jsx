@@ -40,6 +40,7 @@ export default function ComposeNew({ accounts, defaultAccountId, initial, onClos
   const [err, setErr] = useState('');
   const [scheduleAt, setScheduleAt] = useState(null);
   const [showSchedule, setShowSchedule] = useState(false);
+  const [weeklyUpdate, setWeeklyUpdate] = useState(false);
   const fileInput = useRef(null);
 
   function addFiles(list) { setFiles(p => [...p, ...Array.from(list || [])]); }
@@ -55,7 +56,11 @@ export default function ComposeNew({ accounts, defaultAccountId, initial, onClos
       fd.append('payload', JSON.stringify({
         account_id: accountId, to, cc, subject,
         body_text: text, body_html: html,
-        send_at: scheduledMs || null
+        send_at: scheduledMs || null,
+        // When set, DD marks the recipient client's pending EOD work as
+        // reported so they drop off the "Who needs an email" card. Omit
+        // when false so the backend treats it as absent (like `automated`).
+        weekly_update: weeklyUpdate || undefined
       }));
       for (const f of files) fd.append('files', f);
       const token = getToken();
@@ -149,6 +154,10 @@ export default function ComposeNew({ accounts, defaultAccountId, initial, onClos
               </div>
             )}
           </div>
+          <label className="composer-weekly" style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 8, cursor: 'pointer' }}>
+            <input type="checkbox" checked={weeklyUpdate} onChange={e => setWeeklyUpdate(e.target.checked)} />
+            <span className="small">Mark as Weekly SEO Update</span>
+          </label>
           <div className="spacer" />
           <button type="button" className="ghost" onClick={onClose}>Discard</button>
           {scheduleAt

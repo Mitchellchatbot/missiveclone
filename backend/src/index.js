@@ -248,11 +248,11 @@ server.listen(PORT, '0.0.0.0', () => {
                 await client.query(
                   `INSERT INTO messages (id, thread_id, account_id, workspace_id, direction, folder,
                     message_id, subject, from_addr, to_addrs, cc_addrs, body_text, body_html,
-                    sent_at, has_attachments, is_automated, created_at)
-                   VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, '', $7, $8, $9, $10, $11, $12, $13, $14)`,
+                    sent_at, has_attachments, is_automated, is_weekly_update, created_at)
+                   VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, '', $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
                   [msgId, threadId, s.account_id, s.workspace_id, sent.messageId,
                    s.subject || '', s.to_addrs || '', s.cc_addrs || '',
-                   s.body_text || '', s.body_html || '', now, attachments.length ? 1 : 0, s.is_automated || 0, now]
+                   s.body_text || '', s.body_html || '', now, attachments.length ? 1 : 0, s.is_automated || 0, s.is_weekly_update || 0, now]
                 );
                 for (const a of attachments) {
                   await client.query(
@@ -279,7 +279,13 @@ server.listen(PORT, '0.0.0.0', () => {
                 workspace_id: s.workspace_id,
                 account_id: s.account_id,
                 thread_id: threadId,
-                message_id: msgId
+                message_id: msgId,
+                // Recipients (not the sender) are what DD matches to a client;
+                // weekly_update gates the "Who needs an email" card clear. The
+                // flag survived scheduling via scheduled_messages.is_weekly_update.
+                to_addrs: s.to_addrs || '',
+                cc_addrs: s.cc_addrs || '',
+                weekly_update: !!s.is_weekly_update
               });
             } catch (e) {
               // Already sent — never 'failed'. Best-effort mark 'sent' so the
