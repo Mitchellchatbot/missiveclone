@@ -30,10 +30,13 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
   try { data = JSON.parse(req.body.payload || '{}'); }
   catch { return res.status(400).json({ error: 'payload must be JSON' }); }
 
-  const { account_id, to, cc, bcc, subject, body_text, body_html, send_at, automated } = data;
+  const { account_id, to, cc, bcc, subject, body_text, body_html, send_at, automated, weekly_update } = data;
   if (!account_id || !to || !subject) return res.status(400).json({ error: 'account_id, to, subject required' });
   // Bulk-email tool marks blasts so DD can keep them out of touchpoint health.
   const isAutomated = automated === true ? 1 : 0;
+  // Inbox composer marks weekly SEO updates so DD clears the recipient client
+  // from its "Who needs an email" card. Carried to DD in the webhook below.
+  const isWeeklyUpdate = weekly_update === true ? 1 : 0;
 
   const acc = await one(
     'SELECT * FROM email_accounts WHERE id = $1 AND workspace_id = $2',
@@ -59,12 +62,12 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
       await client.query(
         `INSERT INTO scheduled_messages
           (id, workspace_id, user_id, account_id, thread_id, to_addrs, cc_addrs,
-           subject, body_text, body_html, in_reply_to, send_at, status, is_automated, created_at)
-         VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, NULL, $10, 'pending', $11, $12)`,
+           subject, body_text, body_html, in_reply_to, send_at, status, is_automated, is_weekly_update, created_at)
+         VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, NULL, $10, 'pending', $11, $12, $13)`,
         [
           id, req.user.workspace_id, req.user.id, acc.id,
           to, cc || '', subject, body_text || '', body_html || '',
-          Number(send_at), isAutomated, now
+          Number(send_at), isAutomated, isWeeklyUpdate, now
         ]
       );
       for (const f of files) {
@@ -116,11 +119,11 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
     `INSERT INTO messages
       (id, thread_id, account_id, workspace_id, direction, folder, message_id,
        subject, from_addr, to_addrs, cc_addrs, body_text, body_html, sent_at,
-       has_attachments, is_automated, created_at)
-      VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+       has_attachments, is_automated, is_weekly_update, created_at)
+      VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
     [msgId, threadId, acc.id, req.user.workspace_id, messageId,
      subject, '', to, cc || '', body_text || '', body_html || '',
-     now, files.length ? 1 : 0, isAutomated, now]
+     now, files.length ? 1 : 0, isAutomated, isWeeklyUpdate, now]
   );
   for (const f of files) {
     const aid = uuid();
@@ -143,7 +146,13 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
     workspace_id: req.user.workspace_id,
     account_id: acc.id,
     thread_id: threadId,
-    message_id: msgId
+    message_id: msgId,
+    // Recipients let DD attribute the send to a client (auto-label + the
+    // weekly-update card clear). weekly_update gates the card clear itself.
+    from_addr: acc.email,
+    to_addrs: to,
+    cc_addrs: cc || '',
+    weekly_update: weekly_update === true
   });
 
   res.json({ ok: true, thread_id: threadId, message_id: msgId });
