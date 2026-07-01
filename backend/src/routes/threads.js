@@ -265,6 +265,18 @@ router.get('/', wrap(async (req, res) => {
   res.json({ threads: rows, limit, offset, hasMore: rows.length === limit });
 }));
 
+// One-line preview of a message body for collapsed rows. Mirrors the
+// list endpoint's `last_snippet` SQL (prefer plaintext, else tag-strip the
+// HTML, collapse whitespace, cap length) so deferred-body responses can ship
+// a snippet without the full body. Kept in JS so it also works on the message
+// rows we've already SELECTed.
+function snippetOf(text, html) {
+  const src = text && text.trim()
+    ? text
+    : (html ? String(html).replace(/<[^>]+>/g, ' ') : '');
+  return src.replace(/\s+/g, ' ').trim().slice(0, 200);
+}
+
 router.get('/:id', wrap(async (req, res) => {
   const t = await one(
     `SELECT t.*, u.name AS assignee_name,
@@ -309,6 +321,27 @@ router.get('/:id', wrap(async (req, res) => {
     (attsByMsg[a.message_id] = attsByMsg[a.message_id] || []).push(a);
   }
   for (const m of messages) m.attachments = attsByMsg[m.id] || [];
+
+  // Lazy bodies: with ?defer_bodies=1 the caller (the DD reading pane) only
+  // renders the latest message on open and fetches older bodies on expand via
+  // /api/messages/:id/body. Ship the latest message's body inline (it's the
+  // default-expanded one) plus a snippet for every message; withhold the rest's
+  // body_html/body_text and flag them body_deferred. Without the param the
+  // response is byte-for-byte unchanged (full bodies) — backward compatible.
+  if ((req.query.defer_bodies === '1' || req.query.defer_bodies === 'true') && messages.length) {
+    const latestId = messages[messages.length - 1].id; // ORDER BY sent_at ASC → last is latest
+    for (const m of messages) {
+      m.snippet = snippetOf(m.body_text, m.body_html);
+      if (m.id === latestId) {
+        m.body_deferred = false;
+      } else {
+        m.body_html = null;
+        m.body_text = null;
+        m.body_deferred = true;
+      }
+    }
+  }
+
   const comments = await many(
     `SELECT c.*, u.name AS user_name FROM comments c
      JOIN users u ON u.id = c.user_id

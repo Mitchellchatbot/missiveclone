@@ -26,6 +26,7 @@ const { many, ping, HAS_DB } = db;
 const authRoutes = require('./routes/auth');
 const accountRoutes = require('./routes/accounts');
 const threadRoutes = require('./routes/threads');
+const messageRoutes = require('./routes/messages');
 const attachmentRoutes = require('./routes/attachments');
 const inviteRoutes = require('./routes/invites');
 const cannedRoutes = require('./routes/canned');
@@ -75,6 +76,7 @@ app.get('/api/status', async (_req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/accounts', accountRoutes);
 app.use('/api/threads', threadRoutes);
+app.use('/api/messages', messageRoutes);
 app.use('/api/attachments', attachmentRoutes);
 app.use('/api/invites', inviteRoutes);
 app.use('/api/canned', cannedRoutes);
