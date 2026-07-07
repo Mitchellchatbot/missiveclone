@@ -122,7 +122,10 @@ router.get('/', wrap(async (req, res) => {
                       SELECT m2.is_automated FROM messages m2
                       WHERE m2.thread_id = t.id AND m2.direction = 'outbound'
                       ORDER BY m2.sent_at DESC LIMIT 1
-                    ), 0) AS automated
+                    ), 0) AS automated,
+                    (SELECT m3.sent_at FROM messages m3
+                      WHERE m3.thread_id = t.id AND m3.direction = 'outbound'
+                      ORDER BY m3.sent_at DESC LIMIT 1) AS last_outbound_at
              FROM threads t
              LEFT JOIN users u ON u.id = t.assignee_id
              WHERE t.workspace_id = $1`;
@@ -294,7 +297,10 @@ router.get('/:id', wrap(async (req, res) => {
               SELECT m2.is_automated FROM messages m2
               WHERE m2.thread_id = t.id AND m2.direction = 'outbound'
               ORDER BY m2.sent_at DESC LIMIT 1
-            ), 0) AS automated
+            ), 0) AS automated,
+            (SELECT m3.sent_at FROM messages m3
+              WHERE m3.thread_id = t.id AND m3.direction = 'outbound'
+              ORDER BY m3.sent_at DESC LIMIT 1) AS last_outbound_at
      FROM threads t LEFT JOIN users u ON u.id = t.assignee_id
      WHERE t.id = $1 AND t.workspace_id = $2`,
     [req.params.id, req.user.workspace_id]
