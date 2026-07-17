@@ -199,6 +199,34 @@ async function sendAsReplyViaGraph(token, parentMessageId, mail, attachments, ta
   });
   await assertGraphOk(patchRes, 200, 'PATCH reply draft');
 
+  // createReply seeds the draft with the parent message's inline attachments
+  // (e.g. the original sender's signature logo, embedded via cid:). We never
+  // add the original's attachments deliberately, and we don't want them riding
+  // along on our reply — so list and delete every attachment the draft was
+  // born with before we add our own. Best-effort: a failure here must not block
+  // the send.
+  try {
+    const inheritedRes = await fetch(
+      `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/attachments?$select=id`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (inheritedRes.ok) {
+      const inherited = (await inheritedRes.json()).value || [];
+      for (const att of inherited) {
+        const delRes = await fetch(
+          `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/attachments/${encodeURIComponent(att.id)}`,
+          { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!delRes.ok) console.warn(`${tag} could not delete inherited attachment ${att.id} (HTTP ${delRes.status})`);
+      }
+      if (inherited.length) console.log(`${tag} stripped ${inherited.length} createReply-inherited attachment(s) from draft ${draftId}`);
+    } else {
+      console.warn(`${tag} could not list draft attachments to strip inherited ones (HTTP ${inheritedRes.status})`);
+    }
+  } catch (e) {
+    console.warn(`${tag} error stripping inherited attachments: ${e.message}`);
+  }
+
   if (attachments.length) await addAttachmentsToDraft(token, draftId, attachments, tag);
 
   // 3) Re-read the draft so we get the post-PATCH internetMessageId
