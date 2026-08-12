@@ -415,9 +415,17 @@ const MIGRATIONS = [
   // it lets findOrCreateThread reunite the two halves of a conversation instead
   // of filing the outbound half as its own thread (which then never appears in
   // the Inbox view, since that filter needs a message with folder='INBOX').
+  // Adding a nullable column with no default is a catalog-only change, so this
+  // is instant regardless of table size and is safe to run on boot.
+  //
+  // The matching INDEX deliberately is NOT here — see
+  // backend/scripts/create_conversation_index.sql. Every connection in this pool
+  // gets `SET statement_timeout = '15s'` (see ensurePool below), and a btree
+  // build over `messages` — which stores body_text/body_html inline — will not
+  // finish inside that. It would be cancelled, swallowed by init()'s catch as a
+  // one-line warning, and silently retried on every single deploy while never
+  // actually existing. Build it out of band instead.
   `ALTER TABLE messages ADD COLUMN IF NOT EXISTS provider_conversation_id TEXT`,
-  `CREATE INDEX IF NOT EXISTS idx_messages_conversation
-     ON messages(workspace_id, account_id, provider_conversation_id)`,
   // Reconnect-recovery: any messages whose account_id went NULL after a
   // disconnect get re-linked to whichever current mailbox in the same
   // workspace mentions that address in headers. Idempotent — only touches

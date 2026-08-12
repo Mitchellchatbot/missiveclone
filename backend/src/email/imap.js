@@ -135,22 +135,84 @@ function normalizeAddrList(list) {
   return list.text || '';
 }
 
-// Every email address mentioned in an address field, lower-cased. Handles both
-// shapes we get fed: mailparser gives { text, value: [{ address }] }, while the
-// Graph path builds { text } only — so read `value` when it's there and fall
-// back to scraping the rendered text.
+// Every email address in an address field, lower-cased. Three shapes reach this:
+// mailparser's { text, value: [{ address }] }, mailparser's ARRAY of those (it
+// returns one per header when a message carries duplicate To:/Cc: lines — the
+// reason normalizeAddrList above has an array branch), and the Graph path's
+// { text } with no `value` at all.
+//
+// Structured `value` is strongly preferred over scraping the text: a rendered
+// address list is full of display names, and those routinely contain addresses
+// that are NOT recipients — `"support@x.com via Zendesk" <notifications@x.com>`
+// would otherwise contribute support@x.com as a real correspondent.
+const ADDR_RE = /[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+/g;
+
 function addressesOf(field) {
   if (!field) return [];
-  const out = [];
-  const values = Array.isArray(field) ? field : (field.value || null);
-  if (Array.isArray(values)) {
-    for (const v of values) if (v && v.address) out.push(String(v.address).toLowerCase());
+  // Duplicate-header array: recurse, so each element goes through the same
+  // value-then-text preference instead of being silently skipped.
+  if (Array.isArray(field)) return [...new Set(field.flatMap(addressesOf))];
+
+  if (Array.isArray(field.value) && field.value.length) {
+    const out = field.value
+      .map((v) => v && v.address)
+      .filter(Boolean)
+      .map((a) => String(a).toLowerCase());
+    if (out.length) return [...new Set(out)];
   }
-  const text = Array.isArray(field) ? '' : (field.text || '');
-  for (const m of String(text).matchAll(/[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+/g)) {
-    out.push(m[0].toLowerCase());
+  // No structured value (the Graph path builds `{ text }` only). Split the list
+  // first, then take each entry's <angle-bracketed> address when it has one and
+  // scrape the whole entry when it doesn't — a rendered list legitimately mixes
+  // `Name <addr>` and bare `addr`, so handling only one form drops recipients.
+  // Splitting per entry is also what keeps a display name from contributing:
+  // in `"support@x.com via Zendesk" <notifications@x.com>` only the bracketed
+  // address counts.
+  const out = [];
+  for (const entry of String(field.text || '').split(/[,;]+/)) {
+    const angled = entry.match(/<([^>]*)>/);
+    const source = angled ? angled[1] : entry;
+    for (const m of source.matchAll(ADDR_RE)) out.push(m[0].toLowerCase());
   }
   return [...new Set(out)];
+}
+
+// Match an address inside a comma-joined "Name <addr>" list without matching a
+// longer address that merely contains it. A plain LIKE '%addr%' is far too
+// loose here: `%ann@acme.com%` hits "Jo Ann" <joann@acme.com>, and
+// `%info@acme.com%` hits info@acme.com.br. Anchoring on characters that can't
+// appear adjacent in a real address fixes both. Regex metacharacters in the
+// address (dots, +) are escaped so they can't alter the pattern.
+// Lower-cased addresses of every mailbox connected in a workspace. Cached
+// briefly because findOrCreateThread runs once per ingested message and a full
+// folder walk can be thousands — this must not become a query per message. The
+// set only changes when someone connects or disconnects a mailbox, so a short
+// TTL is plenty; a stale entry just means one message uses the previous set.
+const ACCOUNT_EMAIL_TTL_MS = 60_000;
+const accountEmailCache = new Map(); // workspace_id -> { at, emails:Set }
+
+async function workspaceAccountEmails(workspace_id) {
+  const hit = accountEmailCache.get(workspace_id);
+  if (hit && Date.now() - hit.at < ACCOUNT_EMAIL_TTL_MS) return hit.emails;
+  try {
+    const rows = await many(
+      `SELECT email FROM email_accounts WHERE workspace_id = $1`,
+      [workspace_id]
+    );
+    const emails = new Set(
+      rows.map((r) => String(r.email || '').toLowerCase()).filter(Boolean)
+    );
+    accountEmailCache.set(workspace_id, { at: Date.now(), emails });
+    return emails;
+  } catch {
+    // Never let this block ingest — worst case we treat a sibling mailbox as a
+    // counterparty, which is the behaviour we had before this refinement.
+    return hit ? hit.emails : new Set();
+  }
+}
+
+function addressBoundaryPattern(addr) {
+  const esc = addr.replace(/[.^$*+?()[\]{}|\\]/g, '\\$&');
+  return `(^|[^a-z0-9!#$%&'*+/=?^_\`{|}~.-])${esc}($|[^a-z0-9.-])`;
 }
 
 async function findOrCreateThread(workspace_id, parsed, team_space_id, account_id, account_email) {
@@ -183,6 +245,12 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id, account_i
     const c = await one(
       `SELECT thread_id FROM messages
         WHERE workspace_id = $1 AND account_id = $2 AND provider_conversation_id = $3
+        -- ORDER BY matters: on a conversation that is ALREADY split (the very
+        -- situation this exists to stop) the same conversation id sits on
+        -- messages in both threads, and an unordered LIMIT 1 would pick a
+        -- different one from query to query. Oldest message wins, so everything
+        -- converges on the thread the conversation actually started in.
+        ORDER BY sent_at ASC, id ASC
         LIMIT 1`,
       [workspace_id, account_id, convId]
     );
@@ -207,16 +275,33 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id, account_i
   // collapsing every "Email Account Activity" GoDaddy notification across all
   // 23 mailboxes into one 160-message mega-thread; those share a subject but
   // NOT a correspondent, and account_id still pins us to a single mailbox.
+  //
+  // Cc is deliberately excluded on BOTH sides. Including it makes any address
+  // that is routinely copied — an internal accounting@ or ops@ — a universal
+  // merge key, so two different vendors' "Invoice" threads would join purely
+  // because the same colleague is copied on everything. The old sender-scoped
+  // rule kept those apart and this must too. From/To alone still covers the
+  // case this fix exists for: our Sent copy has the customer in To, and their
+  // thread has them in From.
   const subject = (parsed.subject || '').trim();
   const cleanSubj = subject.replace(/^(re|fwd|fw)\s*:\s*/i, '').trim();
   const selfLower = (account_email || '').toLowerCase();
-  const counterparties = [
-    ...addressesOf(parsed.from),
-    ...addressesOf(parsed.to),
-    ...addressesOf(parsed.cc)
-  ].filter((a) => a && a !== selfLower);
+  // Every mailbox connected in this workspace, not just this one. Two connected
+  // accounts that appear on each other's mail would otherwise be counterparties
+  // for each other and become the same universal merge key as a shared Cc.
+  const ourAddresses = await workspaceAccountEmails(workspace_id);
+  const isOurs = (a) => a === selfLower || ourAddresses.has(a);
+
+  const mentioned = [...new Set([...addressesOf(parsed.from), ...addressesOf(parsed.to)])];
+  let counterparties = mentioned.filter((a) => a && !isOurs(a));
+  // Genuinely self-addressed mail (notes to self) has no counterparty at all.
+  // Skipping the fallback there would start a new thread for every such message
+  // — a regression against the old sender-scoped rule, which matched on our own
+  // address. Fall back to matching on ourselves, which is what it did.
+  if (counterparties.length === 0 && mentioned.length > 0) counterparties = mentioned;
+
   if (cleanSubj && account_id && counterparties.length) {
-    const patterns = [...new Set(counterparties)].map((a) => `%${a}%`);
+    const patterns = counterparties.map(addressBoundaryPattern);
     const t = await one(
       `SELECT t.id FROM threads t
         WHERE t.workspace_id = $1
@@ -226,9 +311,8 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id, account_i
              WHERE m.thread_id = t.id
                AND m.account_id = $3
                AND (
-                 LOWER(m.from_addr) LIKE ANY($4::text[])
-                 OR LOWER(m.to_addrs) LIKE ANY($4::text[])
-                 OR LOWER(m.cc_addrs) LIKE ANY($4::text[])
+                 LOWER(m.from_addr) ~ ANY($4::text[])
+                 OR LOWER(m.to_addrs) ~ ANY($4::text[])
                )
           )
         ORDER BY t.last_message_at DESC
@@ -368,6 +452,20 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
       [messageId, acc.id, dir]
     );
     if (dup) {
+      // Backfill the provider conversation id onto a message stored before that
+      // column existed. Without this the Graph half of the threading fix only
+      // ever helps mail that arrives AFTER deploy: this short-circuit returns
+      // before the INSERT, so /rescan-all (which clears the delta cursor and
+      // re-walks every message) would re-see every message and write none of
+      // them. Only fills NULLs, so it never overwrites a known value.
+      const convId = parsed._graphConversationId || null;
+      if (convId) {
+        await query(
+          `UPDATE messages SET provider_conversation_id = $1
+            WHERE id = $2 AND provider_conversation_id IS NULL`,
+          [convId, dup.id]
+        );
+      }
       // Backfill attachments onto a message we already stored without them.
       // Anything synced before the inbound attachment fixes (the
       // hasAttachments-gate removal + $value-for-all in graph.js) was ingested
