@@ -9,16 +9,25 @@
 -- The ingest fix stops NEW splits; this repairs existing ones.
 --
 --
--- ============================ MEASURED, NOT GUESSED ==========================
--- Everything below was run read-only against production on 2026-08-13
--- (PostgreSQL 17.6, 36,798 threads / 100,144 messages / 31 mailboxes):
+-- ############################################################################
+-- ##  DO NOT RUN SECTION 3 UNSUPERVISED. The APPLY block has NEVER been     ##
+-- ##  executed anywhere. Sections 1-2 have been, read-only, against         ##
+-- ##  production. Take a database snapshot first, and re-run every dry-run  ##
+-- ##  query in section 2 — the numbers below are from 2026-08-13 and the    ##
+-- ##  data moves.                                                           ##
+-- ############################################################################
 --
---   pairs that would merge ......... 479   (1,313 messages, 1.3% of all mail)
---   winners absorbing 1 loser ...... 243
---   winners absorbing 2-3 .......... 67
+-- ============================ MEASURED, NOT GUESSED ==========================
+-- Run read-only against production on 2026-08-13 (PostgreSQL 17.6,
+-- 36,798 threads / 100,144 messages / 31 mailboxes):
+--
+--   pairs that would merge ......... 456   (1,061 messages, ~1% of all mail)
+--   losers that are 1-2 person
+--     conversations ................ 411   ← the real signature of the bug
 --   worst case ..................... 8 losers into one winner
 --   threads that are BOTH loser
 --     and winner (cycle risk) ...... 0     ← proven, see "ACYCLIC" below
+--   losers that are automated/bulk .. 0
 --   biggest resulting thread ....... 213 messages — and 29 threads are already
 --                                    over 200 today (largest 622), so the merge
 --                                    is not what creates large threads.
@@ -26,9 +35,6 @@
 -- The originally-reported conversation resolves correctly:
 --   c20e0853… (2 msgs, 0 inbound, 0 in INBOX folder)
 --     → 17af46af… (4 msgs, all inbound)  = one 6-message thread, inbox-visible.
---
--- The APPLY block itself has still NEVER BEEN EXECUTED. Sections 1-2 have.
--- Take a snapshot before section 3.
 -- =============================================================================
 --
 -- RUN ORDER:
@@ -51,6 +57,15 @@
 --     "Missive updates: …" (newsletter) .... 16
 -- because a shared automated sender IS a shared correspondent. Excluding our own
 -- mailboxes was not nearly enough.
+--
+-- A later pass found the same failure in gentler form: with only "a shared
+-- correspondent" required, two marketing blasts merged because they happened to
+-- share ONE recipient — "Your Monthly SEO Update" and "Your Blog Traffic Just
+-- Got a Boost", whose recipient lists cover completely unrelated clients. Hence
+-- the subset requirement and the 5-correspondent cap below: overlap says these
+-- two mailings touched the same person, containment says they are the same
+-- conversation. Note the automated/bulk flag does NOT catch these — all 456
+-- losers have is_automated = 0, so it cannot be relied on.
 --
 -- So the rule now matches the BUG SIGNATURE instead of merely matching topics:
 --   * the LOSER must be an orphaned Sent copy — inbox_count = 0 and at least one
@@ -129,11 +144,21 @@ JOIN thread_merge_identity w
   AND lower(w.clean_subject) <> '(no subject)'
   AND w.thread_id    <> l.thread_id
   AND w.account_ids     && l.account_ids     -- same mailbox
-  AND w.correspondents  && l.correspondents  -- and a shared outside party
-  -- Don't let an ancient thread swallow a current one. The ::bigint is
-  -- load-bearing: 180 * 86400 * 1000 is 15,552,000,000, which overflows int4 —
-  -- verified, it raises "integer out of range" and takes the dry run with it.
-  AND abs(w.last_message_at - l.last_message_at) <= 180::bigint * 86400 * 1000
+  -- SUBSET, not mere overlap. Overlap alone lets two marketing blasts merge
+  -- because they happen to share one recipient: measured, that pulled in
+  -- "Your Monthly SEO Update" and "Your Blog Traffic Just Got a Boost", whose
+  -- recipient lists span completely unrelated clients. Requiring one side's
+  -- people to be contained in the other's is what makes them the same
+  -- conversation rather than merely the same mailing.
+  AND (l.correspondents <@ w.correspondents OR w.correspondents <@ l.correspondents)
+  -- And a broadcast is not a conversation. 411 of the real splits involve 1-2
+  -- people; anything with a long recipient list is a mailing.
+  AND array_length(l.correspondents, 1) <= 5
+  -- Don't let an old thread swallow a current one. 356 of the real splits are
+  -- under a day apart and 456 within 30, so 30 days is generous. The ::bigint is
+  -- load-bearing: 180 * 86400 * 1000 overflows int4 — verified, it raises
+  -- "integer out of range" and takes the dry run with it.
+  AND abs(w.last_message_at - l.last_message_at) <= 30::bigint * 86400 * 1000
 WHERE l.inbox_count = 0 AND l.out_count > 0   -- loser: orphaned Sent copy
   AND w.inbox_count > 0                       -- winner: holds the received mail
 -- Most inbound content wins, then oldest, then id — deterministic.
@@ -347,19 +372,22 @@ ORDER BY l.thread_id, w.inbox_count DESC, w.last_message_at ASC, w.thread_id ASC
 -- DD stores these thread ids as free text with NO foreign key, so nothing above
 -- touched them. Measured against production for the current 479-thread plan:
 --
---   thread_read_state ............ 87 rows   ← users' read markers; those
---                                              threads reappear as unread
---   email_satisfaction_scores .... 246 rows  ← scores orphaned
---   inbox_drafts ................. 0 rows    ← no typed replies at risk today
---   bulk_email_threads ........... 0 rows    ← SEO-blast touchpoint backstop safe
---   email_intake_log ............. 0 rows
---   scheduled_emails ............. 0 rows
+--   thread_read_state ............  86 of 2,850 rows  ← read markers; those
+--                                                       threads reappear unread
+--   email_satisfaction_scores .... 155 of 3,134 rows  ← scores orphaned
+--   inbox_drafts .................   0 of 36 rows     ← no typed reply at risk
+--   bulk_email_threads ...........   0 of 19 rows     ← SEO-blast backstop safe
+--   email_intake_log .............   0 of 5,661 rows
+--   scheduled_emails .............   0 of 1 row
 --   email_drafts ................. n/a — no thread_id column
 --   routing_review ............... n/a — table does not exist
 --
--- So today the damage is 333 rows of read-state and scores: annoying, not
--- destructive. RE-MEASURE BEFORE RUNNING — inbox_drafts being 0 is luck, not a
--- guarantee, and it is the one that would lose a user's typed reply.
+-- The totals are quoted deliberately: "0 affected" only means something because
+-- those tables are populated. So today the damage is 241 rows of read-state and
+-- satisfaction scores — annoying, not destructive.
+--
+-- RE-MEASURE BEFORE RUNNING. inbox_drafts being 0 is luck, not a guarantee, and
+-- it is the one that would lose a user's typed reply.
 --
 -- Export the mapping:
 --   \copy (SELECT DISTINCT from_thread_id, to_thread_id FROM thread_merge_log \

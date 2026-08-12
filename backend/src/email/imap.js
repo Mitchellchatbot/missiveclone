@@ -300,6 +300,20 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id, account_i
   // address. Fall back to matching on ourselves, which is what it did.
   if (counterparties.length === 0 && mentioned.length > 0) counterparties = mentioned;
 
+  // Mass sends do not get the subject fallback at all. A marketing blast goes to
+  // many people under one subject, and the moment two such sends share a single
+  // recipient the subject rule would chain them into one thread — measured on
+  // production, one blast subject had 43 threads in a mailbox of which 35 shared
+  // a recipient with another. Above this many correspondents the message is a
+  // broadcast, not a conversation, so it starts its own thread; a genuine
+  // reply-all still threads via the RFC chain or the conversation id, which both
+  // run before this. (The OLD rule was worse here — it matched on OUR OWN
+  // from_addr, which is present in every blast thread, so it merged all of them.)
+  const MAX_FALLBACK_CORRESPONDENTS = 5;
+  if (counterparties.length > MAX_FALLBACK_CORRESPONDENTS) {
+    counterparties = [];
+  }
+
   if (cleanSubj && account_id && counterparties.length) {
     const patterns = counterparties.map(addressBoundaryPattern);
     const t = await one(
