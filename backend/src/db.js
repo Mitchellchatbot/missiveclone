@@ -407,6 +407,17 @@ const MIGRATIONS = [
   // deletes, and the reconnect-recovery UPDATE just below. Without it,
   // those scans walk the entire messages table.
   `CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account_id)`,
+  // Microsoft's own conversation grouping. Graph hands us a conversationId on
+  // every message and it is STABLE across the inbox copy and the sender's Sent
+  // copy of the same exchange — which is exactly the link RFC threading loses
+  // when a client omits In-Reply-To, or when the Sent copy is ingested before
+  // the message it replies to. We used to compute it and throw it away; storing
+  // it lets findOrCreateThread reunite the two halves of a conversation instead
+  // of filing the outbound half as its own thread (which then never appears in
+  // the Inbox view, since that filter needs a message with folder='INBOX').
+  `ALTER TABLE messages ADD COLUMN IF NOT EXISTS provider_conversation_id TEXT`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_conversation
+     ON messages(workspace_id, account_id, provider_conversation_id)`,
   // Reconnect-recovery: any messages whose account_id went NULL after a
   // disconnect get re-linked to whichever current mailbox in the same
   // workspace mentions that address in headers. Idempotent — only touches

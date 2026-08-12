@@ -135,7 +135,25 @@ function normalizeAddrList(list) {
   return list.text || '';
 }
 
-async function findOrCreateThread(workspace_id, parsed, team_space_id, account_id) {
+// Every email address mentioned in an address field, lower-cased. Handles both
+// shapes we get fed: mailparser gives { text, value: [{ address }] }, while the
+// Graph path builds { text } only — so read `value` when it's there and fall
+// back to scraping the rendered text.
+function addressesOf(field) {
+  if (!field) return [];
+  const out = [];
+  const values = Array.isArray(field) ? field : (field.value || null);
+  if (Array.isArray(values)) {
+    for (const v of values) if (v && v.address) out.push(String(v.address).toLowerCase());
+  }
+  const text = Array.isArray(field) ? '' : (field.text || '');
+  for (const m of String(text).matchAll(/[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+/g)) {
+    out.push(m[0].toLowerCase());
+  }
+  return [...new Set(out)];
+}
+
+async function findOrCreateThread(workspace_id, parsed, team_space_id, account_id, account_email) {
   // RFC 5322 threading first — Message-ID chain via In-Reply-To /
   // References. This is the only path that's safe across accounts;
   // a real reply chain genuinely belongs in one thread.
@@ -154,17 +172,51 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id, account_i
     if (m) return m.thread_id;
   }
 
+  // Provider conversation id (Microsoft Graph). RFC threading above misses
+  // whenever the headers aren't there to follow — the client didn't set
+  // In-Reply-To, or we're ingesting the Sent copy before the message it
+  // answers. Graph's conversationId covers exactly that gap: it's the same
+  // value on the inbox copy and the sent copy of one exchange. Scoped to the
+  // same account because conversationId is only unique within a mailbox.
+  const convId = parsed._graphConversationId || null;
+  if (convId && account_id) {
+    const c = await one(
+      `SELECT thread_id FROM messages
+        WHERE workspace_id = $1 AND account_id = $2 AND provider_conversation_id = $3
+        LIMIT 1`,
+      [workspace_id, account_id, convId]
+    );
+    if (c) return c.thread_id;
+  }
+
   // Subject-based fallback — used when the email is the first in a
-  // conversation (no In-Reply-To). Scoped to the SAME account_id +
-  // SAME sender so unrelated notification emails to different
-  // mailboxes don't merge. Previous behavior was workspace-wide
-  // subject match, which collapsed every "Email Account Activity"
-  // GoDaddy notification across all 23 mailboxes into one
-  // 160-message mega-thread. Don't do that.
+  // conversation (no In-Reply-To) and we have no conversation id either
+  // (i.e. the IMAP path). Scoped to the SAME account_id, and to a thread this
+  // message shares a COUNTERPARTY with.
+  //
+  // It used to require an existing message *from the same sender*, which
+  // quietly broke the common case: our own outbound copy of a reply, arriving
+  // with no usable headers, found no message from US in the customer's thread
+  // and so started a second thread — one holding only our sent mail, invisible
+  // in the Inbox view (that filter needs a message with folder='INBOX'). Worse,
+  // it was self-reinforcing: the new thread now DID contain a message from us,
+  // so every later send matched it and the conversation stayed split forever.
+  //
+  // Matching on the counterparty instead keeps the guard that mattered. The
+  // incident this scoping was added for was a workspace-wide subject match
+  // collapsing every "Email Account Activity" GoDaddy notification across all
+  // 23 mailboxes into one 160-message mega-thread; those share a subject but
+  // NOT a correspondent, and account_id still pins us to a single mailbox.
   const subject = (parsed.subject || '').trim();
   const cleanSubj = subject.replace(/^(re|fwd|fw)\s*:\s*/i, '').trim();
-  const fromAddrLower = (parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address || '').toLowerCase();
-  if (cleanSubj && account_id && fromAddrLower) {
+  const selfLower = (account_email || '').toLowerCase();
+  const counterparties = [
+    ...addressesOf(parsed.from),
+    ...addressesOf(parsed.to),
+    ...addressesOf(parsed.cc)
+  ].filter((a) => a && a !== selfLower);
+  if (cleanSubj && account_id && counterparties.length) {
+    const patterns = [...new Set(counterparties)].map((a) => `%${a}%`);
     const t = await one(
       `SELECT t.id FROM threads t
         WHERE t.workspace_id = $1
@@ -173,11 +225,15 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id, account_i
             SELECT 1 FROM messages m
              WHERE m.thread_id = t.id
                AND m.account_id = $3
-               AND LOWER(m.from_addr) LIKE '%' || $4 || '%'
+               AND (
+                 LOWER(m.from_addr) LIKE ANY($4::text[])
+                 OR LOWER(m.to_addrs) LIKE ANY($4::text[])
+                 OR LOWER(m.cc_addrs) LIKE ANY($4::text[])
+               )
           )
         ORDER BY t.last_message_at DESC
         LIMIT 1`,
-      [workspace_id, cleanSubj, account_id, fromAddrLower]
+      [workspace_id, cleanSubj, account_id, patterns]
     );
     if (t) return t.id;
   }
@@ -337,7 +393,7 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     }
   }
 
-  const threadId = await findOrCreateThread(acc.workspace_id, parsed, acc.team_space_id, acc.id);
+  const threadId = await findOrCreateThread(acc.workspace_id, parsed, acc.team_space_id, acc.id, acc.email);
   const id = uuid();
   const sentAt = parsed.date ? new Date(parsed.date).getTime() : Date.now();
   const attachments = Array.isArray(parsed.attachments) ? parsed.attachments : [];
@@ -347,8 +403,8 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     `INSERT INTO messages
       (id, thread_id, account_id, workspace_id, direction, folder, message_id, in_reply_to,
        subject, from_addr, to_addrs, cc_addrs, body_text, body_html, sent_at, imap_uid,
-       has_attachments, created_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+       has_attachments, created_at, provider_conversation_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
     [
       id, threadId, acc.id, acc.workspace_id, dir, folder || null, messageId || null,
       (parsed.inReplyTo || '').replace(/[<>]/g, '') || null,
@@ -358,7 +414,9 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
       normalizeAddrList(parsed.cc),
       parsed.text || '',
       parsed.html || '',
-      sentAt, uid, hasAtt, Date.now()
+      sentAt, uid, hasAtt, Date.now(),
+      // Null on the IMAP path — only Graph gives us a conversation id.
+      parsed._graphConversationId || null
     ]
   );
 
