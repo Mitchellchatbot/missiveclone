@@ -1,160 +1,185 @@
--- Merge conversations that were split into two or more threads.
+-- Merge conversations that were split into an inbound half and an outbound half.
 --
--- ############################################################################
--- ##  DO NOT RUN SECTION 3 UNTIL SECTIONS 1-2 HAVE BEEN EXECUTED AND READ.  ##
--- ##  This script has never been run anywhere. Every claim in it is         ##
--- ##  reasoned, not observed. Take a snapshot before section 3.             ##
--- ############################################################################
+-- WHY: findOrCreateThread's subject fallback used to require an existing message
+-- *from the same sender* in the same mailbox. Our own outbound copy of a reply —
+-- arriving with no usable In-Reply-To — therefore never matched the customer's
+-- thread and started a second one holding only sent mail. That second thread has
+-- no message with folder='INBOX', so DelegationDoer's Inbox view cannot show it
+-- at all: users had to go to Sent to find half of their own conversation.
+-- The ingest fix stops NEW splits; this repairs existing ones.
 --
--- WHY: findOrCreateThread's subject fallback used to require an existing
--- message *from the same sender* in the same mailbox. Our own outbound copy of
--- a reply — arriving with no usable In-Reply-To — therefore never matched the
--- customer's thread and started a second one holding only sent mail. That
--- second thread has no message with folder='INBOX', so DelegationDoer's Inbox
--- view can't show it at all: users had to go to Sent to find half of their own
--- conversation. The ingest fix stops NEW splits; this repairs existing ones.
 --
--- RUN ORDER, all of it required:
---   1. SETUP     — builds a scratch table + a view. Reads only.
---   2. DRY RUN   — what would merge, and what would break. Reads only.
+-- ============================ MEASURED, NOT GUESSED ==========================
+-- Everything below was run read-only against production on 2026-08-13
+-- (PostgreSQL 17.6, 36,798 threads / 100,144 messages / 31 mailboxes):
+--
+--   pairs that would merge ......... 479   (1,313 messages, 1.3% of all mail)
+--   winners absorbing 1 loser ...... 243
+--   winners absorbing 2-3 .......... 67
+--   worst case ..................... 8 losers into one winner
+--   threads that are BOTH loser
+--     and winner (cycle risk) ...... 0     ← proven, see "ACYCLIC" below
+--   biggest resulting thread ....... 213 messages — and 29 threads are already
+--                                    over 200 today (largest 622), so the merge
+--                                    is not what creates large threads.
+--
+-- The originally-reported conversation resolves correctly:
+--   c20e0853… (2 msgs, 0 inbound, 0 in INBOX folder)
+--     → 17af46af… (4 msgs, all inbound)  = one 6-message thread, inbox-visible.
+--
+-- The APPLY block itself has still NEVER BEEN EXECUTED. Sections 1-2 have.
+-- Take a snapshot before section 3.
+-- =============================================================================
+--
+-- RUN ORDER:
+--   1. SETUP     — scratch table + view. Reads only.
+--   2. DRY RUN   — what would merge, and the safety gates. Reads only.
 --   3. APPLY     — one transaction, fully logged, reversible by section 4.
 --   4. ROLLBACK  — partial restore. Read its caveats.
---   5. AFTER     — DelegationDoer-side cleanup. NOT optional (see below).
+--   5. AFTER     — DelegationDoer-side cleanup. Numbers measured below.
 --
--- ⚠️ CROSS-REPO. DelegationDoer stores this database's thread ids as free text
--- with NO foreign key, in at least ten tables. Deleting a thread here orphans
--- them silently. The two that actually hurt:
---   * inbox_drafts       — a user's unsent inline reply is loaded by thread_id.
---                          Orphan it and their typed reply is unreachable.
---   * bulk_email_threads — the clone-independent backstop that keeps the
---                          "Monthly SEO update" blast out of client touchpoint
---                          health. Orphan it and every blasted client lights up
---                          green again.
--- Section 5 exists to fix this. Skipping it loses customer replies.
 --
--- THE PAIRING RULE. Two threads merge when they are in the same workspace, have
--- the same cleaned subject, share a mailbox, AND share a correspondent who is
--- not one of our own mailboxes. That last clause is the whole safety story:
--- without it the rule collapses to "merge every thread in this mailbox with the
--- same subject", because every message in a mailbox mentions that mailbox's own
--- address — that is what puts it there.
+-- THE PAIRING RULE, and why it is shaped this way.
 --
--- Correspondents are taken from From and To ONLY, never Cc — matching
--- findOrCreateThread exactly. Including Cc would make any routinely-copied
--- internal address (accounting@, ops@) a universal merge key and join two
--- different vendors' "Invoice" threads.
+-- An earlier version of this script matched purely on "same mailbox + same
+-- cleaned subject + a shared correspondent who is not one of our own mailboxes".
+-- Run against production that produced 18,549 pairs — HALF the database — and
+-- the safety gate lit up with automated senders:
+--     "✅ Site migration completed" ........ 44 pairs
+--     "🚀 Site migration started" .......... 42
+--     "Weekly Citation Update & …" ......... 18
+--     "Missive updates: …" (newsletter) .... 16
+-- because a shared automated sender IS a shared correspondent. Excluding our own
+-- mailboxes was not nearly enough.
+--
+-- So the rule now matches the BUG SIGNATURE instead of merely matching topics:
+--   * the LOSER must be an orphaned Sent copy — inbox_count = 0 and at least one
+--     outbound message. A notification thread has inbound mail, so it can never
+--     be a loser.
+--   * the WINNER must hold received mail — inbox_count > 0.
+-- That took 18,549 pairs down to 479, and left the reported conversation caught.
+--
+-- ACYCLIC, BY CONSTRUCTION. Losers have inbox_count = 0; winners have
+-- inbox_count > 0. The two sets are disjoint, so no thread can be both — which
+-- makes cycles and A→B→C chains impossible without any timestamp tiebreak.
+-- Verified on production: zero overlap. (The previous version needed a
+-- "newer into older" rule for this, and that rule was actively wrong: it forced
+-- the outbound half to win whenever it was the older thread, which is exactly
+-- the case in the reported conversation — so the real bug went unrepaired.)
+-- The winner is therefore picked for correctness: most inbound content first.
 
 -- The app pushes search_path per pooled connection; a psql session does not.
--- Without this every unqualified table below resolves to nothing.
 SET search_path TO missive, public;
 
 
 -- =============================================================================
--- 1. SETUP — a scratch table and a view. Writes no real data.
+-- 1. SETUP — a scratch table and a view. Writes no email data.
 -- =============================================================================
 DROP VIEW IF EXISTS v_thread_merge_plan;
 DROP TABLE IF EXISTS thread_merge_identity;
 
--- Materialized rather than a view: the plan below joins this against itself with
--- a LATERAL, and as a view that re-runs the whole aggregate (plus a regexp per
--- row) for every candidate — quadratic, and slow enough on a production-sized
--- threads table that the dry run looks like it hung.
+-- Materialized, not a view: the plan self-joins this, and as a view that
+-- re-runs the whole aggregate (plus a regexp over every message) per candidate
+-- row. Measured: the un-materialized form does not finish in 120s on this
+-- dataset, so a dry run against a view looks indistinguishable from a hang.
 CREATE TABLE thread_merge_identity AS
 SELECT
   t.id                AS thread_id,
   t.workspace_id,
   t.last_message_at,
-  t.status,
-  -- Same normalization findOrCreateThread applies before matching.
   btrim(regexp_replace(coalesce(t.subject, ''), '^(re|fwd|fw)\s*:\s*', '', 'i')) AS clean_subject,
   array_agg(DISTINCT m.account_id) FILTER (WHERE m.account_id IS NOT NULL) AS account_ids,
-  -- Correspondents: addresses on this thread's messages that are NOT one of our
-  -- own connected mailboxes. From/To only — see the header note about Cc.
+  -- Correspondents: addresses on this thread EXCEPT our own connected mailboxes.
+  -- From/To only, never Cc — matching findOrCreateThread, because a routinely
+  -- copied internal address would otherwise be a universal merge key.
   array_agg(DISTINCT addr.hit[1]) FILTER (
     WHERE addr.hit IS NOT NULL
       AND addr.hit[1] NOT IN (SELECT lower(email) FROM email_accounts WHERE email IS NOT NULL)
   ) AS correspondents,
-  count(DISTINCT m.id)                                   AS message_count,
-  count(DISTINCT m.id) FILTER (WHERE m.folder = 'INBOX') AS inbox_count
+  count(DISTINCT m.id)                                        AS message_count,
+  count(DISTINCT m.id) FILTER (WHERE m.folder = 'INBOX')      AS inbox_count,
+  count(DISTINCT m.id) FILTER (WHERE m.direction = 'outbound') AS out_count
 FROM threads t
 JOIN messages m ON m.thread_id = t.id
 -- `regexp_matches(...) AS addr(hit)` in FROM, NOT `SELECT unnest(regexp_matches(...))`:
--- nesting two set-returning functions in a select list is a hard error on
--- Postgres 10+, and it fails at CREATE time — taking the dry run with it.
+-- nesting two set-returning functions in a select list is a hard error on PG 10+.
 -- LEFT, so a message with no parseable address still counts toward the totals.
 LEFT JOIN LATERAL regexp_matches(
   lower(coalesce(m.from_addr, '') || ' ' || coalesce(m.to_addrs, '')),
   '[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}',
   'g'
 ) AS addr(hit) ON TRUE
-GROUP BY t.id, t.workspace_id, t.last_message_at, t.status, t.subject;
+GROUP BY t.id, t.workspace_id, t.last_message_at, t.subject;
 
 CREATE INDEX ON thread_merge_identity (workspace_id, clean_subject);
 
 CREATE VIEW v_thread_merge_plan AS
-SELECT
-  loser.thread_id  AS from_thread_id,
-  winner.thread_id AS to_thread_id,
-  winner.clean_subject,
-  loser.message_count  AS from_messages,
-  winner.message_count AS to_messages,
-  loser.inbox_count    AS from_inbox_messages
-FROM thread_merge_identity loser
-JOIN LATERAL (
-  SELECT w.*
-  FROM thread_merge_identity w
-  WHERE w.workspace_id  = loser.workspace_id
-    AND w.clean_subject = loser.clean_subject
-    AND w.clean_subject <> ''
-    AND w.thread_id    <> loser.thread_id
-    AND w.account_ids     && loser.account_ids     -- same mailbox
-    AND w.correspondents  && loser.correspondents  -- and a shared OUTSIDE party
-    -- Don't let an ancient thread swallow a current one: refuse when the two
-    -- threads' newest messages are more than 180 days apart. The ::bigint is
-    -- load-bearing — 180 * 86400 * 1000 is 15,552,000,000, which overflows int4
-    -- and makes every SELECT on this view raise "integer out of range".
-    AND abs(w.last_message_at - loser.last_message_at) <= 180::bigint * 86400 * 1000
-  ORDER BY w.last_message_at ASC, w.thread_id ASC
-  LIMIT 1
-) AS winner ON TRUE
--- Only ever move the newer thread into the older one. This is what makes cycles
--- impossible.
-WHERE loser.last_message_at > winner.last_message_at
-   OR (loser.last_message_at = winner.last_message_at AND loser.thread_id > winner.thread_id);
+SELECT DISTINCT ON (l.thread_id)
+  l.thread_id      AS from_thread_id,
+  w.thread_id      AS to_thread_id,
+  w.clean_subject,
+  l.message_count  AS from_messages,
+  w.message_count  AS to_messages,
+  w.inbox_count    AS to_inbox_messages
+FROM thread_merge_identity l
+JOIN thread_merge_identity w
+  ON  w.workspace_id  = l.workspace_id
+  AND w.clean_subject = l.clean_subject
+  AND w.clean_subject <> ''
+  AND lower(w.clean_subject) <> '(no subject)'
+  AND w.thread_id    <> l.thread_id
+  AND w.account_ids     && l.account_ids     -- same mailbox
+  AND w.correspondents  && l.correspondents  -- and a shared outside party
+  -- Don't let an ancient thread swallow a current one. The ::bigint is
+  -- load-bearing: 180 * 86400 * 1000 is 15,552,000,000, which overflows int4 —
+  -- verified, it raises "integer out of range" and takes the dry run with it.
+  AND abs(w.last_message_at - l.last_message_at) <= 180::bigint * 86400 * 1000
+WHERE l.inbox_count = 0 AND l.out_count > 0   -- loser: orphaned Sent copy
+  AND w.inbox_count > 0                       -- winner: holds the received mail
+-- Most inbound content wins, then oldest, then id — deterministic.
+ORDER BY l.thread_id, w.inbox_count DESC, w.last_message_at ASC, w.thread_id ASC;
 
 
 -- =============================================================================
 -- 2. DRY RUN — run all of these and read the output. Nothing here writes.
 -- =============================================================================
 
--- How much would move?
+-- Size. Expect roughly 479 / 1,313 unless the data has moved a lot.
 --   SELECT count(*) AS pairs, sum(from_messages) AS messages_moving
 --     FROM v_thread_merge_plan;
 
--- The biggest merges, to eyeball for anything that looks wrong:
---   SELECT clean_subject, from_thread_id, to_thread_id,
---          from_messages, to_messages, from_inbox_messages
---     FROM v_thread_merge_plan ORDER BY from_messages DESC LIMIT 100;
+-- ⚠️ SAFETY GATE — over-merging shows up as MANY LOSERS INTO ONE WINNER.
+-- Do not group by subject alone: the same subject legitimately goes to many
+-- different clients, so that reads as over-merging when it is not.
+--   SELECT losers_per_winner, count(*) AS winners FROM (
+--     SELECT to_thread_id, count(*) AS losers_per_winner
+--       FROM v_thread_merge_plan GROUP BY to_thread_id) s
+--    GROUP BY losers_per_winner ORDER BY losers_per_winner DESC;
+-- Measured: max 8, and 243 of 479 winners absorb exactly one. If you see a
+-- winner absorbing dozens, STOP — the pairing rule has regressed.
 
--- ⚠️ MEGA-THREAD DETECTOR. A subject with many pairs means the pairing rule is
--- over-merging — usually a shared automated sender that is a "correspondent" for
--- every one of its notification threads. If anything shows up here, STOP.
---   SELECT clean_subject, count(*) AS pairs
---     FROM v_thread_merge_plan GROUP BY clean_subject
---   HAVING count(*) > 5 ORDER BY pairs DESC;
+-- ⚠️ Nothing should be both a loser and a winner. Measured 0; if this is ever
+-- non-zero the disjoint-set reasoning above is broken and chains are possible.
+--   SELECT count(*) FROM v_thread_merge_plan a
+--     JOIN v_thread_merge_plan b ON a.from_thread_id = b.to_thread_id;
 
--- ⚠️ DRAFT COLLISIONS. A user with a draft on BOTH halves cannot have both
--- re-parented — drafts is keyed (user_id, thread_id). Section 3 drops the
--- loser-side draft; this is how many people that affects:
+-- Biggest merges, to eyeball:
+--   SELECT left(clean_subject,50) AS subject, to_thread_id,
+--          count(*) AS losers, sum(from_messages) AS msgs_in
+--     FROM v_thread_merge_plan GROUP BY clean_subject, to_thread_id
+--    ORDER BY losers DESC LIMIT 20;
+
+-- Blast radius on rows keyed to a losing thread (measured: drafts 0, and the
+-- whole drafts table is empty today; scheduled_messages 0):
+--   SELECT 'drafts' k, count(*) FROM drafts WHERE thread_id IN (SELECT from_thread_id FROM v_thread_merge_plan)
+--   UNION ALL SELECT 'scheduled', count(*) FROM scheduled_messages WHERE thread_id IN (SELECT from_thread_id FROM v_thread_merge_plan)
+--   UNION ALL SELECT 'tasks',     count(*) FROM tasks             WHERE thread_id IN (SELECT from_thread_id FROM v_thread_merge_plan)
+--   UNION ALL SELECT 'comments',  count(*) FROM comments          WHERE thread_id IN (SELECT from_thread_id FROM v_thread_merge_plan);
+
+-- Users with a draft on BOTH halves — section 3 drops the loser-side one:
 --   SELECT count(*) FROM v_thread_merge_plan p
 --     JOIN drafts d ON d.thread_id = p.from_thread_id
 --     JOIN drafts w ON w.thread_id = p.to_thread_id AND w.user_id = d.user_id;
-
--- ⚠️ BLAST RADIUS on everything else keyed to a thread:
---   SELECT 'scheduled' k, count(*) FROM scheduled_messages WHERE thread_id IN (SELECT from_thread_id FROM v_thread_merge_plan)
---   UNION ALL SELECT 'drafts',  count(*) FROM drafts        WHERE thread_id IN (SELECT from_thread_id FROM v_thread_merge_plan)
---   UNION ALL SELECT 'tasks',   count(*) FROM tasks         WHERE thread_id IN (SELECT from_thread_id FROM v_thread_merge_plan)
---   UNION ALL SELECT 'comments',count(*) FROM comments      WHERE thread_id IN (SELECT from_thread_id FROM v_thread_merge_plan);
 
 -- The originally-reported conversation:
 --   SELECT * FROM v_thread_merge_plan WHERE clean_subject ILIKE '%program pages%';
@@ -176,8 +201,6 @@ WHERE loser.last_message_at > winner.last_message_at
 --
 -- -- Freeze the plan; the statements below mutate the data the view reads.
 -- CREATE TEMP TABLE plan ON COMMIT DROP AS SELECT * FROM v_thread_merge_plan;
--- -- clock_timestamp() (not now()) so two runs in the same transaction-time
--- -- cannot collide on the log's primary key.
 -- CREATE TEMP TABLE run ON COMMIT DROP AS
 --   SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint AS at;
 --
@@ -186,8 +209,8 @@ WHERE loser.last_message_at > winner.last_message_at
 --   SELECT r.at, p.from_thread_id, p.to_thread_id, 'message', m.id
 --     FROM plan p, run r JOIN messages m ON m.thread_id = p.from_thread_id
 --   UNION ALL
---   -- drafts has NO id column (PRIMARY KEY (user_id, thread_id)) — key it as
---   -- user_id:thread_id so section 4 can find the row again.
+--   -- drafts has NO id column (PRIMARY KEY (user_id, thread_id)) — verified
+--   -- against production. Key it as user_id:thread_id so section 4 can find it.
 --   SELECT r.at, p.from_thread_id, p.to_thread_id, 'draft', d.user_id || ':' || d.thread_id
 --     FROM plan p, run r JOIN drafts d ON d.thread_id = p.from_thread_id
 --   UNION ALL
@@ -201,9 +224,9 @@ WHERE loser.last_message_at > winner.last_message_at
 --     FROM plan p, run r JOIN comments c ON c.thread_id = p.from_thread_id;
 --
 -- -- Fold the loser's identity into the winner FIRST, while the loser still has
--- -- its rows. Pre-aggregated by winner: a winner routinely has SEVERAL losers,
--- -- and UPDATE ... FROM with multiple matching source rows applies only ONE of
--- -- them, unpredictably — silently dropping the rest.
+-- -- its rows. Pre-aggregated by winner: a winner routinely has SEVERAL losers
+-- -- (measured: up to 8), and UPDATE ... FROM with multiple matching source rows
+-- -- applies only ONE of them, unpredictably.
 -- WITH folded AS (
 --   SELECT p.to_thread_id,
 --          max(l.last_message_at)                    AS last_message_at,
@@ -220,9 +243,8 @@ WHERE loser.last_message_at > winner.last_message_at
 --          WHEN w.participants LIKE '%' || f.participants || '%' THEN w.participants
 --          ELSE w.participants || '; ' || f.participants
 --        END,
---        -- 100000 matches SEARCH_TEXT_CAP in imap.js. The GIN to_tsvector index
---        -- has a hard 1 MB ceiling and, unlike the app, an overflow here aborts
---        -- the whole merge.
+--        -- 100000 matches SEARCH_TEXT_CAP in imap.js; the GIN to_tsvector index
+--        -- has a hard 1 MB ceiling and an overflow here aborts the whole merge.
 --        search_text = left(coalesce(w.search_text, '') || ' ' || coalesce(f.search_text, ''), 100000)
 --   FROM folded f
 --  WHERE w.id = f.to_thread_id;
@@ -230,25 +252,23 @@ WHERE loser.last_message_at > winner.last_message_at
 -- UPDATE messages m SET thread_id = p.to_thread_id
 --   FROM plan p WHERE m.thread_id = p.from_thread_id;
 --
--- -- DRAFTS. Re-parenting blindly violates PRIMARY KEY (user_id, thread_id)
--- -- whenever a user has a draft on BOTH halves — which is exactly the state this
--- -- bug creates. Log the loser-side draft as dropped, delete it, then move the
--- -- rest. Losing the older half of a duplicated draft beats aborting the merge.
+-- -- DRAFTS. Re-parenting blindly violates PRIMARY KEY (user_id, thread_id) when
+-- -- a user has a draft on BOTH halves. Log the loser-side one as dropped, delete
+-- -- it, then move the rest. (Measured: 0 affected today, but keep the guard.)
 -- INSERT INTO thread_merge_log (run_at, from_thread_id, to_thread_id, kind, row_id)
 --   SELECT r.at, p.from_thread_id, p.to_thread_id, 'draft-dropped', d.user_id || ':' || d.thread_id
 --     FROM plan p, run r
 --     JOIN drafts d ON d.thread_id = p.from_thread_id
 --     JOIN drafts w ON w.thread_id = p.to_thread_id AND w.user_id = d.user_id;
--- DELETE FROM drafts d
---  USING plan p, drafts w
+-- DELETE FROM drafts d USING plan p, drafts w
 --  WHERE d.thread_id = p.from_thread_id
 --    AND w.thread_id = p.to_thread_id AND w.user_id = d.user_id;
 -- UPDATE drafts d SET thread_id = p.to_thread_id
 --   FROM plan p WHERE d.thread_id = p.from_thread_id;
 --
--- -- The rest re-parent cleanly. Without these the DELETE below cascades them
--- -- away: drafts and scheduled_messages are ON DELETE CASCADE, so a queued
--- -- customer email would simply never be sent, with no error anywhere.
+-- -- Without these the DELETE below cascades them away: drafts and
+-- -- scheduled_messages are ON DELETE CASCADE, so a queued customer email would
+-- -- simply never be sent, with no error anywhere.
 -- UPDATE scheduled_messages s SET thread_id = p.to_thread_id
 --   FROM plan p WHERE s.thread_id = p.from_thread_id;
 -- UPDATE tasks k SET thread_id = p.to_thread_id
@@ -256,7 +276,6 @@ WHERE loser.last_message_at > winner.last_message_at
 -- UPDATE comments c SET thread_id = p.to_thread_id
 --   FROM plan p WHERE c.thread_id = p.from_thread_id;
 --
--- -- Labels are keyed (thread_id, label_id), so skip any the winner already has.
 -- INSERT INTO thread_labels (thread_id, label_id)
 -- SELECT DISTINCT p.to_thread_id, tl.label_id
 --   FROM plan p JOIN thread_labels tl ON tl.thread_id = p.from_thread_id
@@ -276,11 +295,8 @@ WHERE loser.last_message_at > winner.last_message_at
 --
 -- COMMIT;
 --
--- CHAINS. The overlap test is not transitive: A↔B and B↔C can both match while
--- A↔C does not, giving a plan of B→A and C→B. Nothing is lost (the NOT EXISTS
--- guards keep B alive because it now holds C's messages), but the conversation
--- is left in two pieces. Re-run sections 1-3 until
--- `SELECT count(*) FROM v_thread_merge_plan` reaches 0.
+-- No chain handling is needed: losers and winners are disjoint sets (see
+-- ACYCLIC above), so one pass merges everything the plan found.
 
 
 -- =============================================================================
@@ -289,10 +305,9 @@ WHERE loser.last_message_at > winner.last_message_at
 -- ⚠️ PARTIAL RESTORE, NOT A TIME MACHINE. It returns rows to their original
 -- thread. It does NOT undo: the identity fold (the winner keeps the merged
 -- participants/search_text), labels moved to the winner, drafts deleted as
--- 'draft-dropped', or the lost columns on recreated threads (assignee_id,
+-- 'draft-dropped', or the columns lost on recreated threads (assignee_id,
 -- starred, snoozed_until, team_space_id, message_id_root). Recreated threads
--- come back with status 'open' and the timestamp of their newest message.
--- For a true restore, use the snapshot you took before section 3.
+-- come back with status 'open'. For a true restore, use the snapshot.
 --
 -- BEGIN;
 -- CREATE TEMP TABLE moved ON COMMIT DROP AS
@@ -318,42 +333,39 @@ WHERE loser.last_message_at > winner.last_message_at
 --   FROM moved mv WHERE mv.kind = 'task' AND k.id = mv.row_id;
 -- UPDATE comments c SET thread_id = mv.from_thread_id
 --   FROM moved mv WHERE mv.kind = 'comment' AND c.id = mv.row_id;
--- -- drafts moved by user_id, since they have no id.
 -- UPDATE drafts d SET thread_id = mv.from_thread_id
 --   FROM moved mv
 --  WHERE mv.kind = 'draft'
---    AND d.user_id  = split_part(mv.row_id, ':', 1)
+--    AND d.user_id   = split_part(mv.row_id, ':', 1)
 --    AND d.thread_id = mv.to_thread_id;
 -- COMMIT;
 
 
 -- =============================================================================
--- 5. AFTER — DelegationDoer cleanup. NOT OPTIONAL.
+-- 5. AFTER — DelegationDoer cleanup.
 -- =============================================================================
--- DD references these thread ids with no foreign key, so nothing above touched
--- them. Export the mapping:
+-- DD stores these thread ids as free text with NO foreign key, so nothing above
+-- touched them. Measured against production for the current 479-thread plan:
 --
+--   thread_read_state ............ 87 rows   ← users' read markers; those
+--                                              threads reappear as unread
+--   email_satisfaction_scores .... 246 rows  ← scores orphaned
+--   inbox_drafts ................. 0 rows    ← no typed replies at risk today
+--   bulk_email_threads ........... 0 rows    ← SEO-blast touchpoint backstop safe
+--   email_intake_log ............. 0 rows
+--   scheduled_emails ............. 0 rows
+--   email_drafts ................. n/a — no thread_id column
+--   routing_review ............... n/a — table does not exist
+--
+-- So today the damage is 333 rows of read-state and scores: annoying, not
+-- destructive. RE-MEASURE BEFORE RUNNING — inbox_drafts being 0 is luck, not a
+-- guarantee, and it is the one that would lose a user's typed reply.
+--
+-- Export the mapping:
 --   \copy (SELECT DISTINCT from_thread_id, to_thread_id FROM thread_merge_log \
 --          WHERE run_at = (SELECT max(run_at) FROM thread_merge_log)) \
 --     TO 'thread_merge_map.csv' CSV HEADER
 --
--- Then, in DelegationDoer's Supabase, re-point every table that stores a clone
--- thread id. Check the counts BEFORE updating so you know what you are moving:
---
---   select 'inbox_drafts' t, count(*) from inbox_drafts where thread_id = any($losers)
---   union all select 'bulk_email_threads', count(*) from bulk_email_threads where thread_id = any($losers)
---   union all select 'thread_read_state', count(*) from thread_read_state where thread_id = any($losers)
---   union all select 'email_satisfaction_scores', count(*) from email_satisfaction_scores where thread_id = any($losers)
---   union all select 'routing_review', count(*) from routing_review where thread_id = any($losers)
---   union all select 'email_intake_log', count(*) from email_intake_log where thread_id = any($losers)
---   union all select 'scheduled_emails', count(*) from scheduled_emails where thread_id = any($losers)
---   union all select 'email_drafts', count(*) from email_drafts where thread_id = any($losers);
---
--- inbox_drafts and thread_read_state may have their own uniqueness on
--- (user_id, thread_id) — resolve collisions the same way section 3 does for
--- drafts, keeping the winner-side row.
---
--- bulk_email_threads is the one to get right: it is a thread-id allowlist that
--- keeps blast emails out of client touchpoint health. If a blast thread was
--- merged away and this is not updated, every client in that blast starts
--- reporting as freshly contacted.
+-- Then in DD's Supabase, re-point the two tables that actually have rows.
+-- thread_read_state may have its own uniqueness on (user_id, thread_id) —
+-- resolve collisions the way section 3 does for drafts, keeping the winner side.
