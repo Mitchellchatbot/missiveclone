@@ -22,8 +22,18 @@
 -- run inside a transaction block — psql runs statements in autocommit by
 -- default, so just don't wrap this in BEGIN/COMMIT.
 --
+-- The app pushes search_path per pooled connection; a psql session does not, so
+-- without this `messages` resolves to nothing and you get a confusing
+-- "relation does not exist" on the one manual step the threading fix needs.
+SET search_path TO missive, public;
+
 -- Raise the timeout for this session only; the 15s default belongs to the app's
 -- pool, not to you.
+--
+-- ⚠️ This must be a DIRECT connection, not a transaction-mode pooler (pgBouncer
+-- / Supabase's :6543). A pooler can hand the SET and the CREATE INDEX to
+-- different backends, so the timeout silently does not apply — and CREATE INDEX
+-- CONCURRENTLY cannot run through one at all.
 SET statement_timeout = '30min';
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_conversation

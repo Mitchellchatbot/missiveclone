@@ -667,6 +667,33 @@ async function fetchAttachmentsForMessage(token, messageGraphId) {
   return out;
 }
 
+// Does this error mean "the database or schema is broken" rather than "this one
+// message is bad"? Structural errors affect every message identically, so
+// skipping past them while advancing the delta cursor throws away real mail.
+// Postgres SQLSTATEs, per the error-code table:
+//   42703 undefined_column      42P01 undefined_table
+//   42883 undefined_function    42P07 duplicate_table
+//   53300 too_many_connections  57014 query_canceled (statement_timeout)
+//   08xxx connection exceptions
+const STRUCTURAL_PG_CODES = new Set(['42703', '42P01', '42883', '42P07', '53300', '57014']);
+
+function isStructuralDbError(e) {
+  const code = e && e.code;
+  if (typeof code === 'string' && (STRUCTURAL_PG_CODES.has(code) || code.startsWith('08'))) {
+    return true;
+  }
+  // The pg pool surfaces some failures without a SQLSTATE (pool exhausted,
+  // socket closed mid-query). Fall back to the message.
+  const msg = String((e && e.message) || '').toLowerCase();
+  return (
+    msg.includes('does not exist') ||
+    msg.includes('timeout exceeded when trying to connect') ||
+    msg.includes('canceling statement due to statement timeout') ||
+    msg.includes('connection terminated') ||
+    msg.includes('database is unavailable')
+  );
+}
+
 // Walk one Graph folder via delta. Returns { count, deltaLink } so the
 // caller can persist the new resume cursor only AFTER all pages
 // ingested cleanly. If a page mid-walk throws (network blip, ingest
@@ -782,10 +809,19 @@ async function syncFolderViaGraph(account, folderPath, direction, folderLabel) {
         const ok = await ingestMessage(account, /* uid */ 0, folderLabel, parsed, direction);
         if (ok) count += 1;
       } catch (e) {
-        // Don't let one corrupt message kill the whole folder walk. Log
-        // and move on. The delta link we'd save still covers this message
-        // so we won't retry forever — caller can re-fetch by clearing
-        // the delta link manually if a fix lands.
+        // Skip-and-continue is right for ONE corrupt message: the delta link we
+        // save still covers it, so we don't retry forever.
+        //
+        // It is very wrong for a STRUCTURAL failure — a missing column, a dead
+        // pool, a statement timeout. Those fail for every message equally, so
+        // "skip and advance the cursor" silently discards the entire folder
+        // walk and there is no way to get that mail back short of manually
+        // clearing the cursor. Rethrow instead: the caller aborts the walk and
+        // leaves the previous cursor in place, so the next poll retries.
+        if (isStructuralDbError(e)) {
+          console.error(`[graph] ABORTING walk for ${account.email}/${folderLabel} — structural DB error, cursor NOT advanced: ${e.message}`);
+          throw e;
+        }
         console.warn(`[graph] ingest failed for ${m.id} (${account.email}): ${e.message}`);
       }
     }
