@@ -310,7 +310,11 @@ router.get('/:id', wrap(async (req, res) => {
     `SELECT m.*, ea.email AS account_email, ea.display_name AS account_name
      FROM messages m
      LEFT JOIN email_accounts ea ON ea.id = m.account_id
-     WHERE m.thread_id = $1 ORDER BY m.sent_at ASC`,
+     -- m.id breaks ties deterministically: two copies of one email (delivered
+     -- to several connected inboxes) share a sent_at, and without a tiebreaker
+     -- Postgres may return them in a different order per request — which the
+     -- reading pane notices, since it treats the last element as "the latest".
+     WHERE m.thread_id = $1 ORDER BY m.sent_at ASC, m.id ASC`,
     [t.id]
   );
   const messageIds = messages.map(m => m.id);

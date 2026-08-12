@@ -407,6 +407,25 @@ const MIGRATIONS = [
   // deletes, and the reconnect-recovery UPDATE just below. Without it,
   // those scans walk the entire messages table.
   `CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account_id)`,
+  // Microsoft's own conversation grouping. Graph hands us a conversationId on
+  // every message and it is STABLE across the inbox copy and the sender's Sent
+  // copy of the same exchange — which is exactly the link RFC threading loses
+  // when a client omits In-Reply-To, or when the Sent copy is ingested before
+  // the message it replies to. We used to compute it and throw it away; storing
+  // it lets findOrCreateThread reunite the two halves of a conversation instead
+  // of filing the outbound half as its own thread (which then never appears in
+  // the Inbox view, since that filter needs a message with folder='INBOX').
+  // Adding a nullable column with no default is a catalog-only change, so this
+  // is instant regardless of table size and is safe to run on boot.
+  //
+  // The matching INDEX deliberately is NOT here — see
+  // backend/scripts/create_conversation_index.sql. Every connection in this pool
+  // gets `SET statement_timeout = '15s'` (see ensurePool below), and a btree
+  // build over `messages` — which stores body_text/body_html inline — will not
+  // finish inside that. It would be cancelled, swallowed by init()'s catch as a
+  // one-line warning, and silently retried on every single deploy while never
+  // actually existing. Build it out of band instead.
+  `ALTER TABLE messages ADD COLUMN IF NOT EXISTS provider_conversation_id TEXT`,
   // Reconnect-recovery: any messages whose account_id went NULL after a
   // disconnect get re-linked to whichever current mailbox in the same
   // workspace mentions that address in headers. Idempotent — only touches
@@ -426,6 +445,75 @@ function ensurePool() {
   if (!pool) throw new Error('DATABASE_URL is not set; database is unavailable');
 }
 
+// Columns that ingest writes UNCONDITIONALLY. If one of these is missing the app
+// still boots perfectly happily — and then every single INSERT in ingestMessage
+// throws "column ... does not exist", which the Graph walk catches per message
+// and moves past while still advancing the delta cursor. That combination loses
+// mail permanently and reports nothing but warn lines.
+//
+// Swallowing migration failures is right for the backfills and the best-effort
+// UPDATEs in MIGRATIONS. It is NOT right for a column ingest depends on: ADD
+// COLUMN needs an ACCESS EXCLUSIVE lock, every pooled connection carries
+// statement_timeout = 15s, and during a rolling deploy the old instance is still
+// ingesting — so the ALTER can genuinely be cancelled by lock contention on a
+// perfectly healthy database. Better to fail the boot and let the deploy roll
+// back than to serve traffic that silently drops email.
+const REQUIRED_COLUMNS = [
+  ['messages', 'provider_conversation_id'],
+];
+
+async function assertRequiredColumns() {
+  const missing = [];
+  for (const [table, column] of REQUIRED_COLUMNS) {
+    const row = await one(
+      `SELECT 1 AS ok FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = $2 AND column_name = $3`,
+      [DB_SCHEMA, table, column]
+    );
+    if (!row) missing.push(`${table}.${column}`);
+  }
+  if (missing.length) {
+    throw new Error(
+      `schema incomplete after migrations: missing ${missing.join(', ')}. ` +
+      `Ingest writes these columns on every message, so booting without them ` +
+      `would drop mail silently. Re-run the migration (most likely the ALTER ` +
+      `was cancelled by lock contention or statement_timeout) and restart.`
+    );
+  }
+}
+
+// Advisory only: the conversation-id lookup runs once per ingested message, and
+// without its index it degrades to a scan of the whole mailbox — which on a big
+// account crosses statement_timeout and throws into the same message-dropping
+// path as a missing column. It is created out of band (see
+// scripts/create_conversation_index.sql), so nothing else would ever notice it
+// was skipped. Warn loudly rather than fail: a fresh/small database is fine
+// without it, and refusing to boot over an index would be worse than the risk.
+async function warnIfConversationIndexMissing() {
+  try {
+    const row = await one(
+      `SELECT i.indisvalid FROM pg_class c
+         JOIN pg_index i ON i.indexrelid = c.oid
+        WHERE c.relname = 'idx_messages_conversation'`
+    );
+    if (!row) {
+      console.warn(
+        '[db] idx_messages_conversation is MISSING. The per-message ' +
+        'conversation-id lookup will scan; on a large mailbox it can hit ' +
+        'statement_timeout and drop messages. Run backend/scripts/create_conversation_index.sql'
+      );
+    } else if (row.indisvalid === false) {
+      console.warn(
+        '[db] idx_messages_conversation exists but is INVALID (a cancelled ' +
+        'CREATE INDEX CONCURRENTLY). The planner ignores it and IF NOT EXISTS ' +
+        'will match it forever. DROP INDEX CONCURRENTLY it and rebuild.'
+      );
+    }
+  } catch (e) {
+    console.warn('[db] could not check idx_messages_conversation:', e.message);
+  }
+}
+
 async function init() {
   ensurePool();
   await pool.query(SCHEMA);
@@ -433,6 +521,9 @@ async function init() {
     try { await pool.query(m); }
     catch (e) { console.warn('migration warning:', m, '-', e.message); }
   }
+  // Throws — deliberately fatal. See REQUIRED_COLUMNS.
+  await assertRequiredColumns();
+  await warnIfConversationIndexMissing();
 }
 
 async function ping() {
