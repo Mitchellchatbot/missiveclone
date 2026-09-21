@@ -134,8 +134,32 @@ console.log('[boot] env:', {
   CLIENT_ORIGIN: process.env.CLIENT_ORIGIN || '(unset, allowing any)'
 });
 
+// db.init() is idempotent (IF NOT EXISTS schema, idempotent MIGRATIONS, pool
+// created once), so a failure is retried rather than treated as terminal. It
+// used to be terminal: the catch below logged once and nothing retried, while
+// HTTP kept serving and the healthcheck stayed green — so the poll loop, the
+// watchers and the scheduled-send dispatcher simply never started. On
+// 2026-09-21 a single 5s connect timeout at boot stopped mail sync for every
+// mailbox for hours with nothing visibly down. /api/status carries the latest
+// error in db_init_error while this loops.
+async function initDbWithRetry() {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      console.log(`[boot] initializing database… (attempt ${attempt})`);
+      await db.init();
+      dbInitError = null;
+      return;
+    } catch (e) {
+      dbInitError = e.message;
+      const delayMs = Math.min(60 * 1000, 5 * 1000 * 2 ** (attempt - 1));
+      console.error(`[boot] DB init FAILED (attempt ${attempt}): ${e.message} — retrying in ${delayMs / 1000}s`);
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+}
+
 // Listen FIRST so the platform healthcheck succeeds. Initialize the DB after
-// — if it fails, /api/status will report the error so we can debug.
+// — while it's failing, /api/status reports the error so we can debug.
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[boot] HTTP listening on 0.0.0.0:${PORT}`);
 
@@ -146,8 +170,7 @@ server.listen(PORT, '0.0.0.0', () => {
 
   (async () => {
     try {
-      console.log('[boot] initializing database…');
-      await db.init();
+      await initDbWithRetry();
       dbReady = true;
       console.log('[boot] DB ready');
 
@@ -309,8 +332,10 @@ server.listen(PORT, '0.0.0.0', () => {
         }
       }, 30 * 1000);
     } catch (e) {
+      // init itself never lands here (it retries forever) — this is startup
+      // AFTER init: watchers/poll/scheduler setup.
       dbInitError = e.message;
-      console.error('[boot] DB init FAILED:', e.message);
+      console.error('[boot] post-init startup FAILED:', e.message);
       console.error('Hit GET /api/status for diagnostic info.');
     }
   })();
