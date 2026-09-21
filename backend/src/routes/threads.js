@@ -21,6 +21,34 @@ const upload = multer({
   limits: { fileSize: 150 * 1024 * 1024, fieldSize: 10 * 1024 * 1024 }
 });
 
+// This service and its database sit an ocean apart (Railway US-West ↔ Supabase
+// ap-southeast-1), so every byte a query returns costs wall-clock time AND holds
+// a pool slot while it crawls across. Read paths the DD inbox hits on every page
+// load therefore select only what the caller renders.
+//
+// Every threads column EXCEPT search_text. search_text is search input only —
+// matched in SQL by the list filter below, never read by DD or the frontend —
+// and it's by far the widest column: ~200 KB of the ~250 KB a 50-thread page
+// used to pull (one thread alone carried 50 KB). Add a column here when the
+// threads table grows one a caller needs.
+const THREAD_COLUMNS = `t.id, t.workspace_id, t.subject, t.participants, t.last_message_at,
+  t.status, t.assignee_id, t.message_id_root, t.created_at, t.team_space_id,
+  t.starred, t.snoozed_until`;
+
+// Every messages column except body_html / body_text — for ?defer_bodies=1,
+// where only the latest message's body is shipped. Pulling all of them and
+// nulling them out in JS moved megabytes per open on long threads.
+const MESSAGE_META_COLUMNS = `m.id, m.thread_id, m.account_id, m.workspace_id, m.direction,
+  m.folder, m.message_id, m.in_reply_to, m.subject, m.from_addr, m.to_addrs, m.cc_addrs,
+  m.sent_at, m.imap_uid, m.has_attachments, m.created_at, m.is_automated,
+  m.is_weekly_update, m.provider_conversation_id`;
+
+// snippetOf() below, in SQL, so Postgres returns 200 chars instead of the body.
+const SNIPPET_SQL = `left(btrim(regexp_replace(
+    CASE WHEN m.body_text ~ '\\S' THEN m.body_text
+         ELSE regexp_replace(coalesce(m.body_html, ''), '<[^>]+>', ' ', 'g') END,
+    '\\s+', ' ', 'g')), 200)`;
+
 // Parse Gmail-style search operators out of a query string.
 // Supported: from:, to:, subject:, has:attachment, is:(starred|open|closed|
 //            pending|snoozed), label:NAME, before:YYYY-MM-DD, after:YYYY-MM-DD.
@@ -98,7 +126,7 @@ router.get('/', wrap(async (req, res) => {
   const { status, assignee, q, folder, team_space_id, snoozed, label_id,
           mine, mailbox_id, mailbox_ids, category, starred } = req.query;
   const params = [req.user.workspace_id];
-  let sql = `SELECT t.*, u.name AS assignee_name,
+  let sql = `SELECT ${THREAD_COLUMNS}, u.name AS assignee_name,
                     coalesce(
                       (SELECT json_agg(json_build_object('id', l.id, 'name', l.name, 'color', l.color))
                        FROM thread_labels tl JOIN labels l ON l.id = tl.label_id
@@ -281,8 +309,9 @@ function snippetOf(text, html) {
 }
 
 router.get('/:id', wrap(async (req, res) => {
+  const deferBodies = req.query.defer_bodies === '1' || req.query.defer_bodies === 'true';
   const t = await one(
-    `SELECT t.*, u.name AS assignee_name,
+    `SELECT ${THREAD_COLUMNS}, u.name AS assignee_name,
             coalesce(
               (SELECT json_agg(json_build_object('id', l.id, 'name', l.name, 'color', l.color))
                FROM thread_labels tl JOIN labels l ON l.id = tl.label_id
@@ -306,8 +335,13 @@ router.get('/:id', wrap(async (req, res) => {
     [req.params.id, req.user.workspace_id]
   );
   if (!t) return res.status(404).json({ error: 'not found' });
+  // With defer_bodies the bodies never leave Postgres — only a snippet per
+  // message; the latest one's body is fetched on its own below.
+  const messageColumns = deferBodies
+    ? `${MESSAGE_META_COLUMNS}, ${SNIPPET_SQL} AS snippet`
+    : 'm.*';
   const messages = await many(
-    `SELECT m.*, ea.email AS account_email, ea.display_name AS account_name
+    `SELECT ${messageColumns}, ea.email AS account_email, ea.display_name AS account_name
      FROM messages m
      LEFT JOIN email_accounts ea ON ea.id = m.account_id
      -- m.id breaks ties deterministically: two copies of one email (delivered
@@ -338,11 +372,14 @@ router.get('/:id', wrap(async (req, res) => {
   // default-expanded one) plus a snippet for every message; withhold the rest's
   // body_html/body_text and flag them body_deferred. Without the param the
   // response is byte-for-byte unchanged (full bodies) — backward compatible.
-  if ((req.query.defer_bodies === '1' || req.query.defer_bodies === 'true') && messages.length) {
-    const latestId = messages[messages.length - 1].id; // ORDER BY sent_at ASC → last is latest
+  if (deferBodies && messages.length) {
+    const latest = messages[messages.length - 1]; // ORDER BY sent_at ASC → last is latest
+    const body = await one('SELECT body_html, body_text FROM messages WHERE id = $1', [latest.id]);
+    latest.body_html = body ? body.body_html : null;
+    latest.body_text = body ? body.body_text : null;
+    latest.snippet = snippetOf(latest.body_text, latest.body_html);
     for (const m of messages) {
-      m.snippet = snippetOf(m.body_text, m.body_html);
-      if (m.id === latestId) {
+      if (m === latest) {
         m.body_deferred = false;
       } else {
         m.body_html = null;
