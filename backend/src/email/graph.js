@@ -673,13 +673,31 @@ async function fetchAttachmentsForMessage(token, messageGraphId) {
 // Postgres SQLSTATEs, per the error-code table:
 //   42703 undefined_column      42P01 undefined_table
 //   42883 undefined_function    42P07 duplicate_table
-//   53300 too_many_connections  57014 query_canceled (statement_timeout)
+//   57014 query_canceled (statement_timeout)
+//   57P01 admin_shutdown  57P02 crash_shutdown  57P03 cannot_connect_now
+//     (what a Supabase restart / maintenance window returns)
 //   08xxx connection exceptions
-const STRUCTURAL_PG_CODES = new Set(['42703', '42P01', '42883', '42P07', '53300', '57014']);
+//   53xxx insufficient resources (53300 too_many_connections, out of memory…)
+const STRUCTURAL_PG_CODES = new Set([
+  '42703', '42P01', '42883', '42P07', '57014', '57P01', '57P02', '57P03'
+]);
+// Socket-level failures. node-postgres passes these through with the OS errno
+// as e.code and no SQLSTATE, so they never matched the 08xxx check above. On
+// this path they can only mean the database link: everything ingestMessage
+// awaits is a DB call (the DD webhook is fire-and-forget).
+const NETWORK_ERROR_CODES = new Set([
+  'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ECONNREFUSED', 'ECONNABORTED',
+  'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN'
+]);
 
 function isStructuralDbError(e) {
   const code = e && e.code;
-  if (typeof code === 'string' && (STRUCTURAL_PG_CODES.has(code) || code.startsWith('08'))) {
+  if (typeof code === 'string' && (
+    STRUCTURAL_PG_CODES.has(code) ||
+    NETWORK_ERROR_CODES.has(code) ||
+    code.startsWith('08') ||
+    code.startsWith('53')
+  )) {
     return true;
   }
   // The pg pool surfaces some failures without a SQLSTATE (pool exhausted,
@@ -690,8 +708,35 @@ function isStructuralDbError(e) {
     msg.includes('timeout exceeded when trying to connect') ||
     msg.includes('canceling statement due to statement timeout') ||
     msg.includes('connection terminated') ||
-    msg.includes('database is unavailable')
+    msg.includes('database is unavailable') ||
+    // pg: "Client has encountered a connection error and is not queryable"
+    msg.includes('not queryable')
   );
+}
+
+// Backstop for failure shapes the list above doesn't know yet. Before skipping
+// a message as "bad", check the database still answers. If it doesn't, the
+// failure is environmental, not about this message: abort so the cursor stays
+// put. If it does, the message really is the problem and is skipped exactly as
+// before. Raced against a timer because a half-open socket can hang a query
+// with no client-side timeout — a hang counts as "not answering".
+const DB_PING_TIMEOUT_MS = 10 * 1000;
+
+async function dbStillAnswers(db) {
+  let timer;
+  try {
+    const result = await Promise.race([
+      db.ping(),
+      new Promise(resolve => {
+        timer = setTimeout(() => resolve({ ok: false }), DB_PING_TIMEOUT_MS);
+      })
+    ]);
+    return !!(result && result.ok);
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // Walk one Graph folder via delta. Returns { count, deltaLink } so the
@@ -820,6 +865,10 @@ async function syncFolderViaGraph(account, folderPath, direction, folderLabel) {
         // leaves the previous cursor in place, so the next poll retries.
         if (isStructuralDbError(e)) {
           console.error(`[graph] ABORTING walk for ${account.email}/${folderLabel} — structural DB error, cursor NOT advanced: ${e.message}`);
+          throw e;
+        }
+        if (!(await dbStillAnswers(db))) {
+          console.error(`[graph] ABORTING walk for ${account.email}/${folderLabel} — ingest failed and the DB is not answering, cursor NOT advanced: ${e.message}`);
           throw e;
         }
         console.warn(`[graph] ingest failed for ${m.id} (${account.email}): ${e.message}`);
