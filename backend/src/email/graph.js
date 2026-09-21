@@ -673,31 +673,13 @@ async function fetchAttachmentsForMessage(token, messageGraphId) {
 // Postgres SQLSTATEs, per the error-code table:
 //   42703 undefined_column      42P01 undefined_table
 //   42883 undefined_function    42P07 duplicate_table
-//   57014 query_canceled (statement_timeout)
-//   57P01 admin_shutdown  57P02 crash_shutdown  57P03 cannot_connect_now
-//     (what a Supabase restart / maintenance window returns)
+//   53300 too_many_connections  57014 query_canceled (statement_timeout)
 //   08xxx connection exceptions
-//   53xxx insufficient resources (53300 too_many_connections, out of memory…)
-const STRUCTURAL_PG_CODES = new Set([
-  '42703', '42P01', '42883', '42P07', '57014', '57P01', '57P02', '57P03'
-]);
-// Socket-level failures. node-postgres passes these through with the OS errno
-// as e.code and no SQLSTATE, so they never matched the 08xxx check above. On
-// this path they can only mean the database link: everything ingestMessage
-// awaits is a DB call (the DD webhook is fire-and-forget).
-const NETWORK_ERROR_CODES = new Set([
-  'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ECONNREFUSED', 'ECONNABORTED',
-  'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN'
-]);
+const STRUCTURAL_PG_CODES = new Set(['42703', '42P01', '42883', '42P07', '53300', '57014']);
 
 function isStructuralDbError(e) {
   const code = e && e.code;
-  if (typeof code === 'string' && (
-    STRUCTURAL_PG_CODES.has(code) ||
-    NETWORK_ERROR_CODES.has(code) ||
-    code.startsWith('08') ||
-    code.startsWith('53')
-  )) {
+  if (typeof code === 'string' && (STRUCTURAL_PG_CODES.has(code) || code.startsWith('08'))) {
     return true;
   }
   // The pg pool surfaces some failures without a SQLSTATE (pool exhausted,
@@ -708,18 +690,47 @@ function isStructuralDbError(e) {
     msg.includes('timeout exceeded when trying to connect') ||
     msg.includes('canceling statement due to statement timeout') ||
     msg.includes('connection terminated') ||
-    msg.includes('database is unavailable') ||
-    // pg: "Client has encountered a connection error and is not queryable"
-    msg.includes('not queryable')
+    msg.includes('database is unavailable')
   );
 }
 
-// Backstop for failure shapes the list above doesn't know yet. Before skipping
-// a message as "bad", check the database still answers. If it doesn't, the
-// failure is environmental, not about this message: abort so the cursor stays
-// put. If it does, the message really is the problem and is skipped exactly as
-// before. Raced against a timer because a half-open socket can hang a query
-// with no client-side timeout — a hang counts as "not answering".
+// Database-outage shapes isStructuralDbError doesn't cover. These used to take
+// the skip path, which advanced the cursor and lost the message for good
+// during a blip. They now get retried — but capped (see noteTransientRetry), so
+// in the worst case they end up exactly where they were before: skipped.
+//   57P01 admin_shutdown  57P02 crash_shutdown  57P03 cannot_connect_now
+//     (what a Supabase restart / maintenance window returns)
+//   53xxx other insufficient-resources errors (out of memory, disk full…)
+//   25006 read_only_sql_transaction (Supabase goes read-only when the disk
+//     fills; SELECT 1 still works there, so the ping below can't see it)
+const TRANSIENT_PG_CODES = new Set(['57P01', '57P02', '57P03', '25006']);
+// Socket errno codes node-postgres passes through as e.code with no SQLSTATE,
+// mostly while opening a new pool connection (a reset mid-query surfaces as
+// "Connection terminated", already structural above). Everything ingestMessage
+// awaits is a DB call — the DD webhook is fire-and-forget — so on this path
+// they can only mean the database link.
+const NETWORK_ERROR_CODES = new Set([
+  'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ECONNREFUSED', 'ECONNABORTED',
+  'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN'
+]);
+
+function isTransientDbError(e) {
+  const code = e && e.code;
+  if (typeof code === 'string' && (
+    TRANSIENT_PG_CODES.has(code) ||
+    NETWORK_ERROR_CODES.has(code) ||
+    code.startsWith('53')
+  )) {
+    return true;
+  }
+  // pg: "Client has encountered a connection error and is not queryable"
+  return String((e && e.message) || '').toLowerCase().includes('not queryable');
+}
+
+// Before skipping a message as "bad", check the database still answers. If it
+// doesn't, the failure is environmental, not about this message: abort so the
+// cursor stays put. Raced against a timer because a half-open socket can hang
+// a query with no client-side timeout — a hang counts as "not answering".
 const DB_PING_TIMEOUT_MS = 10 * 1000;
 
 async function dbStillAnswers(db) {
@@ -737,6 +748,23 @@ async function dbStillAnswers(db) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// Cap on retrying a transient-looking error while the DB is answering. A real
+// blip clears within a poll or two; a message that fails the same way on every
+// attempt is a bad message wearing an outage's error code, and retrying it
+// forever would freeze every later email in that folder behind it. After
+// MAX_TRANSIENT_RETRIES consecutive aborts on the same message (30s poll → ~2.5
+// min) it falls back to the old skip. In-memory: a restart just re-arms it.
+const MAX_TRANSIENT_RETRIES = 5;
+const transientRetries = new Map(); // `${accountId}|${folder}` → { messageId, attempts }
+
+function noteTransientRetry(accountId, folderPath, messageId) {
+  const key = `${accountId}|${folderPath}`;
+  const prev = transientRetries.get(key);
+  const attempts = prev && prev.messageId === messageId ? prev.attempts + 1 : 1;
+  transientRetries.set(key, { messageId, attempts });
+  return attempts;
 }
 
 // Walk one Graph folder via delta. Returns { count, deltaLink } so the
@@ -867,9 +895,20 @@ async function syncFolderViaGraph(account, folderPath, direction, folderLabel) {
           console.error(`[graph] ABORTING walk for ${account.email}/${folderLabel} — structural DB error, cursor NOT advanced: ${e.message}`);
           throw e;
         }
+        // Everything below used to skip straight away. Only skip once we're
+        // sure it's this message and not the database.
         if (!(await dbStillAnswers(db))) {
+          // Uncapped: with the DB down nothing could be ingested anyway.
           console.error(`[graph] ABORTING walk for ${account.email}/${folderLabel} — ingest failed and the DB is not answering, cursor NOT advanced: ${e.message}`);
           throw e;
+        }
+        if (isTransientDbError(e)) {
+          const attempt = noteTransientRetry(account.id, folderPath, m.id);
+          if (attempt <= MAX_TRANSIENT_RETRIES) {
+            console.error(`[graph] ABORTING walk for ${account.email}/${folderLabel} — transient DB error (retry ${attempt}/${MAX_TRANSIENT_RETRIES}), cursor NOT advanced: ${e.message}`);
+            throw e;
+          }
+          console.error(`[graph] GIVING UP on ${m.id} (${account.email}/${folderLabel}) after ${MAX_TRANSIENT_RETRIES} retries while the DB answers — skipping it so later mail isn't blocked: ${e.message}`);
         }
         console.warn(`[graph] ingest failed for ${m.id} (${account.email}): ${e.message}`);
       }
@@ -906,6 +945,9 @@ async function syncFolderViaGraph(account, folderPath, direction, folderLabel) {
       [account.id, folderPath, lastDeltaLink]
     );
   }
+
+  // The walk finished, so whatever was being retried is behind us.
+  transientRetries.delete(`${account.id}|${folderPath}`);
 
   return { count, deltaLink: lastDeltaLink };
 }
