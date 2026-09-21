@@ -754,16 +754,25 @@ async function dbStillAnswers(db) {
 // blip clears within a poll or two; a message that fails the same way on every
 // attempt is a bad message wearing an outage's error code, and retrying it
 // forever would freeze every later email in that folder behind it. After
-// MAX_TRANSIENT_RETRIES consecutive aborts on the same message (30s poll → ~2.5
-// min) it falls back to the old skip. In-memory: a restart just re-arms it.
+// MAX_TRANSIENT_RETRIES aborts on the same message (30s poll → ~2.5 min each)
+// it falls back to the old skip.
+//
+// Counted PER MESSAGE, never one slot per folder: with a single slot, two bad
+// messages in the same walk reset each other's count on alternate polls and
+// the folder never advances again. Cleared once a walk completes. In-memory,
+// so a restart re-arms it.
 const MAX_TRANSIENT_RETRIES = 5;
-const transientRetries = new Map(); // `${accountId}|${folder}` → { messageId, attempts }
+const transientRetries = new Map(); // `${accountId}|${folder}` → Map<messageId, attempts>
 
 function noteTransientRetry(accountId, folderPath, messageId) {
   const key = `${accountId}|${folderPath}`;
-  const prev = transientRetries.get(key);
-  const attempts = prev && prev.messageId === messageId ? prev.attempts + 1 : 1;
-  transientRetries.set(key, { messageId, attempts });
+  let perMessage = transientRetries.get(key);
+  if (!perMessage) {
+    perMessage = new Map();
+    transientRetries.set(key, perMessage);
+  }
+  const attempts = (perMessage.get(messageId) || 0) + 1;
+  perMessage.set(messageId, attempts);
   return attempts;
 }
 
