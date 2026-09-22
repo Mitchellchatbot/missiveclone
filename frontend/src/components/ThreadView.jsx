@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import DOMPurify from 'dompurify';
 import { Star, Mail, Moon, Tag, Reply, Forward, Paperclip, Clock } from 'lucide-react';
-import { api, getApiBase } from '../api';
+import { api, getApiBase, getToken } from '../api';
 import { getSocket } from '../socket';
+import { inlineImageType, referencedInlineIds, replaceCids } from '../inlineCid';
 import ComposeReply from './ComposeReply.jsx';
 import Comments from './Comments.jsx';
 import Avatar from './Avatar.jsx';
@@ -106,8 +107,18 @@ function collapseQuotedHistory(safeHtml) {
 // Wrap the sanitized HTML into a complete document so the iframe renders it
 // with our base styles. <base target="_blank"> makes every link open in a
 // new tab, which is what email clients do.
-function buildEmailDoc(rawHtml) {
-  const { html: safe } = collapseQuotedHistory(sanitizeForIframe(rawHtml || ''));
+//
+// `cidMap` ({ content_id -> blob URL }) resolves inline `cid:` images. It's
+// applied AFTER sanitizing because DOMPurify's URI allowlist strips `blob:`
+// srcs, and after quote-collapsing so images inside the quoted history still
+// land under the "•••" toggle. The blob URLs are minted by this page, and the
+// iframe has allow-same-origin, so they load inside it.
+//
+// Takes html already run through sanitizeForIframe: the caller sanitizes once
+// and classifies inline parts against that same string.
+function buildEmailDoc(safeHtml, cidMap) {
+  const { html: collapsed } = collapseQuotedHistory(safeHtml);
+  const safe = replaceCids(collapsed, cidMap);
   return `<!doctype html><html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -490,7 +501,37 @@ export default function ThreadView({ threadId, me, team, accounts, onChanged, on
 }
 
 function MessageBlock({ m, expanded, onToggle, onReply, onResize }) {
-  const docHtml = useMemo(() => m.body_html ? buildEmailDoc(m.body_html) : null, [m.body_html]);
+  // Split attachments into real files and inline images (image parts the body
+  // references via `cid:`). Inline images render inside the body, so they get
+  // no chip and no collapsed-stub paperclip. Computed before the collapsed
+  // early return below to respect the rules of hooks.
+  //
+  // Classified against the SANITIZED html — the string that actually renders —
+  // so a reference the sanitizer drops can't hide a part that then never shows.
+  const safeHtml = useMemo(() => m.body_html ? sanitizeForIframe(m.body_html) : '', [m.body_html]);
+  const { fileAtts, inlineAtts } = useMemo(() => {
+    const atts = m.attachments || [];
+    const inlineIds = referencedInlineIds(safeHtml, atts);
+    return {
+      fileAtts: atts.filter(a => !inlineIds.has(a.id)),
+      inlineAtts: atts.filter(a => inlineIds.has(a.id))
+    };
+  }, [safeHtml, m.attachments]);
+  const { cidMap, failedCids } = useInlineImages(inlineAtts, expanded);
+  const docHtml = useMemo(() => m.body_html ? buildEmailDoc(safeHtml, cidMap) : null, [m.body_html, safeHtml, cidMap]);
+  // An inline image whose bytes failed to load would otherwise be unreachable
+  // (no chip, broken <img>), so it falls back to a chip. One per content_id:
+  // the clone can store the same inline part twice on one message.
+  const chipAtts = useMemo(() => {
+    if (!failedCids.size) return fileAtts;
+    const seen = new Set();
+    const fallback = inlineAtts.filter(a => {
+      if (!failedCids.has(a.content_id) || seen.has(a.content_id)) return false;
+      seen.add(a.content_id);
+      return true;
+    });
+    return fileAtts.concat(fallback);
+  }, [fileAtts, inlineAtts, failedCids]);
   const senderName = m.direction === 'outbound' ? (m.from_addr ? nameFromAddr(m.from_addr) : 'You') : nameFromAddr(m.from_addr) || 'Unknown';
 
   // Collapsed: a compact, clickable one-line stub (Gmail-style). The body iframe
@@ -504,7 +545,7 @@ function MessageBlock({ m, expanded, onToggle, onReply, onResize }) {
           <span className="msg-collapsed-from">{senderName}</span>
           <span className="msg-collapsed-snippet">{msgSnippet(m)}</span>
         </div>
-        {m.attachments && m.attachments.length > 0 && (
+        {fileAtts.length > 0 && (
           <Paperclip size={13} className="msg-collapsed-clip" />
         )}
         <span className="msg-collapsed-date">{fmtFull(m.sent_at)}</span>
@@ -576,9 +617,9 @@ function MessageBlock({ m, expanded, onToggle, onReply, onResize }) {
           />
         )
         : <pre className="msg-body">{m.body_text}</pre>}
-      {m.attachments && m.attachments.length > 0 && (
+      {chipAtts.length > 0 && (
         <div className="att-list">
-          {m.attachments.map(a => (
+          {chipAtts.map(a => (
             <a key={a.id}
               href={getApiBase() + `/api/attachments/${a.id}`}
               onClick={e => downloadAttachment(e, a)}
@@ -592,16 +633,96 @@ function MessageBlock({ m, expanded, onToggle, onReply, onResize }) {
   );
 }
 
+const NO_INLINE_IMAGES = { key: '', cidMap: null, failedCids: new Set() };
+const INLINE_IMAGE_TIMEOUT_MS = 30000;
+
+// Resolve a message's inline images to blob URLs while it is expanded. The
+// attachments route only accepts `Authorization: Bearer`, which an <img> can't
+// send, so the bytes are fetched here (like downloadAttachment) and handed to
+// buildEmailDoc as { content_id -> blob URL }. Collapsed messages fetch nothing.
+//
+// Returns { cidMap, failedCids }. cidMap stays null until every fetch settles,
+// so the iframe re-renders once rather than once per image. A failed content_id
+// keeps its `cid:` in the body and is reported so the caller can chip it.
+function useInlineImages(inlineAtts, expanded) {
+  const [state, setState] = useState(NO_INLINE_IMAGES);
+
+  // One fetch per content_id: the clone can store the same inline part twice
+  // on one message. Keyed on a string rather than the array because every
+  // thread reload (star, label, socket event) hands us new attachment objects
+  // for the same parts, and that mustn't refetch the images.
+  const key = useMemo(() => {
+    if (!expanded) return '';
+    const seen = new Set();
+    const targets = [];
+    for (const a of inlineAtts) {
+      if (seen.has(a.content_id)) continue;
+      seen.add(a.content_id);
+      targets.push([a.content_id, a.id, inlineImageType(a.content_type)]);
+    }
+    return targets.length ? JSON.stringify(targets) : '';
+  }, [inlineAtts, expanded]);
+
+  useEffect(() => {
+    if (!key) return;
+    const targets = JSON.parse(key);
+    const ctrl = new AbortController();
+    const urls = [];
+    Promise.allSettled(targets.map(([cid, id, type]) => {
+      const load = fetchAttachmentBlob(id, ctrl.signal).then(blob => {
+        // Cleanup already ran (collapse/unmount) — don't mint a URL nobody revokes.
+        if (ctrl.signal.aborted) throw new Error('aborted');
+        // Re-wrap under the allowlisted raster type instead of the served
+        // Content-Type (the sender's claim), so the same-origin blob URL can
+        // never be interpreted as SVG/HTML if it's ever opened directly.
+        const url = URL.createObjectURL(new Blob([blob], { type }));
+        urls.push(url);
+        return [cid, url];
+      });
+      // A hung fetch counts as failed, so its chip comes back instead of the
+      // image staying unreachable. A late URL is still revoked on cleanup.
+      const timeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('timeout')), INLINE_IMAGE_TIMEOUT_MS));
+      return Promise.race([load, timeout]);
+    })).then(results => {
+      if (ctrl.signal.aborted) return;
+      const cidMap = {};
+      const failedCids = new Set();
+      results.forEach((r, i) => {
+        if (r.status === 'fulfilled') cidMap[r.value[0]] = r.value[1];
+        else failedCids.add(targets[i][0]);
+      });
+      setState({ key, cidMap, failedCids });
+    });
+    return () => {
+      ctrl.abort();
+      urls.forEach(u => URL.revokeObjectURL(u));
+      // Drop the now-revoked URLs so re-expanding doesn't render them.
+      setState(NO_INLINE_IMAGES);
+    };
+  }, [key]);
+
+  // Until the effect for a new key has settled, don't hand out the previous
+  // key's (about to be revoked) URLs.
+  return state.key === key ? state : NO_INLINE_IMAGES;
+}
+
+// Fetch an attachment's bytes with the service token. Shared by the download
+// chips and inline-image rendering.
+async function fetchAttachmentBlob(id, signal) {
+  const token = getToken();
+  const res = await fetch(getApiBase() + `/api/attachments/${id}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    signal
+  });
+  if (!res.ok) throw new Error('download failed');
+  return res.blob();
+}
+
 async function downloadAttachment(e, a) {
   e.preventDefault();
   try {
-    const { getToken } = await import('../api');
-    const token = getToken();
-    const res = await fetch(getApiBase() + `/api/attachments/${a.id}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {}
-    });
-    if (!res.ok) throw new Error('download failed');
-    const blob = await res.blob();
+    const blob = await fetchAttachmentBlob(a.id);
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
