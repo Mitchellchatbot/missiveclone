@@ -195,12 +195,23 @@ server.listen(PORT, '0.0.0.0', () => {
       // Scheduled-send dispatcher — every 30s, send any due messages.
       const { sendEmail } = require('./email/smtp');
       const { v4: uuid } = require('uuid');
-      const { query, tx, emitToWorkspace } = (() => {
+      const { query, tx, txLockedAfterSend, emitToWorkspace } = (() => {
         const dbm = require('./db');
         const sock = require('./sockets');
-        return { query: dbm.query, tx: dbm.tx, emitToWorkspace: sock.emitToWorkspace };
+        return { query: dbm.query, tx: dbm.tx, txLockedAfterSend: dbm.txLockedAfterSend, emitToWorkspace: sock.emitToWorkspace };
       })();
+      const { ingestLockKey } = require('./email/imap');
+      // Tick guard: a tick that sends several emails (each an SMTP/Graph round
+      // trip, plus attachments) can outlast the 30s interval, and the next tick
+      // would re-select the same due rows. The atomic claim below is what
+      // actually prevents a double send (it also covers a second instance during
+      // a deploy overlap — from the deploy after this one: the instance this
+      // code replaces still claims unconditionally); this just stops ticks from
+      // piling up.
+      let dispatching = false;
       setInterval(async () => {
+        if (dispatching) return;
+        dispatching = true;
         try {
           const due = await many(
             `SELECT * FROM scheduled_messages WHERE status = 'pending' AND send_at <= $1 LIMIT 20`,
@@ -212,7 +223,19 @@ server.listen(PORT, '0.0.0.0', () => {
             // Phase 1 — actually send. A throw here means the email never went
             // out, so marking the row 'failed' is correct.
             try {
-              await query(`UPDATE scheduled_messages SET status = 'sending' WHERE id = $1`, [s.id]);
+              // Claim atomically: only the caller that flips pending → sending
+              // may send. Without `AND status = 'pending'` two overlapping
+              // ticks (or two instances) both "claimed" the row and both sent.
+              const claim = await query(
+                `UPDATE scheduled_messages SET status = 'sending'
+                  WHERE id = $1 AND status = 'pending'
+                  RETURNING id`,
+                [s.id]
+              );
+              if (!claim.rowCount) {
+                console.log(`[scheduled] ${s.id} already claimed elsewhere — skipping`);
+                continue;
+              }
 
               // Replay any attachments stashed at schedule time. BYTEA comes
               // back from pg as a Buffer, which is exactly what sendEmail (SMTP
@@ -256,30 +279,83 @@ server.listen(PORT, '0.0.0.0', () => {
               // Materialize as a thread/message so it shows up in the inbox.
               // One tx so the inbox copy is all-or-nothing (the send already
               // happened above — never wrap that network call in a tx).
-              const threadId = uuid();
-              const msgId = uuid();
+              let threadId;
+              let msgId;
               const now = Date.now();
-              await tx(async (client) => {
-                await client.query(
-                  `INSERT INTO threads (id, workspace_id, subject, participants,
-                                        last_message_at, status, message_id_root, search_text, created_at)
-                   VALUES ($1, $2, $3, $4, $5, 'open', $6, $7, $8)`,
-                  [threadId, s.workspace_id,
-                   s.subject || '', [s.to_addrs, s.cc_addrs].filter(Boolean).join('; '),
-                   now, sent.messageId || null,
-                   (s.subject || '') + ' ' + [s.to_addrs, s.cc_addrs].filter(Boolean).join(' '),
-                   now]
-                );
-                await client.query(
-                  `INSERT INTO messages (id, thread_id, account_id, workspace_id, direction, folder,
-                    message_id, subject, from_addr, to_addrs, cc_addrs, body_text, body_html,
-                    sent_at, has_attachments, is_automated, is_weekly_update, created_at)
-                   VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, '', $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
-                  [msgId, threadId, s.account_id, s.workspace_id, sent.messageId,
-                   s.subject || '', s.to_addrs || '', s.cc_addrs || '',
-                   s.body_text || '', s.body_html || '', now, attachments.length ? 1 : 0, s.is_automated || 0, s.is_weekly_update || 0, now]
-                );
-                for (const a of attachments) {
+              // `|| null`, never '': an empty Message-ID is not a dedup
+              // identity (see routes/compose.js).
+              const sentMessageId = sent.messageId || null;
+              // Same per-message lock ingest takes (see routes/compose.js), so a
+              // Sent Items walk storing this email at the same moment can't
+              // leave a second row. The attachments stay inside it: the copy is
+              // all-or-nothing, and an ingest that times out waiting on a big
+              // insert here aborts its walk and retries on the next poll.
+              // storeCopy may run twice (txLockedAfterSend's no-lock fallback
+              // after a rolled-back attempt), so it starts from fresh ids.
+              const findExisting = async (client) => (await client.query(
+                `SELECT m.id, m.thread_id,
+                        EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id) AS has_att
+                   FROM messages m
+                  WHERE m.account_id = $1 AND m.direction = 'outbound' AND m.message_id = $2
+                  ORDER BY m.sent_at, m.id
+                  LIMIT 1`,
+                [s.account_id, sentMessageId]
+              )).rows[0] || null;
+              const storeCopy = async (client) => {
+                threadId = uuid();
+                msgId = uuid();
+                let existing = sentMessageId ? await findExisting(client) : null;
+                if (!existing) {
+                  await client.query(
+                    `INSERT INTO threads (id, workspace_id, subject, participants,
+                                          last_message_at, status, message_id_root, search_text, created_at)
+                     VALUES ($1, $2, $3, $4, $5, 'open', $6, $7, $8)`,
+                    [threadId, s.workspace_id,
+                     s.subject || '', [s.to_addrs, s.cc_addrs].filter(Boolean).join('; '),
+                     now, sentMessageId,
+                     (s.subject || '') + ' ' + [s.to_addrs, s.cc_addrs].filter(Boolean).join(' '),
+                     now]
+                  );
+                  // Bare ON CONFLICT DO NOTHING: absorbs uq_messages_acct_dir_msgid
+                  // if a writer that didn't hold the lock stored it first.
+                  const ins = await client.query(
+                    `INSERT INTO messages (id, thread_id, account_id, workspace_id, direction, folder,
+                      message_id, subject, from_addr, to_addrs, cc_addrs, body_text, body_html,
+                      sent_at, has_attachments, is_automated, is_weekly_update, created_at)
+                     VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, '', $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                     ON CONFLICT DO NOTHING
+                     RETURNING id`,
+                    [msgId, threadId, s.account_id, s.workspace_id, sentMessageId,
+                     s.subject || '', s.to_addrs || '', s.cc_addrs || '',
+                     s.body_text || '', s.body_html || '', now, attachments.length ? 1 : 0, s.is_automated || 0, s.is_weekly_update || 0, now]
+                  );
+                  if (!ins.rowCount) {
+                    // The thread above was created in this transaction for this
+                    // message alone, so it is empty — drop it and use the row
+                    // that won.
+                    await client.query('DELETE FROM threads WHERE id = $1', [threadId]);
+                    existing = await findExisting(client);
+                    if (!existing) throw new Error(`message insert conflicted but no row found for ${sentMessageId}`);
+                  }
+                }
+                let attachHere = attachments;
+                if (existing) {
+                  console.log(`[scheduled] ${s.id}: ${sentMessageId} already stored as ${existing.id} — reusing it`);
+                  threadId = existing.thread_id;
+                  msgId = existing.id;
+                  // Don't give a row that already has its attachments a second copy.
+                  attachHere = existing.has_att ? [] : attachments;
+                  // Keep the flags DD reads (is_automated excludes bulk sends
+                  // from touchpoint health) — the synced copy has neither.
+                  await client.query(
+                    `UPDATE messages SET has_attachments = GREATEST(has_attachments, $2),
+                            is_automated = GREATEST(is_automated, $3),
+                            is_weekly_update = GREATEST(is_weekly_update, $4)
+                      WHERE id = $1`,
+                    [msgId, attachHere.length ? 1 : 0, s.is_automated || 0, s.is_weekly_update || 0]
+                  );
+                }
+                for (const a of attachHere) {
                   await client.query(
                     `INSERT INTO attachments (id, message_id, workspace_id, filename, content_type, size_bytes, content_id, data, created_at)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
@@ -287,7 +363,15 @@ server.listen(PORT, '0.0.0.0', () => {
                      a.content ? a.content.length : 0, a.content_id || null, a.content, now]
                   );
                 }
-              });
+              };
+              // No Message-ID: no dedup identity, nothing to lock on.
+              if (sentMessageId) {
+                await txLockedAfterSend(
+                  ingestLockKey(s.account_id, 'outbound', sentMessageId), storeCopy, '[scheduled]'
+                );
+              } else {
+                await tx(storeCopy);
+              }
 
               // The bytes now live in `attachments` against the real message;
               // drop the scheduled copy to reclaim BYTEA, keeping the 'sent'
@@ -329,6 +413,8 @@ server.listen(PORT, '0.0.0.0', () => {
           }
         } catch (e) {
           console.error('scheduler tick', e.message);
+        } finally {
+          dispatching = false;
         }
       }, 30 * 1000);
     } catch (e) {

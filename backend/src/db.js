@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+const crypto = require('crypto');
 
 const HAS_DB = !!process.env.DATABASE_URL;
 if (!HAS_DB) {
@@ -404,7 +405,7 @@ const MIGRATIONS = [
   `ALTER TABLE email_accounts ALTER COLUMN smtp_pass DROP NOT NULL`,
   // Index account_id on messages — used by mailbox_id thread filters
   // (EXISTS messages WHERE thread_id=t.id AND account_id=$X), account
-  // deletes, and the reconnect-recovery UPDATE just below. Without it,
+  // deletes, and the reconnect relink UPDATEs. Without it,
   // those scans walk the entire messages table.
   `CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account_id)`,
   // Microsoft's own conversation grouping. Graph hands us a conversationId on
@@ -426,19 +427,16 @@ const MIGRATIONS = [
   // one-line warning, and silently retried on every single deploy while never
   // actually existing. Build it out of band instead.
   `ALTER TABLE messages ADD COLUMN IF NOT EXISTS provider_conversation_id TEXT`,
-  // Reconnect-recovery: any messages whose account_id went NULL after a
-  // disconnect get re-linked to whichever current mailbox in the same
-  // workspace mentions that address in headers. Idempotent — only touches
-  // NULL rows, so re-runs are no-ops.
-  `UPDATE messages SET account_id = ea.id
-   FROM email_accounts ea
-   WHERE messages.workspace_id = ea.workspace_id
-     AND messages.account_id IS NULL
-     AND (
-       messages.to_addrs ILIKE '%' || ea.email || '%'
-       OR messages.from_addr ILIKE '%' || ea.email || '%'
-       OR messages.cc_addrs ILIKE '%' || ea.email || '%'
-     )`
+  // (A boot-time "reconnect-recovery" UPDATE used to live here, re-linking every
+  // NULL-account message to whichever mailbox in the workspace its headers
+  // mentioned. It was removed on purpose: it was an unbounded UPDATE ... FROM
+  // over the whole table on every deploy, it picked the account
+  // nondeterministically when several matched, and it relinked every copy of a
+  // message onto the same account — which recreates exactly the duplicate
+  // (account_id, direction, message_id) rows uq_messages_acct_dir_msgid forbids.
+  // The reconnect paths (POST /accounts, /accounts/:id/relink-orphans and the
+  // Microsoft OAuth callback) already relink, one row per key, via
+  // util/relink_orphans.js.)
 ];
 
 function ensurePool() {
@@ -514,6 +512,40 @@ async function warnIfConversationIndexMissing() {
   }
 }
 
+// Advisory only, same reasoning as above. The unique index is the database-side
+// backstop against duplicate message rows (the in-process guards are the ingest
+// advisory lock and one-walk-per-account). It can only be built after the
+// existing duplicates are cleaned up, so it is created out of band
+// (scripts/dedupe_messages.sql, then scripts/create_unique_message_index.sql).
+// Every writer uses a bare ON CONFLICT DO NOTHING, so the code behaves the same
+// whether the index is present, missing or INVALID — this just makes the state
+// visible in the boot log.
+async function warnIfUniqueMsgIndexMissing() {
+  try {
+    const row = await one(
+      `SELECT i.indisvalid FROM pg_class c
+         JOIN pg_index i ON i.indexrelid = c.oid
+        WHERE c.relname = 'uq_messages_acct_dir_msgid'`
+    );
+    if (!row) {
+      console.warn(
+        '[db] uq_messages_acct_dir_msgid is MISSING. Duplicate message rows are ' +
+        'prevented only by the ingest lock, not by the database. Clean up with ' +
+        'backend/scripts/dedupe_messages.sql, then run create_unique_message_index.sql'
+      );
+    } else if (row.indisvalid === false) {
+      console.warn(
+        '[db] uq_messages_acct_dir_msgid exists but is INVALID (a failed ' +
+        'CREATE UNIQUE INDEX CONCURRENTLY, usually a duplicate slipped in). It ' +
+        'still costs every write and only partly enforces. DROP INDEX CONCURRENTLY ' +
+        'it, re-clean and rebuild.'
+      );
+    }
+  } catch (e) {
+    console.warn('[db] could not check uq_messages_acct_dir_msgid:', e.message);
+  }
+}
+
 async function init() {
   ensurePool();
   await pool.query(SCHEMA);
@@ -524,6 +556,7 @@ async function init() {
   // Throws — deliberately fatal. See REQUIRED_COLUMNS.
   await assertRequiredColumns();
   await warnIfConversationIndexMissing();
+  await warnIfUniqueMsgIndexMissing();
 }
 
 async function ping() {
@@ -555,4 +588,102 @@ async function tx(fn) {
   }
 }
 
-module.exports = { pool, init, ping, query, one, many, tx, HAS_DB };
+// tx() under a transaction-scoped advisory lock on `key` (any string; callers
+// use the message's dedup key). Two writers holding the same key serialize, so
+// "check for the row, then insert it" can no longer interleave between two
+// sync walks, two instances during a deploy overlap, or ingest vs. compose.
+//
+// Why each piece is here:
+//   - pg_advisory_XACT_lock, not the session variant: it is released by COMMIT
+//     or ROLLBACK, so it is safe through the transaction-mode pooler (the
+//     server connection stays pinned from BEGIN to COMMIT) and can never leak.
+//   - The key is a signed 64-bit integer derived from SHA-1 in JS and spliced
+//     in as a quoted literal. It is built only from hex digest bytes, so there
+//     is no injection surface, and it does not depend on hashtext() staying
+//     stable across Postgres versions. Quoted + ::bigint so the one value with
+//     no positive counterpart (-2^63) still parses.
+//   - SET LOCAL timeouts: the 15s statement_timeout set in pool.on('connect')
+//     is session state, which a transaction-mode pooler does not guarantee we
+//     still have. lock_timeout bounds the wait behind another holder; a
+//     timeout surfaces as 55P03, which graph.js treats as structural (abort
+//     the walk, keep the cursor) rather than skipping the message.
+//     idle_in_transaction_session_timeout covers the gaps between statements:
+//     a transaction abandoned while holding the lock (a JS path that never
+//     resolves, a stalled event loop) would otherwise keep the key forever,
+//     failing every later ingest of that message with 55P03. The server ends
+//     such a session after 60s idle and the key is freed.
+//   - READ COMMITTED is spelled out, not left to the server/role default: the
+//     re-check below only works if each statement takes a fresh snapshot.
+//   - All of it goes as ONE simple query (no parameters), so taking the lock
+//     costs a single round trip. Callers must run their re-check as a SEPARATE
+//     statement from fn: under READ COMMITTED a statement's snapshot is taken
+//     when it starts, so only a statement issued after the lock is granted can
+//     see a row another holder committed while we waited.
+//   - A client whose ROLLBACK fails is broken (dead socket, pooler reset);
+//     release(err) destroys it instead of handing it to the next caller.
+function advisoryKey(key) {
+  return crypto.createHash('sha1').update(String(key)).digest().readBigInt64BE(0).toString();
+}
+
+// Timeouts are spliced into the SQL too, so only plain "<n>ms" / "<n>s"
+// values are accepted — they come from code, never from a request.
+const PG_INTERVAL = /^\d+(ms|s)$/;
+
+async function txLocked(key, fn, { lockTimeout = '5s', statementTimeout = '15s' } = {}) {
+  if (!PG_INTERVAL.test(lockTimeout) || !PG_INTERVAL.test(statementTimeout)) {
+    throw new Error(`txLocked: bad timeout ${lockTimeout} / ${statementTimeout}`);
+  }
+  ensurePool();
+  const client = await pool.connect();
+  let broken;
+  try {
+    try {
+      await client.query(
+        `BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '${lockTimeout}'; ` +
+        `SET LOCAL statement_timeout = '${statementTimeout}'; SET LOCAL idle_in_transaction_session_timeout = '60s'; ` +
+        `SELECT pg_advisory_xact_lock('${advisoryKey(key)}'::bigint)`
+      );
+    } catch (e) {
+      // Tag failures to TAKE the lock (as opposed to failures inside fn), so
+      // txLockedAfterSend knows nothing of the caller's ran yet.
+      if (e && typeof e === 'object') e.lockPhase = true;
+      throw e;
+    }
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (e) {
+    try { await client.query('ROLLBACK'); }
+    catch (rbErr) { broken = rbErr; }
+    throw e;
+  } finally {
+    client.release(broken);
+  }
+}
+
+// txLocked for bookkeeping that runs AFTER an email has already gone out
+// (compose, reply, scheduled send). There, failing on lock contention is the
+// wrong trade: the send can't be undone, so a 500 just invites the user to
+// send it again. Two differences from plain txLocked:
+//   - It waits longer. An ingest holder can keep the key for its whole locked
+//     statement (up to the 15s statement_timeout, e.g. a big attachment insert
+//     over the slow link), so the 5s default would time out on it. 20s outlasts
+//     that, and the statement_timeout is raised above it so the lock wait ends
+//     as 55P03 rather than being cut short by 57014.
+//   - If the lock still can't be had, it falls back to a plain tx(fn). fn must
+//     therefore be safe to run twice (the locked attempt rolled back) and must
+//     do its own existing-row check + bare ON CONFLICT DO NOTHING, which still
+//     dedupes against anything committed — only the "both insert at the same
+//     instant" window is left open, and the unique index closes that once built.
+async function txLockedAfterSend(key, fn, tag = '[db]') {
+  try {
+    return await txLocked(key, fn, { lockTimeout: '20s', statementTimeout: '30s' });
+  } catch (e) {
+    const code = e && e.code;
+    if (!(e && e.lockPhase) && code !== '55P03' && code !== '40P01') throw e;
+    console.warn(`${tag} ingest lock unavailable (${code || e.message}) — storing without it`);
+    return tx(fn);
+  }
+}
+
+module.exports = { pool, init, ping, query, one, many, tx, txLocked, txLockedAfterSend, HAS_DB };
