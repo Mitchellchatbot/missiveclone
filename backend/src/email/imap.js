@@ -2,7 +2,7 @@ const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const { v4: uuid } = require('uuid');
 const crypto = require('crypto');
-const { one, many, query } = require('../db');
+const { one, many, query, tx, txLocked } = require('../db');
 const { decrypt } = require('../crypto');
 const { emitToWorkspace } = require('../sockets');
 const ms = require('../oauth/microsoft');
@@ -183,7 +183,7 @@ function addressesOf(field) {
 // appear adjacent in a real address fixes both. Regex metacharacters in the
 // address (dots, +) are escaped so they can't alter the pattern.
 // Lower-cased addresses of every mailbox connected in a workspace. Cached
-// briefly because findOrCreateThread runs once per ingested message and a full
+// briefly because resolveThread runs once per ingested message and a full
 // folder walk can be thousands — this must not become a query per message. The
 // set only changes when someone connects or disconnects a mailbox, so a short
 // TTL is plenty; a stale entry just means one message uses the previous set.
@@ -215,7 +215,10 @@ function addressBoundaryPattern(addr) {
   return `(^|[^a-z0-9!#$%&'*+/=?^_\`{|}~.-])${esc}($|[^a-z0-9.-])`;
 }
 
-async function findOrCreateThread(workspace_id, parsed, team_space_id, account_id, account_email) {
+// Decide which thread an incoming message belongs to. Write-free: returns
+// { threadId } for an existing thread, or { newThread } describing one to create
+// (see the tail of this function for why the INSERT lives in ingestMessage).
+async function resolveThread(workspace_id, parsed, team_space_id, account_id, account_email) {
   // RFC 5322 threading first — Message-ID chain via In-Reply-To /
   // References. This is the only path that's safe across accounts;
   // a real reply chain genuinely belongs in one thread.
@@ -231,7 +234,7 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id, account_i
        LIMIT 1`,
       [workspace_id, candidates]
     );
-    if (m) return m.thread_id;
+    if (m) return { threadId: m.thread_id };
   }
 
   // Provider conversation id (Microsoft Graph). RFC threading above misses
@@ -254,7 +257,7 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id, account_i
         LIMIT 1`,
       [workspace_id, account_id, convId]
     );
-    if (c) return c.thread_id;
+    if (c) return { threadId: c.thread_id };
   }
 
   // Subject-based fallback — used when the email is the first in a
@@ -333,10 +336,13 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id, account_i
         LIMIT 1`,
       [workspace_id, cleanSubj, account_id, patterns]
     );
-    if (t) return t.id;
+    if (t) return { threadId: t.id };
   }
 
-  const id = uuid();
+  // No existing thread matched. Describe the thread to create instead of
+  // creating it: ingestMessage inserts it in the same locked statement as the
+  // message, so a message that turns out to be a duplicate (another walk won
+  // the race) never leaves an empty thread behind.
   const now = Date.now();
   const sentAt = parsed.date ? new Date(parsed.date).getTime() : now;
   const participants = [
@@ -344,19 +350,18 @@ async function findOrCreateThread(workspace_id, parsed, team_space_id, account_i
     ...(parsed.to ? [normalizeAddrList(parsed.to)] : []),
   ].filter(Boolean).join('; ');
 
-  await query(
-    `INSERT INTO threads (id, workspace_id, team_space_id, subject, participants, last_message_at, status,
-                          message_id_root, search_text, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, 'open', $7, $8, $9)`,
-    [
-      id, workspace_id, team_space_id || null,
-      cleanSubj || subject || '(no subject)', participants, sentAt,
-      (parsed.messageId || '').replace(/[<>]/g, '') || null,
-      (cleanSubj || subject || '') + ' ' + participants,
-      now
-    ]
-  );
-  return id;
+  return {
+    newThread: {
+      id: uuid(),
+      team_space_id: team_space_id || null,
+      subject: cleanSubj || subject || '(no subject)',
+      participants,
+      last_message_at: sentAt,
+      message_id_root: (parsed.messageId || '').replace(/[<>]/g, '') || null,
+      search_text: (cleanSubj || subject || '') + ' ' + participants,
+      created_at: now
+    }
+  };
 }
 
 // Append a new fragment to threads.search_text under a character cap,
@@ -407,17 +412,29 @@ async function appendThreadSearchText(threadId, fragment) {
   }
 }
 
-// Insert attachment rows for a message. Shared by the normal ingest path and
-// the dup-backfill branch in ingestMessage so both build the multi-row INSERT
-// identically. Bytes (att.content) are stored inline in the `data` column.
-async function insertAttachmentRows(messageId, workspaceId, attRows) {
-  if (!attRows.length) return;
+// Build the VALUES list for a multi-row attachments insert, appending its
+// parameters to `params`. Shared by the new-message insert and the dup-backfill
+// branch in ingestMessage so both shape rows identically. Bytes (att.content)
+// are stored inline in the `data` column.
+//
+// Every column is cast explicitly. These VALUES feed INSERT ... SELECT inside a
+// CTE, where there is no target column to infer a parameter's type from: an
+// uncast parameter resolves to text, and a Buffer bound as text fails for
+// bytea. (unnest(bytea[]) is avoided on purpose: node-pg sends a Buffer array
+// as hex text, doubling the payload; plain Buffer parameters go over as binary.)
+//
+// One created_at for the whole batch is deliberate: rows of a single insert
+// share it, so a later cleanup can tell a legitimately repeated attachment
+// (same batch) from a race-duplicated one (a separate insert).
+function attachmentValues(messageId, workspaceId, attRows, params) {
   const nowMs = Date.now();
   const values = [];
-  const params = [];
   for (const att of attRows) {
     const base = params.length;
-    values.push(`($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, $${base+8}, $${base+9})`);
+    values.push(
+      `($${base+1}::text, $${base+2}::text, $${base+3}::text, $${base+4}::text, $${base+5}::text, ` +
+      `$${base+6}::int, $${base+7}::text, $${base+8}::bytea, $${base+9}::bigint)`
+    );
     params.push(
       uuid(), messageId, workspaceId,
       att.filename || 'attachment',
@@ -428,12 +445,31 @@ async function insertAttachmentRows(messageId, workspaceId, attRows) {
       nowMs
     );
   }
-  await query(
-    `INSERT INTO attachments
-      (id, message_id, workspace_id, filename, content_type, size_bytes, content_id, data, created_at)
-     VALUES ${values.join(', ')}`,
-    params
-  );
+  return values.join(', ');
+}
+
+const ATTACHMENT_COLUMNS =
+  'id, message_id, workspace_id, filename, content_type, size_bytes, content_id, data, created_at';
+
+// Advisory-lock key for one message's dedup identity. Ingest, the attachment
+// backfill, compose, reply and scheduled send all take the same key, so any
+// two writers of the same (account, direction, Message-ID) serialize. See
+// txLocked in db.js.
+function ingestLockKey(accountId, direction, messageId) {
+  return `mc-ingest|${accountId}|${direction}|${messageId}`;
+}
+
+// Errors that mean "these attachment rows can't be stored", as opposed to "the
+// database is unavailable":
+//   - SQLSTATE class 22 (data exception): the row's content is bad (e.g. a NUL
+//     byte in a text column) — retrying the same row fails again.
+//   - 57014 (statement timeout) once the lock is held: a big attachment that
+//     can't be written within the statement_timeout over the slow link — it
+//     would time out again on every re-walk.
+// A 57014 while still waiting for the lock is not one of these (lockPhase).
+function isAttachmentRejected(e) {
+  if (!e || typeof e.code !== 'string') return false;
+  return e.code.startsWith('22') || (e.code === '57014' && !e.lockPhase);
 }
 
 async function ingestMessage(acc, uid, folder, parsed, direction) {
@@ -458,11 +494,20 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     // appear in the sender's own INBOX view (the outbound record was
     // created by compose, then dedup blocked the inbound copy from
     // ever being ingested).
+    //
+    // This is the lock-free fast path: most messages in a re-walk already
+    // exist and cost exactly this one round trip. has_att rides along so the
+    // backfill check below needs no second query. ORDER BY picks the same
+    // copy DD renders when legacy duplicates exist, so a backfill lands on it.
+    // A miss here is NOT final — the locked insert below re-checks.
     const dup = await one(
-      `SELECT id FROM messages
-        WHERE message_id = $1
-          AND account_id = $2
-          AND direction = $3`,
+      `SELECT m.id, EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id) AS has_att
+         FROM messages m
+        WHERE m.message_id = $1
+          AND m.account_id = $2
+          AND m.direction = $3
+        ORDER BY m.sent_at, m.id
+        LIMIT 1`,
       [messageId, acc.id, dir]
     );
     if (dup) {
@@ -486,53 +531,189 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
       // with zero attachment rows, and this dup short-circuit would otherwise
       // skip it forever. A rescan (accounts.js /rescan-all clears the delta
       // cursor, re-walking every message) now self-heals those rows here.
+      //
       // Guarded so it only fires when the stored row has NO attachments and we
-      // now have some — it never duplicates rows or re-touches complete ones.
+      // now have some. The guard used to be a separate COUNT then INSERT, which
+      // two overlapping walks could both pass — that is how one message ended
+      // up with its logo stored twice. Now the "still none?" check and the
+      // insert are one statement under the message's lock, and the walk that
+      // inserted the message holds that same lock through its own attachment
+      // insert, so a concurrent backfill waits and then sees those rows.
       const incoming = (Array.isArray(parsed.attachments) ? parsed.attachments : [])
         .filter(a => a.content);
-      if (incoming.length) {
-        const have = await one(
-          'SELECT COUNT(*)::int AS n FROM attachments WHERE message_id = $1',
-          [dup.id]
-        );
-        if (have && have.n === 0) {
-          await insertAttachmentRows(dup.id, acc.workspace_id, incoming);
-          await query('UPDATE messages SET has_attachments = 1 WHERE id = $1', [dup.id]);
-          console.log(`[ingest] backfilled ${incoming.length} attachment(s) onto existing message ${messageId} (${acc.email})`);
+      if (incoming.length && !dup.has_att) {
+        const params = [dup.id];
+        const values = attachmentValues(dup.id, acc.workspace_id, incoming, params);
+        // A data exception or statement timeout here means these attachment rows
+        // can't be stored (see isAttachmentRejected), and would fail the same way
+        // on every re-walk — log it and move on rather than failing (IMAP:
+        // wedging) the walk on a message that is already stored. See the
+        // matching fallback in the insert below.
+        let r;
+        try {
+          r = await txLocked(ingestLockKey(acc.id, dir, messageId), (client) => client.query(
+            `WITH a AS (
+               INSERT INTO attachments (${ATTACHMENT_COLUMNS})
+               SELECT v.* FROM (VALUES ${values}) AS v
+                WHERE NOT EXISTS (SELECT 1 FROM attachments x WHERE x.message_id = $1::text)
+               RETURNING 1
+             ), u AS (
+               UPDATE messages SET has_attachments = 1
+                WHERE id = $1::text AND EXISTS (SELECT 1 FROM a)
+               RETURNING 1
+             )
+             SELECT (SELECT count(*) FROM a)::int AS n`,
+            params
+          ));
+        } catch (e) {
+          if (!isAttachmentRejected(e)) throw e;
+          console.warn(`[ingest] attachment backfill rejected for ${messageId} (${acc.email}): ${e.message}`);
+        }
+        const n = r && r.rows[0] ? r.rows[0].n : 0;
+        if (n > 0) {
+          console.log(`[ingest] backfilled ${n} attachment(s) onto existing message ${messageId} (${acc.email})`);
         }
       }
       return false;
     }
   }
 
-  const threadId = await findOrCreateThread(acc.workspace_id, parsed, acc.team_space_id, acc.id, acc.email);
+  // Thread lookups run on the global pool, outside the transaction: they only
+  // read, and keeping them out keeps the lock held for as short as possible.
+  const resolved = await resolveThread(acc.workspace_id, parsed, acc.team_space_id, acc.id, acc.email);
+  const newThread = resolved.newThread || null;
+  const threadId = newThread ? newThread.id : resolved.threadId;
   const id = uuid();
   const sentAt = parsed.date ? new Date(parsed.date).getTime() : Date.now();
   const attachments = Array.isArray(parsed.attachments) ? parsed.attachments : [];
   const hasAtt = attachments.length > 0 ? 1 : 0;
 
-  await query(
-    `INSERT INTO messages
-      (id, thread_id, account_id, workspace_id, direction, folder, message_id, in_reply_to,
-       subject, from_addr, to_addrs, cc_addrs, body_text, body_html, sent_at, imap_uid,
-       has_attachments, created_at, provider_conversation_id)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
-    [
-      id, threadId, acc.id, acc.workspace_id, dir, folder || null, messageId || null,
-      (parsed.inReplyTo || '').replace(/[<>]/g, '') || null,
-      parsed.subject || '',
-      fromAddr,
-      normalizeAddrList(parsed.to),
-      normalizeAddrList(parsed.cc),
-      parsed.text || '',
-      parsed.html || '',
-      sentAt, uid, hasAtt, Date.now(),
-      // Null on the IMAP path — only Graph gives us a conversation id.
-      parsed._graphConversationId || null
-    ]
-  );
+  // One statement does the re-check and every insert:
+  //   d — is the message there now? Its snapshot is taken after the lock was
+  //       granted, so it sees a copy another walk committed while we waited.
+  //   t — the new thread, only if resolveThread asked for one and d is empty.
+  //   m — the message, only if d is empty. The bare ON CONFLICT DO NOTHING
+  //       (never a targeted one, which fails 42P10 while the index is absent)
+  //       absorbs a clash with uq_messages_acct_dir_msgid from a writer that
+  //       doesn't take this lock.
+  //   a — the attachments, only if m inserted.
+  // Parent and child rows in one statement pass the FK checks, because RI
+  // triggers fire at the end of the statement. Every parameter is cast: in
+  // INSERT ... SELECT there is no target column to infer types from.
+  const params = [
+    messageId || null, acc.id, dir,                                    // $1-$3
+    !!newThread, threadId, acc.workspace_id,                           // $4-$6
+    newThread && newThread.team_space_id,                              // $7
+    newThread && newThread.subject,                                    // $8
+    newThread && newThread.participants,                               // $9
+    newThread && newThread.last_message_at,                            // $10
+    newThread && newThread.message_id_root,                            // $11
+    newThread && newThread.search_text,                                // $12
+    newThread && newThread.created_at,                                 // $13
+    id, folder || null,                                                // $14-$15
+    (parsed.inReplyTo || '').replace(/[<>]/g, '') || null,             // $16
+    parsed.subject || '',                                              // $17
+    fromAddr,                                                          // $18
+    normalizeAddrList(parsed.to),                                      // $19
+    normalizeAddrList(parsed.cc),                                      // $20
+    parsed.text || '',                                                 // $21
+    parsed.html || '',                                                 // $22
+    sentAt, uid, hasAtt, Date.now(),                                   // $23-$26
+    // Null on the IMAP path — only Graph gives us a conversation id.
+    parsed._graphConversationId || null                                // $27
+  ];
+  const attRows = attachments.filter(a => a.content);
+  // Attachment parameters are appended after $27; remember where the message's
+  // own parameters end so the no-attachments retry below can drop them (an
+  // unreferenced parameter fails the whole statement).
+  const baseParamCount = params.length;
+  const attValues = attRows.length ? attachmentValues(id, acc.workspace_id, attRows, params) : null;
 
-  await insertAttachmentRows(id, acc.workspace_id, attachments.filter(a => a.content));
+  const buildInsertSql = (withAtt) =>
+    `WITH d AS (
+       SELECT id FROM messages
+        WHERE message_id = $1::text AND account_id = $2::text AND direction = $3::text
+        ORDER BY sent_at, id
+        LIMIT 1
+     ), t AS (
+       INSERT INTO threads (id, workspace_id, team_space_id, subject, participants, last_message_at, status,
+                            message_id_root, search_text, created_at)
+       SELECT $5::text, $6::text, $7::text, $8::text, $9::text, $10::bigint, 'open',
+              $11::text, $12::text, $13::bigint
+        WHERE $4::boolean AND NOT EXISTS (SELECT 1 FROM d)
+       RETURNING id
+     ), m AS (
+       INSERT INTO messages
+         (id, thread_id, account_id, workspace_id, direction, folder, message_id, in_reply_to,
+          subject, from_addr, to_addrs, cc_addrs, body_text, body_html, sent_at, imap_uid,
+          has_attachments, created_at, provider_conversation_id)
+       SELECT $14::text, $5::text, $2::text, $6::text, $3::text, $15::text, $1::text, $16::text,
+              $17::text, $18::text, $19::text, $20::text, $21::text, $22::text, $23::bigint, $24::bigint,
+              $25::int, $26::bigint, $27::text
+        WHERE NOT EXISTS (SELECT 1 FROM d)
+       ON CONFLICT DO NOTHING
+       RETURNING id
+     )${withAtt ? `, a AS (
+       INSERT INTO attachments (${ATTACHMENT_COLUMNS})
+       SELECT v.* FROM (VALUES ${attValues}) AS v
+        WHERE EXISTS (SELECT 1 FROM m)
+       RETURNING 1
+     )` : ''}
+     SELECT (SELECT id FROM d) AS dup_id, (SELECT id FROM m) AS new_id`;
+
+  const runWith = (withAtt) => async (client) => {
+    const r = await client.query(buildInsertSql(withAtt), withAtt ? params : params.slice(0, baseParamCount));
+    const row = r.rows[0] || {};
+    // Neither a dup nor an insert: m hit ON CONFLICT (a writer that doesn't
+    // take this lock got there first). t may have inserted a thread for us
+    // that now holds nothing — drop it before COMMIT.
+    if (!row.new_id && !row.dup_id && newThread) {
+      await client.query(
+        `DELETE FROM threads t WHERE t.id = $1
+            AND NOT EXISTS (SELECT 1 FROM messages x WHERE x.thread_id = t.id)`,
+        [newThread.id]
+      );
+    }
+    return row;
+  };
+  // No Message-ID means no dedup identity (these were never deduped), so there
+  // is nothing to lock on — a plain transaction keeps thread + message atomic.
+  const store = (withAtt) => messageId
+    ? txLocked(ingestLockKey(acc.id, dir, messageId), runWith(withAtt))
+    : tx(runWith(withAtt));
+  let result;
+  try {
+    result = await store(!!attValues);
+  } catch (e) {
+    // Message and attachments share one statement, so a bad attachment row (a
+    // data exception, class 22 — e.g. a NUL byte in a filename or content id)
+    // or one too big to write before the statement_timeout (57014) would roll
+    // the message back too. Graph skips a non-structural failure and its saved
+    // delta link then covers the message, so it would be lost for good; a
+    // timeout (structural) would instead stall the walk on it every poll.
+    // Store the message alone instead; has_attachments stays set and the
+    // dup-backfill branch above retries the attachments on a later rescan. If
+    // the database itself is timing out, this retry fails too and throws.
+    if (!attValues || !isAttachmentRejected(e)) throw e;
+    console.warn(`[ingest] attachments rejected for ${messageId || '(no Message-ID)'} (${acc.email}) — storing message without them: ${e.message}`);
+    result = await store(false);
+  }
+
+  if (!result.new_id) {
+    // Another walk (or instance) stored this message between our fast-path
+    // check and taking the lock. Nothing was written, so no side effects fire.
+    // This line is the metric for the guard working — it should be rare.
+    console.log(`[ingest] lost race ${messageId} (${acc.email}) — already stored as ${result.dup_id || 'a conflicting row'}`);
+    // Same conversation-id backfill as the fast-path dup branch: the winner is
+    // often compose/reply, which stores none, and a delta walk won't come back.
+    if (result.dup_id && parsed._graphConversationId) {
+      await query(
+        'UPDATE messages SET provider_conversation_id = $1 WHERE id = $2 AND provider_conversation_id IS NULL',
+        [parsed._graphConversationId, result.dup_id]
+      );
+    }
+    return false;
+  }
 
   // Update thread search text + bump last_message_at.
   //
@@ -552,7 +733,8 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
 
   // Split into two updates so a tsvector overflow on the GIN index can't
   // abort ingestMessage. The non-search fields always succeed; search_text
-  // is best-effort via appendThreadSearchText.
+  // is best-effort via appendThreadSearchText. Both run after COMMIT, outside
+  // the lock, so they never hold it and need no SAVEPOINT.
   //
   // last_message_at only ever advances — never regresses. Messages can be
   // ingested out of chronological order (separate INBOX/Sent sync passes,
@@ -743,7 +925,105 @@ async function syncFolder(client, acc, folder, direction) {
   return count;
 }
 
-async function syncAccount(accountId) {
+// One walk per account at a time (per instance). The 30s poll, IMAP IDLE,
+// /:id/sync and /rescan-all all start walks, and cursors (Graph delta_link,
+// IMAP last_sync_uid) are only saved when a walk ENDS — so a walk that ran past
+// 30s used to be joined by a second, then a third, each replaying the same mail
+// from the same old cursor. That overlap (initial onboarding syncs, the
+// post-outage catch-up) is where the duplicate message rows came from.
+//
+// A call made while a walk is running coalesces onto it and gets its result.
+// `rerun` (IDLE saw new mail after the walk may have passed it) and `fresh`
+// (/rescan-all: drop the cursors and re-walk everything) can't be satisfied by
+// the running walk, so they set a flag and exactly ONE follow-up walk runs when
+// it finishes — clearing the cursors first if fresh was asked for. Clearing
+// them mid-walk would be undone: the running walk saves its own cursor at the
+// end. A long first sync is exactly when overlap does the most damage, so a
+// running walk is logged after 15 minutes but left alone — until STUCK_WALK_MS.
+// Nothing guarantees a walk settles (a query on a silently dead socket, a Graph
+// fetch that never ends), and without an escape one hung await would stop this
+// mailbox syncing until a restart. Past the cap, the next call presumes the walk
+// stuck and starts a new one alongside it. That overlap is duplicate-safe now
+// (the per-message ingest lock and its locked re-check); if the old walk does
+// finish and save its older cursor, the next walk just replays stored mail.
+const inflight = new Map(); // accountId -> { p, startedAt, again, fresh, warnedMin }
+const STILL_RUNNING_WARN_MS = 15 * 60_000;
+const STUCK_WALK_MS = 45 * 60_000;
+
+function syncAccount(accountId, { rerun = false, fresh = false } = {}) {
+  const cur = inflight.get(accountId);
+  if (cur && Date.now() - cur.startedAt >= STUCK_WALK_MS) {
+    console.warn(`[sync] walk for ${accountId} has run ${Math.floor((Date.now() - cur.startedAt) / 60_000)}m — presuming it stuck, starting a new one alongside`);
+    // The new walk takes over the old one's pending requests; the old one,
+    // if it ever finishes, must not chain a follow-up or clear the new entry.
+    fresh = fresh || cur.fresh;
+    cur.again = false;
+    inflight.delete(accountId);
+  } else if (cur) {
+    if (rerun || fresh) cur.again = true;
+    if (fresh) cur.fresh = true;
+    const ranMs = Date.now() - cur.startedAt;
+    const mins = Math.floor(ranMs / 60_000);
+    // Once per minute at most — the poll alone calls in every 30s.
+    if (ranMs >= STILL_RUNNING_WARN_MS && cur.warnedMin !== mins) {
+      cur.warnedMin = mins;
+      console.warn(`[sync] still running ${mins}m for ${accountId} — not starting another walk`);
+    }
+    return cur.p;
+  }
+  const entry = { startedAt: Date.now(), again: false, fresh: false, warnedMin: null };
+  entry.p = (async () => {
+    try {
+      if (fresh) await clearCursors(accountId);
+      return await _syncAccountImpl(accountId);
+    } finally {
+      if (inflight.get(accountId) === entry) inflight.delete(accountId);
+      if (entry.again) {
+        syncAccount(accountId, { fresh: entry.fresh }).catch((err) => {
+          console.warn(`[sync] follow-up walk failed for ${accountId}: ${err && err.message}`);
+        });
+      }
+    }
+  })();
+  inflight.set(accountId, entry);
+  return entry.p;
+}
+
+// Resolves true once no walk is running for this account — waiting out the
+// current one and any follow-up it chains — or false if that takes longer than
+// maxMs. For writers that must not overlap a walk of the same account but don't
+// go through the per-message lock (util/relink_orphans.js).
+async function waitForIdle(accountId, maxMs) {
+  const deadline = Date.now() + maxMs;
+  for (;;) {
+    const cur = inflight.get(accountId);
+    if (!cur) return true;
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    let timer;
+    await Promise.race([
+      cur.p.catch(() => {}),
+      new Promise((resolve) => { timer = setTimeout(resolve, left); })
+    ]);
+    clearTimeout(timer);
+  }
+}
+
+// Forget where every folder walk left off, so the next walk re-reads the whole
+// mailbox: Graph resumes from delta_link, IMAP from last_sync_uid (uid_validity
+// is kept — it describes the server mailbox, not our progress). Re-reading is
+// safe because ingest dedupes on (message_id, account_id, direction). Only
+// called from syncAccount's wrapper, before a walk starts, so no running walk
+// (bar one already presumed stuck) can save its old cursor over the reset.
+async function clearCursors(accountId) {
+  await query(
+    `UPDATE folder_sync_state SET delta_link = NULL, last_sync_uid = 0
+      WHERE account_id = $1`,
+    [accountId]
+  );
+}
+
+async function _syncAccountImpl(accountId) {
   const acc = await getAccount(accountId);
   if (!acc) return 0;
   // Microsoft accounts sync via Graph instead of IMAP — outlook.office365.com
@@ -936,7 +1216,9 @@ async function startWatching(accountId) {
     await client.connect();
     await client.mailboxOpen('INBOX');
     client.on('exists', async () => {
-      try { await syncAccount(accountId); } catch (e) { console.error('idle sync', e.message); }
+      // rerun: if a walk is already running it may have passed this new
+      // message's UID already, so ask for one more walk after it.
+      try { await syncAccount(accountId, { rerun: true }); } catch (e) { console.error('idle sync', e.message); }
     });
     // Connected cleanly — clear any backoff so the *next* drop starts
     // at 5s again instead of inheriting an old long delay.
@@ -1000,5 +1282,9 @@ module.exports = {
   appendToSentFolder, appendThreadSearchText, fireWebhook,
   // Exposed so graph.js can drive the same ingest pipeline without
   // duplicating thread/message/attachment INSERT logic.
-  ingestMessage, recordSyncError, getAccount
+  ingestMessage, recordSyncError, getAccount,
+  // Compose, reply and scheduled send take the same per-message lock as ingest.
+  ingestLockKey,
+  // Orphan relink waits for the account's walk to finish before it runs.
+  waitForIdle
 };

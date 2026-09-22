@@ -1,10 +1,10 @@
 const express = require('express');
 const multer = require('multer');
 const { v4: uuid } = require('uuid');
-const { one, many, query, tx } = require('../db');
+const { one, many, query, tx, txLockedAfterSend } = require('../db');
 const { requireAuth } = require('../auth');
 const { sendEmail } = require('../email/smtp');
-const { appendThreadSearchText } = require('../email/imap');
+const { appendThreadSearchText, ingestLockKey } = require('../email/imap');
 const { emitToWorkspace } = require('../sockets');
 const { fireWebhook } = require('../email/imap');
 const wrap = require('../util/wrap');
@@ -570,36 +570,96 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
     attachments: files
   });
 
-  const id = uuid();
+  let id = uuid();
   const now = Date.now();
+  // `|| null`, never '': an empty Message-ID is not a dedup identity (see
+  // compose.js).
+  const sentMessageId = sent.messageId || null;
   // folder='Sent' so the dedup key (message_id, account_id, folder)
   // matches when IMAP later polls the sender's Sent folder for the
   // same message. Without this we'd end up with two outbound rows.
-  await query(
-    `INSERT INTO messages
-      (id, thread_id, account_id, workspace_id, direction, folder, message_id, in_reply_to,
-       subject, from_addr, to_addrs, cc_addrs, body_text, body_html, sent_at, has_attachments, created_at)
-      VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
-    [
-      id, t.id, acc.id, req.user.workspace_id, sent.messageId,
-      target ? target.message_id : null, replySubject,
-      '', replyTo, replyCc || '', body_text || '', body_html || '', now,
-      files.length ? 1 : 0, now
-    ]
-  );
-  if (files.length) {
-    const values = [];
-    const params = [];
-    for (const f of files) {
-      const base = params.length;
-      values.push(`($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, $${base+8})`);
-      params.push(uuid(), id, req.user.workspace_id, f.filename, f.content_type, f.size, f.content, now);
-    }
-    await query(
-      `INSERT INTO attachments (id, message_id, workspace_id, filename, content_type, size_bytes, data, created_at)
-       VALUES ${values.join(', ')}`,
-      params
+  //
+  // The email is already sent, so a DB clash must resolve to "reuse the row
+  // that's there", never a 500. Same shape as compose: under the per-message
+  // ingest lock, one statement re-checks (d — a Sent Items walk already stored
+  // it, including one that committed while we waited for the lock) and inserts
+  // only if nothing is there. The bare ON CONFLICT DO NOTHING absorbs
+  // uq_messages_acct_dir_msgid if a writer got in without the lock (e.g. our
+  // own no-lock fallback in txLockedAfterSend).
+  const store = async (client) => {
+    const r = await client.query(
+      `WITH d AS (
+         SELECT m.id
+           FROM messages m
+          WHERE m.account_id = $3::text AND m.direction = 'outbound' AND m.message_id = $5::text
+          ORDER BY m.sent_at, m.id
+          LIMIT 1
+       ), m AS (
+         INSERT INTO messages
+           (id, thread_id, account_id, workspace_id, direction, folder, message_id, in_reply_to,
+            subject, from_addr, to_addrs, cc_addrs, body_text, body_html, sent_at, has_attachments, created_at)
+         SELECT $1::text, $2::text, $3::text, $4::text, 'outbound', 'Sent', $5::text, $6::text,
+                $7::text, $8::text, $9::text, $10::text, $11::text, $12::text, $13::bigint, $14::int, $15::bigint
+          WHERE NOT EXISTS (SELECT 1 FROM d)
+         ON CONFLICT DO NOTHING
+         RETURNING id
+       )
+       SELECT (SELECT id FROM d) AS dup_id, (SELECT id FROM m) AS new_id`,
+      [
+        id, t.id, acc.id, req.user.workspace_id, sentMessageId,
+        target ? target.message_id : null, replySubject,
+        '', replyTo, replyCc || '', body_text || '', body_html || '', now,
+        files.length ? 1 : 0, now
+      ]
     );
+    const row = r.rows[0] || {};
+    if (row.new_id) return null;
+    if (row.dup_id) return { id: row.dup_id };
+    // Conflicted with a row d couldn't see (committed after this statement
+    // began) — a fresh statement can.
+    const ex = await client.query(
+      `SELECT m.id
+         FROM messages m
+        WHERE m.account_id = $1 AND m.direction = 'outbound' AND m.message_id = $2
+        ORDER BY m.sent_at, m.id
+        LIMIT 1`,
+      [acc.id, sentMessageId]
+    );
+    if (!ex.rows[0]) throw new Error(`reply insert conflicted but no row found for ${sentMessageId}`);
+    return ex.rows[0];
+  };
+  // No Message-ID means no dedup identity and nothing to lock on.
+  const existing = sentMessageId
+    ? await txLockedAfterSend(ingestLockKey(acc.id, 'outbound', sentMessageId), store, '[reply]')
+    : await tx(store);
+  if (existing) {
+    console.log(`[reply] ${sentMessageId} (${acc.email}) already stored as ${existing.id} — reusing it`);
+    id = existing.id;
+  }
+  // Attachments: a second, short transaction under the same lock, inserting
+  // only if the row still has none — see compose.js. That stops a Sent Items
+  // backfill landing between our COMMIT and here from doubling every file, and
+  // keeps a reused row's own attachments as they are.
+  if (files.length) {
+    const storeAtt = async (client) => {
+      const has = await client.query('SELECT 1 FROM attachments WHERE message_id = $1 LIMIT 1', [id]);
+      if (has.rows.length) return;
+      if (existing) await client.query('UPDATE messages SET has_attachments = 1 WHERE id = $1', [id]);
+      const values = [];
+      const params = [];
+      for (const f of files) {
+        const base = params.length;
+        values.push(`($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, $${base+8})`);
+        params.push(uuid(), id, req.user.workspace_id, f.filename, f.content_type, f.size, f.content, now);
+      }
+      await client.query(
+        `INSERT INTO attachments (id, message_id, workspace_id, filename, content_type, size_bytes, data, created_at)
+         VALUES ${values.join(', ')}`,
+        params
+      );
+    };
+    if (sentMessageId) await txLockedAfterSend(ingestLockKey(acc.id, 'outbound', sentMessageId), storeAtt, '[reply]');
+    else await tx(storeAtt);
   }
 
   await query(

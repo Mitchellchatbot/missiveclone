@@ -1,10 +1,10 @@
 const express = require('express');
 const multer = require('multer');
 const { v4: uuid } = require('uuid');
-const { one, query, tx } = require('../db');
+const { one, tx, txLockedAfterSend } = require('../db');
 const { requireAuth } = require('../auth');
 const { sendEmail } = require('../email/smtp');
-const { fireWebhook } = require('../email/imap');
+const { fireWebhook, ingestLockKey } = require('../email/imap');
 const { emitToWorkspace } = require('../sockets');
 const wrap = require('../util/wrap');
 
@@ -92,46 +92,137 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
   });
 
   // Create a new thread + outbound message in our DB.
-  const threadId = uuid();
-  const messageId = sent.messageId;
+  // `|| null`, never '': an empty Message-ID (smtp.js can return one) is not a
+  // dedup identity, and storing '' would make unrelated sends look like copies
+  // of each other to the dedup key and the unique index.
+  const messageId = sent.messageId || null;
   const now = Date.now();
   const cleanSubj = subject.replace(/^(re|fwd|fw)\s*:\s*/i, '').trim();
   const participants = [acc.email, to, cc].filter(Boolean).join('; ');
 
-  await query(
-    `INSERT INTO threads (id, workspace_id, team_space_id, subject, participants,
-                          last_message_at, status, message_id_root, search_text, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, 'open', $7, $8, $9)`,
-    [threadId, req.user.workspace_id, acc.team_space_id || null,
-     cleanSubj || subject, participants, now, messageId || null,
-     (cleanSubj || subject) + ' ' + participants,
-     now]
-  );
-
-  const msgId = uuid();
-  // folder='Sent' is written here so that when IMAP later polls the
-  // sender's Sent folder (or appendToSentFolder mirrors the message
-  // there) the dedup key (message_id, account_id, folder) matches and
-  // we don't end up with two outbound rows for one email. Without
-  // this, the dedup would miss because the existing row had
-  // folder=NULL while the IMAP fetch carried folder='Sent'.
-  await query(
-    `INSERT INTO messages
-      (id, thread_id, account_id, workspace_id, direction, folder, message_id,
-       subject, from_addr, to_addrs, cc_addrs, body_text, body_html, sent_at,
-       has_attachments, is_automated, is_weekly_update, created_at)
-      VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-    [msgId, threadId, acc.id, req.user.workspace_id, messageId,
-     subject, '', to, cc || '', body_text || '', body_html || '',
-     now, files.length ? 1 : 0, isAutomated, isWeeklyUpdate, now]
-  );
-  for (const f of files) {
-    const aid = uuid();
-    await query(
-      `INSERT INTO attachments (id, message_id, workspace_id, filename, content_type, size_bytes, data, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [aid, msgId, req.user.workspace_id, f.filename, f.content_type, f.size, f.content, now]
+  // The email is already out, so from here on a DB clash must resolve to "use
+  // the row that's there", never a 500. Thread + message go in one transaction
+  // under the same per-message lock ingest takes: a Sent Items walk that
+  // already stored this email is found by the re-check (no second row, no empty
+  // thread), and one arriving later waits for us and then dedupes against us.
+  // txLockedAfterSend waits out a busy ingest holder, and if the lock still
+  // can't be had it stores without it rather than failing a sent email.
+  const findExisting = async (client) => (await client.query(
+    `SELECT m.id, m.thread_id
+       FROM messages m
+      WHERE m.account_id = $1 AND m.direction = 'outbound' AND m.message_id = $2
+      ORDER BY m.sent_at, m.id
+      LIMIT 1`,
+    [acc.id, messageId]
+  )).rows[0] || null;
+  // Reusing a synced copy: it was ingested without our flags, and DD reads
+  // them (is_automated keeps bulk sends out of touchpoint health).
+  const reuse = async (client, row) => {
+    if (isAutomated || isWeeklyUpdate) {
+      await client.query(
+        `UPDATE messages SET is_automated = GREATEST(is_automated, $2),
+                             is_weekly_update = GREATEST(is_weekly_update, $3)
+          WHERE id = $1`,
+        [row.id, isAutomated, isWeeklyUpdate]
+      );
+    }
+    return { threadId: row.thread_id, msgId: row.id, reused: true };
+  };
+  // Built the same way as ingest's insert (imap.js ingestMessage): one
+  // statement re-checks and inserts, so the common path is three round trips
+  // on the pinned connection (lock, this, COMMIT) — this runs after the user
+  // already waited on the SMTP/Graph send, over a slow link.
+  //   d — the email is already stored (a Sent Items walk got there first). Its
+  //       snapshot is taken after the lock was granted, so it sees a copy
+  //       committed while we waited. Never matches when messageId is null.
+  //   t / m — the new thread and message, only if d is empty. Bare ON CONFLICT
+  //       DO NOTHING (never a targeted one, which fails 42P10 while the index is
+  //       absent) absorbs uq_messages_acct_dir_msgid if an unlocked writer won.
+  // folder='Sent' so the dedup key matches the copy a later Sent-folder poll
+  // (or appendToSentFolder's mirror) brings in — a NULL folder used to make
+  // the old (message_id, account_id, folder) dedup miss it.
+  // Every parameter is cast: INSERT ... SELECT has no target column to infer
+  // types from.
+  const store = async (client) => {
+    const threadId = uuid();
+    const msgId = uuid();
+    const r = await client.query(
+      `WITH d AS (
+         SELECT m.id, m.thread_id
+           FROM messages m
+          WHERE m.account_id = $3::text AND m.direction = 'outbound' AND m.message_id = $5::text
+          ORDER BY m.sent_at, m.id
+          LIMIT 1
+       ), t AS (
+         INSERT INTO threads (id, workspace_id, team_space_id, subject, participants,
+                              last_message_at, status, message_id_root, search_text, created_at)
+         SELECT $2::text, $4::text, $17::text, $18::text, $19::text, $12::bigint, 'open', $5::text, $20::text, $16::bigint
+          WHERE NOT EXISTS (SELECT 1 FROM d)
+         RETURNING id
+       ), m AS (
+         INSERT INTO messages
+           (id, thread_id, account_id, workspace_id, direction, folder, message_id,
+            subject, from_addr, to_addrs, cc_addrs, body_text, body_html, sent_at,
+            has_attachments, is_automated, is_weekly_update, created_at)
+         SELECT $1::text, $2::text, $3::text, $4::text, 'outbound', 'Sent', $5::text,
+                $6::text, $7::text, $8::text, $9::text, $10::text, $11::text, $12::bigint,
+                $13::int, $14::int, $15::int, $16::bigint
+          WHERE NOT EXISTS (SELECT 1 FROM d)
+         ON CONFLICT DO NOTHING
+         RETURNING id
+       )
+       SELECT (SELECT id FROM d) AS dup_id, (SELECT thread_id FROM d) AS dup_thread_id,
+              (SELECT id FROM m) AS new_id`,
+      [msgId, threadId, acc.id, req.user.workspace_id, messageId,
+       subject, '', to, cc || '', body_text || '', body_html || '',
+       now, files.length ? 1 : 0, isAutomated, isWeeklyUpdate, now,
+       acc.team_space_id || null, cleanSubj || subject, participants,
+       (cleanSubj || subject) + ' ' + participants]
     );
+    const row = r.rows[0] || {};
+    if (row.new_id) return { threadId, msgId, reused: false };
+    if (row.dup_id) {
+      return reuse(client, { id: row.dup_id, thread_id: row.dup_thread_id });
+    }
+    // Lost to a conflicting row: drop the thread we just made (it can only be
+    // empty) and use the existing message instead.
+    await client.query('DELETE FROM threads WHERE id = $1', [threadId]);
+    const existing = await findExisting(client);
+    if (!existing) throw new Error(`message insert conflicted but no row found for ${messageId}`);
+    return reuse(client, existing);
+  };
+  const stored = messageId
+    ? await txLockedAfterSend(ingestLockKey(acc.id, 'outbound', messageId), store, '[compose]')
+    : await tx(store);
+  const { threadId, msgId } = stored;
+  if (stored.reused) {
+    console.log(`[compose] ${messageId} (${acc.email}) already stored as ${msgId} — reusing it`);
+  }
+
+  // Attachments go in a second, short transaction after the message commits (a
+  // failed upload must not lose the row of an email that was already sent), but
+  // under the same per-message lock, and only if the row still has none. A
+  // Sent Items walk can reach this message between our COMMIT and here: its
+  // attachment backfill takes this lock and also inserts only when there are
+  // none, so whichever of the two runs second adds nothing — no second copy of
+  // each file. The same check keeps a reused row's own attachments as they are.
+  // While a big upload holds the lock, an ingest of this one message times out
+  // on it (55P03) and its walk retries on the next poll.
+  if (files.length) {
+    const storeAtt = async (client) => {
+      const has = await client.query('SELECT 1 FROM attachments WHERE message_id = $1 LIMIT 1', [msgId]);
+      if (has.rows.length) return;
+      if (stored.reused) await client.query('UPDATE messages SET has_attachments = 1 WHERE id = $1', [msgId]);
+      for (const f of files) {
+        await client.query(
+          `INSERT INTO attachments (id, message_id, workspace_id, filename, content_type, size_bytes, data, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [uuid(), msgId, req.user.workspace_id, f.filename, f.content_type, f.size, f.content, now]
+        );
+      }
+    };
+    if (messageId) await txLockedAfterSend(ingestLockKey(acc.id, 'outbound', messageId), storeAtt, '[compose]');
+    else await tx(storeAtt);
   }
 
   // account_id on the wire is what lets DelegationDoer's per-user SSE

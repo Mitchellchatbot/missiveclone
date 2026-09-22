@@ -148,11 +148,31 @@ async function sendAsDraftViaGraph(token, mail, attachments, tag = '[graph]') {
   await assertGraphOk(draftRes, 201, 'create draft');
   const draft = await draftRes.json();
   const draftId = draft.id;
-  const internetMessageId = stripBrackets(draft.internetMessageId);
+  let internetMessageId = stripBrackets(draft.internetMessageId);
 
   // 2) Attach files after creation so large ones can use an upload session
   //    (inlining them in the create body caps out at Graph's ~3 MB limit).
   if (attachments.length) await addAttachmentsToDraft(token, draftId, attachments, tag);
+
+  // 2b) Re-read internetMessageId right before sending, exactly as the reply
+  //     path does: Graph can regenerate it after the draft changes. The id we
+  //     return is stored on the compose row, and if it doesn't match the id on
+  //     the Sent Items copy, ingest can't recognise that copy as the same email
+  //     and stores it a second time. Read before the send, not after — once
+  //     sent the draft moves to Sent Items and draftId may no longer resolve.
+  //     Falls back to the create-time value.
+  try {
+    const getRes = await fetch(
+      `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}?$select=internetMessageId`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (getRes.ok) {
+      const fresh = await getRes.json();
+      if (fresh.internetMessageId) internetMessageId = stripBrackets(fresh.internetMessageId);
+    }
+  } catch (e) {
+    console.warn(`${tag} could not re-read internetMessageId for draft ${draftId}: ${e.message}`);
+  }
 
   // 3) Send.
   const sendRes = await fetch(
@@ -674,8 +694,13 @@ async function fetchAttachmentsForMessage(token, messageGraphId) {
 //   42703 undefined_column      42P01 undefined_table
 //   42883 undefined_function    42P07 duplicate_table
 //   53300 too_many_connections  57014 query_canceled (statement_timeout)
+//   55P03 lock_not_available    40P01 deadlock_detected
 //   08xxx connection exceptions
-const STRUCTURAL_PG_CODES = new Set(['42703', '42P01', '42883', '42P07', '53300', '57014']);
+// 55P03/40P01: ingest waits on a per-message advisory lock (db.txLocked) with a
+// lock_timeout. A timeout there says "another writer is busy with this
+// message", not "this message is bad" — skipping it would advance the cursor
+// past mail that was never stored. Abort and let the next poll retry.
+const STRUCTURAL_PG_CODES = new Set(['42703', '42P01', '42883', '42P07', '53300', '57014', '55P03', '40P01']);
 
 function isStructuralDbError(e) {
   const code = e && e.code;
