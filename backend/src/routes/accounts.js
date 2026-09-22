@@ -6,6 +6,7 @@ const { requireAuth } = require('../auth');
 const { encrypt } = require('../crypto');
 const { syncAccount, startWatching, stopWatching } = require('../email/imap');
 const wrap = require('../util/wrap');
+const { relinkOrphanMessages } = require('../util/relink_orphans');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -64,12 +65,8 @@ router.post('/', wrap(async (req, res) => {
   );
 
   // Re-link any orphaned messages from a previous connection of this email.
-  await query(
-    `UPDATE messages SET account_id = $1
-     WHERE workspace_id = $2 AND account_id IS NULL
-       AND (to_addrs ILIKE $3 OR from_addr ILIKE $3 OR cc_addrs ILIKE $3)`,
-    [id, req.user.workspace_id, `%${email}%`]
-  );
+  // Best-effort (never throws) so a relink failure can't block the sync below.
+  await relinkOrphanMessages(id, req.user.workspace_id, email);
 
   syncAccount(id).then(() => startWatching(id)).catch(err => console.error('initial sync error', err));
   res.json({ id });
@@ -181,6 +178,11 @@ router.post('/:id/test-graph', wrap(async (req, res) => {
 // messages is bandwidth cost only — no duplicate rows. Returns
 // immediately and runs sync in the background; check /api/accounts
 // for last_synced_at to know when each account is done.
+//
+// The cursor reset itself happens inside syncAccount ({ fresh: true } →
+// clearCursors), not here. Clearing it here while a walk was already running
+// did nothing: that walk saved its own cursor when it finished, undoing the
+// reset. syncAccount instead clears the cursors just before its next walk.
 router.post('/rescan-all', wrap(async (req, res) => {
   const accs = await many(
     `SELECT id, email FROM email_accounts
@@ -189,17 +191,11 @@ router.post('/rescan-all', wrap(async (req, res) => {
   );
   if (!accs.length) return res.json({ ok: true, accounts: 0 });
 
-  await query(
-    `UPDATE folder_sync_state SET delta_link = NULL
-     WHERE account_id = ANY($1::text[])`,
-    [accs.map(a => a.id)]
-  );
-
   // Fire each sync without awaiting — let them run in parallel and let
   // the response come back fast. Per-user Graph rate limits apply per
   // account, so concurrent fan-out is safe.
   for (const a of accs) {
-    syncAccount(a.id).catch((err) => {
+    syncAccount(a.id, { fresh: true }).catch((err) => {
       console.warn(`[rescan] sync failed for ${a.email}: ${err && err.message}`);
     });
   }
@@ -226,13 +222,11 @@ router.post('/:id/relink-orphans', wrap(async (req, res) => {
     [req.params.id, req.user.workspace_id]
   );
   if (!acc) return res.status(404).json({ error: 'not found' });
-  const r = await query(
-    `UPDATE messages SET account_id = $1
-     WHERE workspace_id = $2 AND account_id IS NULL
-       AND (to_addrs ILIKE $3 OR from_addr ILIKE $3 OR cc_addrs ILIKE $3)`,
-    [acc.id, req.user.workspace_id, `%${acc.email}%`]
-  );
-  res.json({ ok: true, relinked: r.rowCount || 0 });
+  const relinked = await relinkOrphanMessages(acc.id, req.user.workspace_id, acc.email);
+  // null = the UPDATE failed, or this mailbox's sync walk was still running
+  // (relinking alongside it could duplicate rows) — both logged; safe to retry.
+  if (relinked === null) return res.status(503).json({ error: 'relink failed or a sync is still running; retry shortly (see server log)' });
+  res.json({ ok: true, relinked });
 }));
 
 router.get('/:id/signature', wrap(async (req, res) => {
