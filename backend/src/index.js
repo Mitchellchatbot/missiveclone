@@ -22,6 +22,7 @@ process.on('unhandledRejection', (reason) => {
 });
 
 const db = require('./db');
+const { MAX_ATTACHMENTS, MAX_FILE_BYTES, FILES_FIELD } = require('./util/upload');
 const { many, ping, HAS_DB } = db;
 const authRoutes = require('./routes/auth');
 const accountRoutes = require('./routes/accounts');
@@ -108,11 +109,23 @@ app.use((err, _req, res, _next) => {
   // the route runs. Surface a clear, actionable message instead of a generic
   // 500 — the common case is a body bloated by pasted screenshots.
   if (err && err.name === 'MulterError') {
+    // Attaching one file too many does NOT raise LIMIT_FILE_COUNT: multer's
+    // upload.array(field, maxCount) reports the overflow as an unexpected file
+    // on `field`, the same code it uses for a field we never declared. That
+    // left the honest message below unreachable and told senders their perfectly
+    // ordinary batch of photos was an 'Unexpected upload field'. Split on the
+    // field name instead of trusting the code.
+    if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+      return res.status(413).json({
+        error: err.field === FILES_FIELD
+          ? `Too many attachments — ${MAX_ATTACHMENTS} per email is the limit. Send the rest in a second email.`
+          : `Unexpected upload field '${err.field}'.`
+      });
+    }
     const map = {
       LIMIT_FIELD_VALUE: 'The message is too large to send. If you pasted images into the body, attach them as files instead.',
-      LIMIT_FILE_SIZE: 'An attachment is too large (max 150 MB each).',
-      LIMIT_FILE_COUNT: 'Too many attachments (max 10).',
-      LIMIT_UNEXPECTED_FILE: 'Unexpected upload field.'
+      LIMIT_FILE_SIZE: `An attachment is too large (max ${Math.round(MAX_FILE_BYTES / (1024 * 1024))} MB each).`,
+      LIMIT_FILE_COUNT: `Too many attachments (max ${MAX_ATTACHMENTS}).`
     };
     return res.status(413).json({ error: map[err.code] || ('Upload error: ' + err.message) });
   }

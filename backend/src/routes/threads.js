@@ -1,5 +1,4 @@
 const express = require('express');
-const multer = require('multer');
 const { v4: uuid } = require('uuid');
 const { one, many, query, tx } = require('../db');
 const { requireAuth } = require('../auth');
@@ -8,18 +7,10 @@ const { appendThreadSearchText } = require('../email/imap');
 const { emitToWorkspace } = require('../sockets');
 const { fireWebhook } = require('../email/imap');
 const wrap = require('../util/wrap');
+const { attachments } = require('../util/upload');
 
 const router = express.Router();
 router.use(requireAuth);
-
-// fileSize caps a single attachment; 150 MB matches Graph's upload-session
-// ceiling — files over the ~3 MB inline limit get chunked (see graph.js
-// uploadAttachmentViaSession). memoryStorage holds the whole file in RAM,
-// so this cap is also the guard against unbounded uploads.
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 150 * 1024 * 1024, fieldSize: 10 * 1024 * 1024 }
-});
 
 // This service and its database sit an ocean apart (Railway US-West ↔ Supabase
 // ap-southeast-1), so every byte a query returns costs wall-clock time AND holds
@@ -489,7 +480,7 @@ router.post('/bulk', wrap(async (req, res) => {
 // Reply with optional attachments. Multipart form-data:
 //   payload = JSON string: { account_id, body_text, body_html, to, cc, subject }
 //   files[] = uploaded binaries
-router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
+router.post('/:id/reply', attachments, wrap(async (req, res) => {
   let data;
   try { data = JSON.parse(req.body.payload || '{}'); }
   catch { return res.status(400).json({ error: 'payload must be JSON' }); }
