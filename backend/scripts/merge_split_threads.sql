@@ -225,9 +225,29 @@ ORDER BY l.thread_id, w.inbox_count DESC, w.last_message_at ASC, w.thread_id ASC
 -- );
 --
 -- -- Freeze the plan; the statements below mutate the data the view reads.
+-- --
+-- -- PILOT FIRST. Add a WHERE clause to merge a single conversation, confirm it
+-- -- reads correctly in the app, and only then re-run with the filter removed:
+-- --   ... FROM v_thread_merge_plan WHERE from_thread_id = '<one loser id>';
 -- CREATE TEMP TABLE plan ON COMMIT DROP AS SELECT * FROM v_thread_merge_plan;
 -- CREATE TEMP TABLE run ON COMMIT DROP AS
 --   SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint AS at;
+--
+-- -- FULL-ROW BACKUP of every thread about to be deleted. The message log below
+-- -- records what moved, but a thread row carries state that exists nowhere else
+-- -- — assignee_id, starred, snoozed_until, team_space_id, message_id_root,
+-- -- status, search_text — and reconstructing it from its messages silently
+-- -- loses all of that. Stored as jsonb so this keeps working if the table gains
+-- -- columns later.
+-- CREATE TABLE IF NOT EXISTS thread_merge_backup_threads (
+--   run_at    BIGINT NOT NULL,
+--   thread_id TEXT   NOT NULL,
+--   row_json  JSONB  NOT NULL,
+--   PRIMARY KEY (run_at, thread_id)
+-- );
+-- INSERT INTO thread_merge_backup_threads (run_at, thread_id, row_json)
+--   SELECT r.at, t.id, to_jsonb(t)
+--     FROM plan p, run r JOIN threads t ON t.id = p.from_thread_id;
 --
 -- -- Record EVERYTHING we are about to touch, before touching any of it.
 -- INSERT INTO thread_merge_log (run_at, from_thread_id, to_thread_id, kind, row_id)
@@ -327,28 +347,26 @@ ORDER BY l.thread_id, w.inbox_count DESC, w.last_message_at ASC, w.thread_id ASC
 -- =============================================================================
 -- 4. ROLLBACK — undo the most recent apply.
 -- =============================================================================
--- ⚠️ PARTIAL RESTORE, NOT A TIME MACHINE. It returns rows to their original
--- thread. It does NOT undo: the identity fold (the winner keeps the merged
--- participants/search_text), labels moved to the winner, drafts deleted as
--- 'draft-dropped', or the columns lost on recreated threads (assignee_id,
--- starred, snoozed_until, team_space_id, message_id_root). Recreated threads
--- come back with status 'open'. For a true restore, use the snapshot.
+-- ⚠️ NOT A TIME MACHINE. Deleted threads are restored EXACTLY from the jsonb
+-- backup taken in section 3, so assignee_id / starred / snoozed_until /
+-- team_space_id / status all come back. What it still does NOT undo: the
+-- identity fold (the winner keeps the merged participants/search_text), labels
+-- moved to the winner, and drafts deleted as 'draft-dropped'. For those, use the
+-- Supabase snapshot.
 --
 -- BEGIN;
 -- CREATE TEMP TABLE moved ON COMMIT DROP AS
 --   SELECT l.* FROM thread_merge_log l
 --    WHERE l.run_at = (SELECT max(run_at) FROM thread_merge_log);
 --
--- INSERT INTO threads (id, workspace_id, team_space_id, subject, participants,
---                      last_message_at, status, created_at)
--- SELECT DISTINCT ON (mv.from_thread_id)
---        mv.from_thread_id, m.workspace_id, NULL, m.subject, m.from_addr,
---        m.sent_at, 'open', (extract(epoch from now()) * 1000)::bigint
---   FROM moved mv JOIN messages m ON m.id = mv.row_id AND mv.kind = 'message'
---  WHERE NOT EXISTS (SELECT 1 FROM threads t WHERE t.id = mv.from_thread_id)
---  -- DESC: restore the thread's NEWEST message time, so it doesn't sink to the
---  -- bottom of an inbox ordered by last_message_at.
---  ORDER BY mv.from_thread_id, m.sent_at DESC;
+-- -- Restore the deleted thread rows verbatim. jsonb_populate_record maps the
+-- -- saved row back onto the live table definition, so this keeps working even
+-- -- if `threads` gained a column since the backup was taken.
+-- INSERT INTO threads
+-- SELECT (jsonb_populate_record(NULL::threads, b.row_json)).*
+--   FROM thread_merge_backup_threads b
+--  WHERE b.run_at = (SELECT max(run_at) FROM thread_merge_log)
+--    AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.id = b.thread_id);
 --
 -- UPDATE messages m SET thread_id = mv.from_thread_id
 --   FROM moved mv WHERE mv.kind = 'message' AND m.id = mv.row_id;
