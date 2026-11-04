@@ -22,14 +22,17 @@ function verify(token) {
 
 // A session token is exactly what sign() mints: a JSON object (not an array,
 // string or number) with a non-empty string `id` and `workspace_id`, and no
-// `kind` claim. Other JWTs signed with JWT_SECRET (such as the OAuth state)
-// are not sessions and must never authenticate a request. `kind` is rejected
-// when present at all, so kind: null or kind: '' can't slip past a
-// truthiness test.
+// `kind` or `scope` claim. Other JWTs signed with JWT_SECRET (such as the
+// OAuth state) are not sessions and must never authenticate a request. A
+// `scope` claim marks a narrower service token, which only code that enforces
+// that scope may accept; this check refuses it so such a token can never act
+// as a full session. Both claims are rejected when present at all, so
+// kind: null or scope: '' can't slip past a truthiness test.
 // Returns null for a session payload, otherwise the rule it breaks.
 function notSessionReason(payload) {
   if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return 'not-object';
   if (Object.prototype.hasOwnProperty.call(payload, 'kind')) return 'kind';
+  if (Object.prototype.hasOwnProperty.call(payload, 'scope')) return 'scope';
   if (typeof payload.id !== 'string' || payload.id === '') return 'id';
   if (typeof payload.workspace_id !== 'string' || payload.workspace_id === '') return 'workspace_id';
   return null;
