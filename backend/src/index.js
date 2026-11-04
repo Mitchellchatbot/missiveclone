@@ -200,7 +200,7 @@ server.listen(PORT, '0.0.0.0', () => {
         const sock = require('./sockets');
         return { query: dbm.query, tx: dbm.tx, txLockedAfterSend: dbm.txLockedAfterSend, emitToWorkspace: sock.emitToWorkspace };
       })();
-      const { ingestLockKey } = require('./email/imap');
+      const { ingestLockKey, accountFromAddr } = require('./email/imap');
       // Tick guard: a tick that sends several emails (each an SMTP/Graph round
       // trip, plus attachments) can outlast the 30s interval, and the next tick
       // would re-select the same due rows. The atomic claim below is what
@@ -281,10 +281,21 @@ server.listen(PORT, '0.0.0.0', () => {
               // happened above — never wrap that network call in a tx).
               let threadId;
               let msgId;
+              let msgFolder = 'Sent';
               const now = Date.now();
               // `|| null`, never '': an empty Message-ID is not a dedup
               // identity (see routes/compose.js).
               const sentMessageId = sent.messageId || null;
+              // The sender as "Name <address>", the way ingest stores the Sent
+              // Items copy's From (it used to be ''). Best-effort: without it the
+              // row still goes in, just with an empty sender as before.
+              let fromAddr = '';
+              try {
+                const a = await query('SELECT email, display_name FROM email_accounts WHERE id = $1', [s.account_id]);
+                if (a.rows[0]) fromAddr = accountFromAddr(a.rows[0]);
+              } catch (e) {
+                console.warn(`[scheduled] ${s.id}: could not read the sending account (${e.message}) — storing without from_addr`);
+              }
               // Same per-message lock ingest takes (see routes/compose.js), so a
               // Sent Items walk storing this email at the same moment can't
               // leave a second row. The attachments stay inside it: the copy is
@@ -293,7 +304,7 @@ server.listen(PORT, '0.0.0.0', () => {
               // storeCopy may run twice (txLockedAfterSend's no-lock fallback
               // after a rolled-back attempt), so it starts from fresh ids.
               const findExisting = async (client) => (await client.query(
-                `SELECT m.id, m.thread_id,
+                `SELECT m.id, m.thread_id, m.folder,
                         EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id) AS has_att
                    FROM messages m
                   WHERE m.account_id = $1 AND m.direction = 'outbound' AND m.message_id = $2
@@ -304,6 +315,7 @@ server.listen(PORT, '0.0.0.0', () => {
               const storeCopy = async (client) => {
                 threadId = uuid();
                 msgId = uuid();
+                msgFolder = 'Sent';
                 let existing = sentMessageId ? await findExisting(client) : null;
                 if (!existing) {
                   await client.query(
@@ -322,12 +334,13 @@ server.listen(PORT, '0.0.0.0', () => {
                     `INSERT INTO messages (id, thread_id, account_id, workspace_id, direction, folder,
                       message_id, subject, from_addr, to_addrs, cc_addrs, body_text, body_html,
                       sent_at, has_attachments, is_automated, is_weekly_update, created_at)
-                     VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, '', $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                     VALUES ($1, $2, $3, $4, 'outbound', 'Sent', $5, $6, $16, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                      ON CONFLICT DO NOTHING
                      RETURNING id`,
                     [msgId, threadId, s.account_id, s.workspace_id, sentMessageId,
                      s.subject || '', s.to_addrs || '', s.cc_addrs || '',
-                     s.body_text || '', s.body_html || '', now, attachments.length ? 1 : 0, s.is_automated || 0, s.is_weekly_update || 0, now]
+                     s.body_text || '', s.body_html || '', now, attachments.length ? 1 : 0, s.is_automated || 0, s.is_weekly_update || 0, now,
+                     fromAddr]
                   );
                   if (!ins.rowCount) {
                     // The thread above was created in this transaction for this
@@ -343,6 +356,7 @@ server.listen(PORT, '0.0.0.0', () => {
                   console.log(`[scheduled] ${s.id}: ${sentMessageId} already stored as ${existing.id} — reusing it`);
                   threadId = existing.thread_id;
                   msgId = existing.id;
+                  msgFolder = existing.folder || 'Sent';
                   // Don't give a row that already has its attachments a second copy.
                   attachHere = existing.has_att ? [] : attachments;
                   // Keep the flags DD reads (is_automated excludes bulk sends
@@ -380,7 +394,11 @@ server.listen(PORT, '0.0.0.0', () => {
 
               await query(`UPDATE scheduled_messages SET status = 'sent', thread_id = $1 WHERE id = $2`, [threadId, s.id]);
               emitToWorkspace(s.workspace_id, 'thread:updated', { thread_id: threadId, account_id: s.account_id });
-              emitToWorkspace(s.workspace_id, 'message:new', { thread_id: threadId, message_id: msgId, account_id: s.account_id });
+              // direction and folder (the stored row's label) match what ingest sends.
+              emitToWorkspace(s.workspace_id, 'message:new', {
+                thread_id: threadId, message_id: msgId, account_id: s.account_id,
+                direction: 'outbound', folder: msgFolder
+              });
               // Push to DD via webhook so the scheduled email shows
               // up live just like a compose-sent one would.
               const { fireWebhook } = require('./email/imap');
@@ -394,7 +412,9 @@ server.listen(PORT, '0.0.0.0', () => {
                 // flag survived scheduling via scheduled_messages.is_weekly_update.
                 to_addrs: s.to_addrs || '',
                 cc_addrs: s.cc_addrs || '',
-                weekly_update: !!s.is_weekly_update
+                weekly_update: !!s.is_weekly_update,
+                direction: 'outbound',
+                folder: msgFolder
               });
             } catch (e) {
               // Already sent — never 'failed'. Best-effort mark 'sent' so the

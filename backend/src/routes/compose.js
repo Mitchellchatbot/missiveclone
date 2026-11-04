@@ -4,7 +4,7 @@ const { v4: uuid } = require('uuid');
 const { one, tx, txLockedAfterSend } = require('../db');
 const { requireAuth } = require('../auth');
 const { sendEmail } = require('../email/smtp');
-const { fireWebhook, ingestLockKey } = require('../email/imap');
+const { fireWebhook, ingestLockKey, accountFromAddr } = require('../email/imap');
 const { emitToWorkspace } = require('../sockets');
 const wrap = require('../util/wrap');
 
@@ -108,7 +108,7 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
   // txLockedAfterSend waits out a busy ingest holder, and if the lock still
   // can't be had it stores without it rather than failing a sent email.
   const findExisting = async (client) => (await client.query(
-    `SELECT m.id, m.thread_id
+    `SELECT m.id, m.thread_id, m.folder
        FROM messages m
       WHERE m.account_id = $1 AND m.direction = 'outbound' AND m.message_id = $2
       ORDER BY m.sent_at, m.id
@@ -126,7 +126,7 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
         [row.id, isAutomated, isWeeklyUpdate]
       );
     }
-    return { threadId: row.thread_id, msgId: row.id, reused: true };
+    return { threadId: row.thread_id, msgId: row.id, folder: row.folder, reused: true };
   };
   // Built the same way as ingest's insert (imap.js ingestMessage): one
   // statement re-checks and inserts, so the common path is three round trips
@@ -141,6 +141,8 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
   // folder='Sent' so the dedup key matches the copy a later Sent-folder poll
   // (or appendToSentFolder's mirror) brings in — a NULL folder used to make
   // the old (message_id, account_id, folder) dedup miss it.
+  // from_addr is the sending account as "Name <address>", the way ingest stores
+  // the Sent Items copy's From (it used to be '', which DD read as "not ours").
   // Every parameter is cast: INSERT ... SELECT has no target column to infer
   // types from.
   const store = async (client) => {
@@ -148,7 +150,7 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
     const msgId = uuid();
     const r = await client.query(
       `WITH d AS (
-         SELECT m.id, m.thread_id
+         SELECT m.id, m.thread_id, m.folder
            FROM messages m
           WHERE m.account_id = $3::text AND m.direction = 'outbound' AND m.message_id = $5::text
           ORDER BY m.sent_at, m.id
@@ -172,17 +174,17 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
          RETURNING id
        )
        SELECT (SELECT id FROM d) AS dup_id, (SELECT thread_id FROM d) AS dup_thread_id,
-              (SELECT id FROM m) AS new_id`,
+              (SELECT folder FROM d) AS dup_folder, (SELECT id FROM m) AS new_id`,
       [msgId, threadId, acc.id, req.user.workspace_id, messageId,
-       subject, '', to, cc || '', body_text || '', body_html || '',
+       subject, accountFromAddr(acc), to, cc || '', body_text || '', body_html || '',
        now, files.length ? 1 : 0, isAutomated, isWeeklyUpdate, now,
        acc.team_space_id || null, cleanSubj || subject, participants,
        (cleanSubj || subject) + ' ' + participants]
     );
     const row = r.rows[0] || {};
-    if (row.new_id) return { threadId, msgId, reused: false };
+    if (row.new_id) return { threadId, msgId, folder: 'Sent', reused: false };
     if (row.dup_id) {
-      return reuse(client, { id: row.dup_id, thread_id: row.dup_thread_id });
+      return reuse(client, { id: row.dup_id, thread_id: row.dup_thread_id, folder: row.dup_folder });
     }
     // Lost to a conflicting row: drop the thread we just made (it can only be
     // empty) and use the existing message instead.
@@ -227,9 +229,13 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
 
   // account_id on the wire is what lets DelegationDoer's per-user SSE
   // filter scope events to the accounts a worker can see; without it
-  // only leaders would see compose-sent emails appear live.
+  // only leaders would see compose-sent emails appear live. direction and
+  // folder (the stored row's label) match what ingest sends.
+  const msgFolder = stored.folder || 'Sent';
   emitToWorkspace(req.user.workspace_id, 'thread:updated', { thread_id: threadId, account_id: acc.id });
-  emitToWorkspace(req.user.workspace_id, 'message:new', { thread_id: threadId, message_id: msgId, account_id: acc.id });
+  emitToWorkspace(req.user.workspace_id, 'message:new', {
+    thread_id: threadId, message_id: msgId, account_id: acc.id, direction: 'outbound', folder: msgFolder
+  });
   // Also push to DD via the HMAC webhook so the redundant push path
   // covers compose-sent mail too. Same as what ingestMessage does for
   // inbound IMAP deliveries.
@@ -243,7 +249,9 @@ router.post('/', upload.array('files', 10), wrap(async (req, res) => {
     from_addr: acc.email,
     to_addrs: to,
     cc_addrs: cc || '',
-    weekly_update: weekly_update === true
+    weekly_update: weekly_update === true,
+    direction: 'outbound',
+    folder: msgFolder
   });
 
   res.json({ ok: true, thread_id: threadId, message_id: msgId });

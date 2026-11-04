@@ -472,12 +472,258 @@ function isAttachmentRejected(e) {
   return e.code.startsWith('22') || (e.code === '57014' && !e.lockPhase);
 }
 
-async function ingestMessage(acc, uid, folder, parsed, direction) {
+// The Graph read signals besides graph_id, in INSERT order: column and SQL type.
+// Values arrive in parsed._graphSignals (graph.js graphToParsed), which holds a
+// key only when the delivering page carried that property.
+const SIGNAL_COLUMNS = [
+  ['web_link', 'text'],
+  ['is_read', 'boolean'],
+  ['importance', 'text'],
+  ['flag_status', 'text'],
+  ['categories', 'text[]'],
+  ['parent_folder_id', 'text'],
+  ['inference_classification', 'text'],
+  ['change_key', 'text']
+];
+
+// The label DD's own sends store (compose, reply, scheduled dispatcher). No walk
+// produces it, and a re-delivery never relabels it: #54's dedupe script
+// recognises DD-written rows by it.
+const DD_SENT_FOLDER = 'Sent';
+
+function hasOwn(o, k) {
+  return !!o && Object.prototype.hasOwnProperty.call(o, k);
+}
+
+// "Name <address>", or the bare address when the account has no display name —
+// the shape graphToParsed gives a synced copy's From, so a DD-sent row (compose,
+// reply, scheduled) stores what its Sent Items copy would have.
+function accountFromAddr(acc) {
+  const email = String((acc && acc.email) || '');
+  const name = String((acc && acc.display_name) || '').trim();
+  return name ? `${name} <${email}>` : email;
+}
+
+// The message's attachments. The IMAP path hands them over in
+// parsed.attachments; the Graph path passes parsed._loadAttachments instead and
+// they are fetched here, at most once, only on the paths that store them (see
+// graph.js). Never called inside a locked transaction: the loader talks to Graph.
+async function attachmentsOf(parsed) {
+  if (typeof parsed._loadAttachments !== 'function') {
+    return Array.isArray(parsed.attachments) ? parsed.attachments : [];
+  }
+  if (!parsed._attachmentsLoaded) {
+    let list = [];
+    try {
+      list = await parsed._loadAttachments();
+    } catch (e) {
+      // The Graph loader never throws; this guards any other one. No
+      // attachments this time is recoverable (the dup backfill retries), a
+      // throw here would cost the message.
+      console.warn(`[ingest] attachment loader failed: ${e && e.message}`);
+    }
+    parsed.attachments = Array.isArray(list) ? list : [];
+    parsed._attachmentsLoaded = true;
+  }
+  return parsed.attachments;
+}
+
+// What a Graph re-delivery of an already-stored message writes back to its row.
+// IMAP deliveries never come here; they keep the plain dedup-and-return.
+//
+//   * Direction. A built-in walk delivers with a fixed direction. An extra-folder
+//     walk has none and infers it from From — but when a row already holds THIS
+//     Graph item, that row's direction wins: the item is the one it stored. (A
+//     copy of the owner's own message that sat in the Inbox as inbound mail —
+//     CC-self, a list he is on, a delegate sending as him — infers 'outbound'
+//     when filed away, and would miss its own row: that row ended INBOX +
+//     removed and a second, outbound row was stored for the same item. Sent mail
+//     From someone else, sent on their behalf, likewise inferred 'inbound'.)
+//     The caller learns the direction used from the returned row.
+//   * Ownership. A built-in walk (inbox, sentitems, junkemail) owns the row —
+//     except that the junk walk takes an INBOX row only on the tests below
+//     (strictLabels; see syncFolderViaGraph in graph.js for when). An
+//     extra-folder walk owns it when no built-in folder holds it (its label isn't
+//     one of protectedLabels, or it was marked removed) — or when the row already
+//     holds THIS Graph item (graph_id equal). A walk that doesn't own the row
+//     leaves it COMPLETELY untouched: its item is a copy (an Outlook copy rule, a
+//     ctrl-drag, a duplicate delivery) of mail still in a built-in folder, and
+//     taking the row would pull the original out of DD's INBOX view (an exact
+//     folder match) and point graph_id at the copy, where a later @removed for
+//     the copy would mark the original removed.
+//     The same-item test is what makes a MOVE into an extra folder safe in
+//     either order. A moved item keeps its immutable id while a copy is a new
+//     item with a new id, so an equal graph_id can only be the original that
+//     moved. The order of walks inside a pass doesn't decide which Graph state
+//     each walk reads: mail filed after this pass's inbox delta GET but before
+//     the extra folder's, or in a pass whose inbox walk failed (per-folder
+//     isolation still runs the extra walks), reaches the extra walk BEFORE the
+//     inbox's @removed. The extra walk then relabels the row, and that @removed,
+//     which only matches rows still labelled INBOX, leaves it alone. (A default
+//     id — a row stored through a pre-CL1 cursor — changes on a move, so it
+//     can't match: such a race still ends INBOX + removed until the message
+//     changes again. Mail filed away before graph ids existed can't be matched
+//     or marked at all; scripts/mark_absent_after_rescan.sql marks it after a
+//     fresh rescan, and an extra folder configured after that takes it over.
+//     resolveExtraFolders in graph.js refuses mail search folders, whose items
+//     carry the ids of mail still in the Inbox.)
+//   * folder: the walk's label when it owns the row and the label differs —
+//     except 'Sent' (DD_SENT_FOLDER). This is the Junk ↔ Inbox fix: such a move
+//     used to leave the row in DD's Spam view (or its Inbox) forever.
+//   * graph_id, and each read signal the page carried, when changed. A property
+//     the page didn't carry (a cursor minted before MSG_SELECT grew it) leaves
+//     its column alone rather than nulling it.
+//   * removed_at / removed_reason cleared: the message is present again.
+//   * from_addr filled when empty (a DD-sent row meeting its Sent Items copy),
+//     unless the row has a duplicate sibling: #54's dedupe script keeps groups
+//     with a DD-written row (folder 'Sent' AND from_addr '') out of its default
+//     plan, and filling one would silently opt its group in.
+//   * provider_conversation_id filled when NULL (#54's backfill, folded in so a
+//     re-delivery stays one round trip).
+//   * signals_updated_at = now when anything visible changed. change_key alone
+//     doesn't count: it moves on every server-side touch.
+//   * threads.last_inbound_at raised to this message's sent_at when it is
+//     inbound, not From the account's own address (ownMail, see ingestMessage)
+//     and, after any relabel, not junk — a Junk → Inbox rescue is inbound mail,
+//     and a fresh rescan repairs threads whose post-insert update never ran.
+//     Raised only, never lowered.
+//
+// ONE autocommit statement, no advisory lock. An UPDATE by primary key is
+// serialized by the row lock, is idempotent, and re-checks its WHERE against a
+// concurrent update (EvalPlanQual) — which is why the ownership tests read the
+// TARGET row (m.*), not the lookup's snapshot. Running it under txLocked would
+// self-deadlock with the attachment backfill below (its own txLocked on the same
+// key, on another pooled connection: a 5s lock timeout, then 55P03, which aborts
+// the walk on every poll) and would add two round trips per known message. An
+// unchanged re-delivery writes nothing.
+//
+// target 'key': find the row by its dedup key — the fast path, where lookup and
+// update are one round trip and the row's id + has_att come back. target 'id':
+// the row a locked insert found already stored (the lost race; the winner is
+// often compose or reply, and delta won't re-deliver an unchanged item).
+async function applyRedelivery(target, ctx) {
+  const params = [];
+  const p = (v, type) => { params.push(v); return `$${params.length}::${type}`; };
+
+  const gid = p(ctx.graphId, 'text');
+  let lookup;
+  if (target === 'key') {
+    const mid = p(ctx.messageId, 'text');
+    const acc = p(ctx.accountId, 'text');
+    // See "Direction" above. The message_id index serves both lookups.
+    const dirMatch = ctx.inferredDir
+      ? `COALESCE((SELECT s.direction FROM messages s
+                    WHERE s.message_id = ${mid} AND s.account_id = ${acc} AND s.graph_id = ${gid}
+                    ORDER BY s.sent_at, s.id LIMIT 1), ${p(ctx.dir, 'text')})`
+      : p(ctx.dir, 'text');
+    lookup = `SELECT m.id, m.thread_id, m.sent_at, m.folder, m.direction,
+                     EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id) AS has_att
+                FROM messages m
+               WHERE m.message_id = ${mid}
+                 AND m.account_id = ${acc}
+                 AND m.direction = ${dirMatch}
+               ORDER BY m.sent_at, m.id
+               LIMIT 1`;
+  } else {
+    lookup = `SELECT m.id, m.thread_id, m.sent_at, m.folder, m.direction, true AS has_att
+                FROM messages m
+               WHERE m.id = ${p(ctx.rowId, 'text')}`;
+  }
+  const label = p(ctx.label, 'text');
+  const primary = p(!!ctx.primary, 'boolean');
+  const protectedLabels = p(ctx.protectedLabels || [], 'text[]');
+  const strictLabels = p(ctx.strictLabels || [], 'text[]');
+  const signals = SIGNAL_COLUMNS.map(([col, type]) => {
+    const present = hasOwn(ctx.signals, col);
+    return { col, present: p(present, 'boolean'), value: p(present ? ctx.signals[col] : null, type) };
+  });
+  const from = p(ctx.fromAddr || '', 'text');
+  const conv = p(ctx.convId || null, 'text');
+  const now = p(ctx.now, 'bigint');
+  const ownMail = p(!!ctx.ownMail, 'boolean');
+
+  // COALESCE: a NULL graph_id (a row stored before graph ids existed) is "not
+  // this item", never an unknown that could leak into the CASEs below. A row
+  // under a strict label is taken by a primary walk only through the terms after
+  // it (no graph id at all, removed, or this very item).
+  const owns = `((${primary} AND NOT (m.graph_id IS NOT NULL AND COALESCE(m.folder = ANY(${strictLabels}), false)))
+       OR m.folder IS NULL OR NOT (m.folder = ANY(${protectedLabels}))
+       OR m.removed_at IS NOT NULL OR COALESCE(m.graph_id = ${gid}, false))`;
+  const relabel = `(${owns} AND m.folder IS DISTINCT FROM ${label} AND m.folder IS DISTINCT FROM '${DD_SENT_FOLDER}')`;
+  const fill = `(${owns} AND COALESCE(m.from_addr, '') = '' AND ${from} <> ''
+       AND NOT EXISTS (SELECT 1 FROM messages s
+                        WHERE s.message_id = m.message_id AND s.account_id = m.account_id
+                          AND s.direction = m.direction AND s.id <> m.id))`;
+  const changed = (s) => `(${s.present} AND m.${s.col} IS DISTINCT FROM ${s.value})`;
+  const visible = `(${relabel} OR ${fill} OR (${owns} AND (
+       m.graph_id IS DISTINCT FROM ${gid}
+       OR ${signals.filter((s) => s.col !== 'change_key').map(changed).join('\n       OR ')}
+       OR m.removed_at IS NOT NULL OR m.removed_reason IS NOT NULL)))`;
+  const changeKey = signals.find((s) => s.col === 'change_key');
+  const anything = `(${visible} OR (${owns} AND ${changed(changeKey)})
+       OR (m.provider_conversation_id IS NULL AND ${conv} IS NOT NULL))`;
+
+  // Every SET expression reads the row as it was before this UPDATE.
+  const sets = [
+    `folder = CASE WHEN ${relabel} THEN ${label} ELSE m.folder END`,
+    `graph_id = CASE WHEN ${owns} THEN ${gid} ELSE m.graph_id END`,
+    ...signals.map((s) => `${s.col} = CASE WHEN ${owns} AND ${s.present} THEN ${s.value} ELSE m.${s.col} END`),
+    `removed_at = CASE WHEN ${owns} THEN NULL ELSE m.removed_at END`,
+    `removed_reason = CASE WHEN ${owns} THEN NULL ELSE m.removed_reason END`,
+    `from_addr = CASE WHEN ${fill} THEN ${from} ELSE m.from_addr END`,
+    `provider_conversation_id = COALESCE(m.provider_conversation_id, ${conv})`,
+    `signals_updated_at = CASE WHEN ${visible} THEN ${now} ELSE m.signals_updated_at END`
+  ];
+
+  return one(
+    `WITH d AS (${lookup}),
+     u AS (
+       UPDATE messages m
+          SET ${sets.join(',\n              ')}
+         FROM d
+        WHERE m.id = d.id AND ${anything}
+       RETURNING m.folder
+     ),
+     t AS (
+       UPDATE threads th SET last_inbound_at = d.sent_at
+         FROM d
+        WHERE th.id = d.thread_id
+          AND d.direction = 'inbound'
+          AND NOT ${ownMail}
+          AND COALESCE((SELECT u.folder FROM u), d.folder, '') !~* '(spam|junk)'
+          AND (th.last_inbound_at IS NULL OR th.last_inbound_at < d.sent_at)
+       RETURNING 1
+     )
+     SELECT d.id, d.has_att, d.direction, (SELECT count(*) FROM u)::int AS updated FROM d`,
+    params
+  );
+}
+
+// opts (all optional; the IMAP path passes none):
+//   graph             — { primary, protectedLabels, strictLabels } from a Graph
+//                       walk. Together with parsed._graphId it turns on the
+//                       re-delivery update.
+//   reopen            — false: inbound mail doesn't reopen/unsnooze its thread.
+//   quietIfSentBefore — epoch ms: a NEW message sent before this is stored
+//                       without the socket events and the DD webhook.
+async function ingestMessage(acc, uid, folder, parsed, direction, opts = {}) {
   const messageId = (parsed.messageId || '').replace(/[<>]/g, '');
   const fromAddr = parsed.from ? parsed.from.text : '';
   const fromAddrLower = (parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address || '').toLowerCase();
-  // If caller didn't pre-decide direction, infer from From: header.
-  const dir = direction || (fromAddrLower === acc.email.toLowerCase() ? 'outbound' : 'inbound');
+  // If caller didn't pre-decide direction, infer from From: header. A Graph
+  // re-delivery may still settle it on the row that holds the item (below).
+  let dir = direction || (fromAddrLower === acc.email.toLowerCase() ? 'outbound' : 'inbound');
+  // Mail From the account's own address, whatever its direction: the copy of
+  // the owner's message that reaches his Inbox (CC-self, BCC-self, a list he is
+  // on, a DD reply whose carried-over Cc names him, a delegate sending as him).
+  // It never raises threads.last_inbound_at: that column answers "when did
+  // someone else last write", and DD compares it with the newest outbound mail
+  // to tell answered threads from ones waiting on us — the owner's own reply
+  // must not make its thread look unanswered.
+  const ownMail = !!fromAddrLower && fromAddrLower === String(acc.email || '').toLowerCase();
+  // A delivery from a Graph walk: it says how it walks and the message has a
+  // Graph id. Everything signal-related keys off this.
+  const graph = parsed._graphId && opts.graph ? opts.graph : null;
   if (messageId) {
     // Dedup is scoped to (message_id, account_id, direction). Key
     // properties:
@@ -500,25 +746,55 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     // backfill check below needs no second query. ORDER BY picks the same
     // copy DD renders when legacy duplicates exist, so a backfill lands on it.
     // A miss here is NOT final — the locked insert below re-checks.
-    const dup = await one(
-      `SELECT m.id, EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id) AS has_att
-         FROM messages m
-        WHERE m.message_id = $1
-          AND m.account_id = $2
-          AND m.direction = $3
-        ORDER BY m.sent_at, m.id
-        LIMIT 1`,
-      [messageId, acc.id, dir]
-    );
+    //
+    // A Graph delivery runs the same lookup with its re-delivery update folded
+    // in (applyRedelivery). If that combined statement fails for any reason
+    // that isn't the database itself, fall back to the plain lookup: signals
+    // are best-effort, finding the row is not — a throw here on a NEW message
+    // would make the walk skip it and advance the cursor past it.
+    let dup = null;
+    let redelivered = false;
+    if (graph) {
+      try {
+        dup = await applyRedelivery('key', {
+          messageId, accountId: acc.id, dir, inferredDir: !direction, label: folder,
+          primary: graph.primary, protectedLabels: graph.protectedLabels, strictLabels: graph.strictLabels,
+          graphId: parsed._graphId, signals: parsed._graphSignals || {},
+          fromAddr, ownMail, convId: parsed._graphConversationId || null, now: Date.now()
+        });
+        redelivered = true;
+        // A delivery without a fixed direction goes with the row that holds its
+        // Graph item (see applyRedelivery); the backfill below locks on that
+        // row's key.
+        if (dup && dup.direction) dir = dup.direction;
+      } catch (e) {
+        const { isStructuralDbError } = require('./graph');
+        if (isStructuralDbError(e)) throw e;
+        console.warn(`[ingest] re-delivery update failed for ${messageId} (${acc.email}) — using the plain lookup: ${e.message}`);
+      }
+    }
+    if (!redelivered) {
+      dup = await one(
+        `SELECT m.id, EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id) AS has_att
+           FROM messages m
+          WHERE m.message_id = $1
+            AND m.account_id = $2
+            AND m.direction = $3
+          ORDER BY m.sent_at, m.id
+          LIMIT 1`,
+        [messageId, acc.id, dir]
+      );
+    }
     if (dup) {
       // Backfill the provider conversation id onto a message stored before that
       // column existed. Without this the Graph half of the threading fix only
       // ever helps mail that arrives AFTER deploy: this short-circuit returns
       // before the INSERT, so /rescan-all (which clears the delta cursor and
       // re-walks every message) would re-see every message and write none of
-      // them. Only fills NULLs, so it never overwrites a known value.
+      // them. Only fills NULLs, so it never overwrites a known value. (Part of
+      // the re-delivery update when that ran.)
       const convId = parsed._graphConversationId || null;
-      if (convId) {
+      if (convId && !redelivered) {
         await query(
           `UPDATE messages SET provider_conversation_id = $1
             WHERE id = $2 AND provider_conversation_id IS NULL`,
@@ -539,8 +815,10 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
       // insert are one statement under the message's lock, and the walk that
       // inserted the message holds that same lock through its own attachment
       // insert, so a concurrent backfill waits and then sees those rows.
-      const incoming = (Array.isArray(parsed.attachments) ? parsed.attachments : [])
-        .filter(a => a.content);
+      //
+      // Only a row with no attachment rows fetches them at all (Graph loads
+      // them lazily) — the one test for "already complete" in the whole path.
+      const incoming = dup.has_att ? [] : (await attachmentsOf(parsed)).filter(a => a.content);
       if (incoming.length && !dup.has_att) {
         const params = [dup.id];
         const values = attachmentValues(dup.id, acc.workspace_id, incoming, params);
@@ -585,8 +863,11 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
   const threadId = newThread ? newThread.id : resolved.threadId;
   const id = uuid();
   const sentAt = parsed.date ? new Date(parsed.date).getTime() : Date.now();
-  const attachments = Array.isArray(parsed.attachments) ? parsed.attachments : [];
+  const attachments = await attachmentsOf(parsed);
   const hasAtt = attachments.length > 0 ? 1 : 0;
+  const createdAt = Date.now();
+  // Graph read signals; the IMAP path stores none (all NULL).
+  const signals = parsed._graphId ? (parsed._graphSignals || {}) : null;
 
   // One statement does the re-check and every insert:
   //   d — is the message there now? Its snapshot is taken after the lock was
@@ -618,12 +899,33 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     normalizeAddrList(parsed.cc),                                      // $20
     parsed.text || '',                                                 // $21
     parsed.html || '',                                                 // $22
-    sentAt, uid, hasAtt, Date.now(),                                   // $23-$26
+    sentAt, uid, hasAtt, createdAt,                                    // $23-$26
     // Null on the IMAP path — only Graph gives us a conversation id.
     parsed._graphConversationId || null                                // $27
   ];
+  // $28..$37: graph_id, the read signals (absent ones NULL — a new row has
+  // nothing to preserve), signals_updated_at (= created_at). They are appended
+  // BEFORE the attachment parameters so the no-attachments retry's slice keeps
+  // them, and the signals-off retry below nulls exactly this range.
+  const sigStart = params.length;
+  if (signals) {
+    params.push(
+      parsed._graphId,
+      ...SIGNAL_COLUMNS.map(([col]) => (hasOwn(signals, col) ? signals[col] : null)),
+      createdAt
+    );
+  } else {
+    params.push(...new Array(SIGNAL_COLUMNS.length + 2).fill(null));
+  }
+  const sigEnd = params.length;
+  const sigColumns = ['graph_id', ...SIGNAL_COLUMNS.map(([col]) => col), 'signals_updated_at'].join(', ');
+  const sigValues = [
+    `$${sigStart + 1}::text`,
+    ...SIGNAL_COLUMNS.map(([, type], i) => `$${sigStart + 2 + i}::${type}`),
+    `$${sigEnd}::bigint`
+  ].join(', ');
   const attRows = attachments.filter(a => a.content);
-  // Attachment parameters are appended after $27; remember where the message's
+  // Attachment parameters are appended after these; remember where the message's
   // own parameters end so the no-attachments retry below can drop them (an
   // unreferenced parameter fails the whole statement).
   const baseParamCount = params.length;
@@ -646,10 +948,10 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
        INSERT INTO messages
          (id, thread_id, account_id, workspace_id, direction, folder, message_id, in_reply_to,
           subject, from_addr, to_addrs, cc_addrs, body_text, body_html, sent_at, imap_uid,
-          has_attachments, created_at, provider_conversation_id)
+          has_attachments, created_at, provider_conversation_id, ${sigColumns})
        SELECT $14::text, $5::text, $2::text, $6::text, $3::text, $15::text, $1::text, $16::text,
               $17::text, $18::text, $19::text, $20::text, $21::text, $22::text, $23::bigint, $24::bigint,
-              $25::int, $26::bigint, $27::text
+              $25::int, $26::bigint, $27::text, ${sigValues}
         WHERE NOT EXISTS (SELECT 1 FROM d)
        ON CONFLICT DO NOTHING
        RETURNING id
@@ -661,8 +963,13 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
      )` : ''}
      SELECT (SELECT id FROM d) AS dup_id, (SELECT id FROM m) AS new_id`;
 
-  const runWith = (withAtt) => async (client) => {
-    const r = await client.query(buildInsertSql(withAtt), withAtt ? params : params.slice(0, baseParamCount));
+  const paramsFor = (withAtt, withSig) => {
+    const list = withAtt ? params.slice() : params.slice(0, baseParamCount);
+    if (!withSig) for (let i = sigStart; i < sigEnd; i++) list[i] = null;
+    return list;
+  };
+  const runWith = (withAtt, withSig) => async (client) => {
+    const r = await client.query(buildInsertSql(withAtt), paramsFor(withAtt, withSig));
     const row = r.rows[0] || {};
     // Neither a dup nor an insert: m hit ON CONFLICT (a writer that doesn't
     // take this lock got there first). t may have inserted a thread for us
@@ -678,12 +985,12 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
   };
   // No Message-ID means no dedup identity (these were never deduped), so there
   // is nothing to lock on — a plain transaction keeps thread + message atomic.
-  const store = (withAtt) => messageId
-    ? txLocked(ingestLockKey(acc.id, dir, messageId), runWith(withAtt))
-    : tx(runWith(withAtt));
+  const store = (withAtt, withSig) => messageId
+    ? txLocked(ingestLockKey(acc.id, dir, messageId), runWith(withAtt, withSig))
+    : tx(runWith(withAtt, withSig));
   let result;
   try {
-    result = await store(!!attValues);
+    result = await store(!!attValues, true);
   } catch (e) {
     // Message and attachments share one statement, so a bad attachment row (a
     // data exception, class 22 — e.g. a NUL byte in a filename or content id)
@@ -694,9 +1001,28 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     // Store the message alone instead; has_attachments stays set and the
     // dup-backfill branch above retries the attachments on a later rescan. If
     // the database itself is timing out, this retry fails too and throws.
-    if (!attValues || !isAttachmentRejected(e)) throw e;
-    console.warn(`[ingest] attachments rejected for ${messageId || '(no Message-ID)'} (${acc.email}) — storing message without them: ${e.message}`);
-    result = await store(false);
+    //
+    // The read signals are the other optional part of the row. They are
+    // sanitized so Postgres can't reject them, but if a data exception remains
+    // after dropping the attachments, store the message without them too — the
+    // next re-delivery writes them. Mail first, signals best-effort.
+    if (!isAttachmentRejected(e)) throw e;
+    let err = e;
+    result = null;
+    if (attValues) {
+      console.warn(`[ingest] attachments rejected for ${messageId || '(no Message-ID)'} (${acc.email}) — storing message without them: ${e.message}`);
+      try {
+        result = await store(false, true);
+      } catch (e2) {
+        if (!isAttachmentRejected(e2)) throw e2;
+        err = e2;
+      }
+    }
+    if (!result && signals && typeof err.code === 'string' && err.code.startsWith('22')) {
+      console.warn(`[ingest] read signals rejected for ${messageId || '(no Message-ID)'} (${acc.email}) — storing message without them: ${err.message}`);
+      result = await store(false, false);
+    }
+    if (!result) throw err;
   }
 
   if (!result.new_id) {
@@ -704,9 +1030,23 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     // check and taking the lock. Nothing was written, so no side effects fire.
     // This line is the metric for the guard working — it should be rare.
     console.log(`[ingest] lost race ${messageId} (${acc.email}) — already stored as ${result.dup_id || 'a conflicting row'}`);
-    // Same conversation-id backfill as the fast-path dup branch: the winner is
-    // often compose/reply, which stores none, and a delta walk won't come back.
-    if (result.dup_id && parsed._graphConversationId) {
+    // Same write-back as the fast-path dup branch: the winner is often
+    // compose/reply, which stores no graph id, link, signals or conversation
+    // id, and a delta walk won't come back for an unchanged item.
+    if (result.dup_id && graph) {
+      try {
+        await applyRedelivery('id', {
+          rowId: result.dup_id, dir, label: folder,
+          primary: graph.primary, protectedLabels: graph.protectedLabels, strictLabels: graph.strictLabels,
+          graphId: parsed._graphId, signals: parsed._graphSignals || {},
+          fromAddr, ownMail, convId: parsed._graphConversationId || null, now: Date.now()
+        });
+      } catch (e) {
+        const { isStructuralDbError } = require('./graph');
+        if (isStructuralDbError(e)) throw e;
+        console.warn(`[ingest] re-delivery update failed for ${messageId} (${acc.email}): ${e.message}`);
+      }
+    } else if (result.dup_id && parsed._graphConversationId) {
       await query(
         'UPDATE messages SET provider_conversation_id = $1 WHERE id = $2 AND provider_conversation_id IS NULL',
         [parsed._graphConversationId, result.dup_id]
@@ -743,22 +1083,41 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
   // clobber a newer thread timestamp, stranding active threads low in the
   // inbox list (which orders by last_message_at DESC). GREATEST keeps the
   // thread stamped with its newest message regardless of ingest order.
+  //
+  // last_inbound_at is the same kind of high-water mark, for inbound mail
+  // outside junk (the webhook's own test, below) that isn't the owner's own
+  // (ownMail, above). BIGINT epoch-ms like sent_at; GREATEST ignores the NULL a
+  // thread starts with.
+  const reopen = opts.reopen !== false;
   await query(
-    `UPDATE threads SET last_message_at = GREATEST(last_message_at, $1),
-       status = CASE WHEN status = 'closed' AND $3 = 'inbound' THEN 'open' ELSE status END,
-       snoozed_until = CASE WHEN $3 = 'inbound' THEN NULL ELSE snoozed_until END
+    `UPDATE threads SET last_message_at = GREATEST(last_message_at, $1::bigint),
+       status = CASE WHEN status = 'closed' AND $3::text = 'inbound' AND $5::boolean THEN 'open' ELSE status END,
+       snoozed_until = CASE WHEN $3::text = 'inbound' AND $5::boolean THEN NULL ELSE snoozed_until END,
+       last_inbound_at = CASE WHEN $3::text = 'inbound' AND COALESCE($4::text, '') !~* '(spam|junk)'
+                               AND NOT $6::boolean
+                              THEN GREATEST(last_inbound_at, $1::bigint) ELSE last_inbound_at END
      WHERE id = $2`,
-    [sentAt, threadId, dir]
+    [sentAt, threadId, dir, folder || null, reopen, ownMail]
   );
   await appendThreadSearchText(threadId, searchAdd);
+
+  // Old mail a walk is told to store quietly (an extra folder's backlog) gets
+  // no live events: it is history, not new mail. DD still sees it through the
+  // messages feed.
+  const quiet = opts.quietIfSentBefore != null && sentAt < opts.quietIfSentBefore;
 
   // account_id is included so consumers that filter by which inbox the
   // event belongs to (e.g. DelegationDoer's per-user SSE stream, which
   // only delivers events for the accounts a worker is allowed to see)
   // can scope without a second round-trip. Missiveclone's own frontend
-  // ignores extra fields.
-  emitToWorkspace(acc.workspace_id, 'thread:updated', { thread_id: threadId, account_id: acc.id });
-  emitToWorkspace(acc.workspace_id, 'message:new', { thread_id: threadId, message_id: id, account_id: acc.id });
+  // ignores extra fields. direction + folder let consumers tell inbound
+  // from outbound and junk from inbox without fetching the message.
+  if (!quiet) {
+    emitToWorkspace(acc.workspace_id, 'thread:updated', { thread_id: threadId, account_id: acc.id });
+    emitToWorkspace(acc.workspace_id, 'message:new', {
+      thread_id: threadId, message_id: id, account_id: acc.id, direction: dir, folder: folder || null
+    });
+  }
 
   // Push to DelegationDoer so the sidebar badge + inbox list can refresh
   // in real time instead of waiting on the 30s poll. Only fires for
@@ -767,7 +1126,7 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
   // it's visible in DD's Spam view but must not trigger auto-intake,
   // routing, or inbound-mail notifications.
   const isSpamFolder = /spam|junk/i.test(folder || '');
-  if (dir === 'inbound' && !isSpamFolder) {
+  if (!quiet && dir === 'inbound' && !isSpamFolder) {
     fireWebhook('message:new', {
       workspace_id: acc.workspace_id,
       account_id: acc.id,
@@ -778,7 +1137,9 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
       // shape as messages.from_addr / to_addrs / cc_addrs in the DB.
       from_addr: fromAddr || null,
       to_addrs: normalizeAddrList(parsed.to) || null,
-      cc_addrs: normalizeAddrList(parsed.cc) || null
+      cc_addrs: normalizeAddrList(parsed.cc) || null,
+      direction: dir,
+      folder: folder || null
     });
   }
   return true;
@@ -1015,12 +1376,20 @@ async function waitForIdle(accountId, maxMs) {
 // safe because ingest dedupes on (message_id, account_id, direction). Only
 // called from syncAccount's wrapper, before a walk starts, so no running walk
 // (bar one already presumed stuck) can save its old cursor over the reset.
+// id_type goes with delta_link: the fresh walk asks for immutable ids and saves
+// its own (see graph.js PREFER_*).
 async function clearCursors(accountId) {
+  const at = Date.now();
   await query(
-    `UPDATE folder_sync_state SET delta_link = NULL, last_sync_uid = 0
+    `UPDATE folder_sync_state SET delta_link = NULL, last_sync_uid = 0, id_type = NULL
       WHERE account_id = $1`,
     [accountId]
   );
+  // The moment the fresh walk really begins. A fresh rescan requested while a
+  // walk is running waits for that walk to end (syncAccount), and until then the
+  // account's cursors still look like those of a finished walk.
+  // scripts/mark_absent_after_rescan.sql takes its rescan_started_ms from here.
+  console.log(`[sync] cleared the cursors of account ${accountId} for a fresh walk (rescan_started_ms=${at})`);
 }
 
 async function _syncAccountImpl(accountId) {
@@ -1282,7 +1651,9 @@ module.exports = {
   appendToSentFolder, appendThreadSearchText, fireWebhook,
   // Exposed so graph.js can drive the same ingest pipeline without
   // duplicating thread/message/attachment INSERT logic.
-  ingestMessage, recordSyncError, getAccount,
+  ingestMessage, recordSyncError, formatSyncError, getAccount,
+  // Compose, reply and scheduled send store the sender the way ingest would.
+  accountFromAddr,
   // Compose, reply and scheduled send take the same per-message lock as ingest.
   ingestLockKey,
   // Orphan relink waits for the account's walk to finish before it runs.

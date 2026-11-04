@@ -1,10 +1,10 @@
 const express = require('express');
 const multer = require('multer');
 const { v4: uuid } = require('uuid');
-const { one, many, query, tx, txLockedAfterSend } = require('../db');
+const { one, many, query, tx, txLockedAfterSend, isSchemaReady } = require('../db');
 const { requireAuth } = require('../auth');
 const { sendEmail } = require('../email/smtp');
-const { appendThreadSearchText, ingestLockKey } = require('../email/imap');
+const { appendThreadSearchText, ingestLockKey, accountFromAddr } = require('../email/imap');
 const { emitToWorkspace } = require('../sockets');
 const { fireWebhook } = require('../email/imap');
 const wrap = require('../util/wrap');
@@ -35,9 +35,23 @@ const THREAD_COLUMNS = `t.id, t.workspace_id, t.subject, t.participants, t.last_
   t.status, t.assignee_id, t.message_id_root, t.created_at, t.team_space_id,
   t.starred, t.snoozed_until`;
 
+// THREAD_COLUMNS plus last_inbound_at (BIGINT epoch-ms, the thread's newest
+// inbound non-junk mail not From the mailbox itself) — but only once this
+// process's boot has confirmed the column exists. HTTP serves before db.init()
+// finishes and keeps serving while it fails; naming a column that isn't there
+// yet would 500 every thread list, which is DD's whole inbox.
+function threadColumns() {
+  return isSchemaReady() ? `${THREAD_COLUMNS}, t.last_inbound_at` : THREAD_COLUMNS;
+}
+
 // Every messages column except body_html / body_text — for ?defer_bodies=1,
 // where only the latest message's body is shipped. Pulling all of them and
 // nulling them out in JS moved megabytes per open on long threads.
+//
+// Deliberately WITHOUT the Graph read-signal columns (graph_id, web_link,
+// is_read, ..., removed_at): they would add roughly a kilobyte per message to
+// every thread open over the slow link, for fields no thread view reads. DD reads
+// them from GET /api/messages.
 const MESSAGE_META_COLUMNS = `m.id, m.thread_id, m.account_id, m.workspace_id, m.direction,
   m.folder, m.message_id, m.in_reply_to, m.subject, m.from_addr, m.to_addrs, m.cc_addrs,
   m.sent_at, m.imap_uid, m.has_attachments, m.created_at, m.is_automated,
@@ -126,7 +140,7 @@ router.get('/', wrap(async (req, res) => {
   const { status, assignee, q, folder, team_space_id, snoozed, label_id,
           mine, mailbox_id, mailbox_ids, category, starred } = req.query;
   const params = [req.user.workspace_id];
-  let sql = `SELECT ${THREAD_COLUMNS}, u.name AS assignee_name,
+  let sql = `SELECT ${threadColumns()}, u.name AS assignee_name,
                     coalesce(
                       (SELECT json_agg(json_build_object('id', l.id, 'name', l.name, 'color', l.color))
                        FROM thread_labels tl JOIN labels l ON l.id = tl.label_id
@@ -311,7 +325,7 @@ function snippetOf(text, html) {
 router.get('/:id', wrap(async (req, res) => {
   const deferBodies = req.query.defer_bodies === '1' || req.query.defer_bodies === 'true';
   const t = await one(
-    `SELECT ${THREAD_COLUMNS}, u.name AS assignee_name,
+    `SELECT ${threadColumns()}, u.name AS assignee_name,
             coalesce(
               (SELECT json_agg(json_build_object('id', l.id, 'name', l.name, 'color', l.color))
                FROM thread_labels tl JOIN labels l ON l.id = tl.label_id
@@ -336,10 +350,12 @@ router.get('/:id', wrap(async (req, res) => {
   );
   if (!t) return res.status(404).json({ error: 'not found' });
   // With defer_bodies the bodies never leave Postgres — only a snippet per
-  // message; the latest one's body is fetched on its own below.
+  // message; the latest one's body is fetched on its own below. Without it,
+  // every column the messages table had before the read signals (it used to be
+  // m.*, which would now ship those too — see MESSAGE_META_COLUMNS).
   const messageColumns = deferBodies
     ? `${MESSAGE_META_COLUMNS}, ${SNIPPET_SQL} AS snippet`
-    : 'm.*';
+    : `${MESSAGE_META_COLUMNS}, m.body_text, m.body_html`;
   const messages = await many(
     `SELECT ${messageColumns}, ea.email AS account_email, ea.display_name AS account_name
      FROM messages m
@@ -502,7 +518,7 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
   if (!t) return res.status(404).json({ error: 'thread not found' });
 
   const acc = await one(
-    'SELECT id, email FROM email_accounts WHERE id = $1 AND workspace_id = $2',
+    'SELECT id, email, display_name FROM email_accounts WHERE id = $1 AND workspace_id = $2',
     [account_id, req.user.workspace_id]
   );
   if (!acc) return res.status(400).json({ error: 'account_id invalid' });
@@ -586,10 +602,12 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
   // only if nothing is there. The bare ON CONFLICT DO NOTHING absorbs
   // uq_messages_acct_dir_msgid if a writer got in without the lock (e.g. our
   // own no-lock fallback in txLockedAfterSend).
+  // from_addr is the sending account as "Name <address>", the way ingest stores
+  // the Sent Items copy's From (it used to be '').
   const store = async (client) => {
     const r = await client.query(
       `WITH d AS (
-         SELECT m.id
+         SELECT m.id, m.folder
            FROM messages m
           WHERE m.account_id = $3::text AND m.direction = 'outbound' AND m.message_id = $5::text
           ORDER BY m.sent_at, m.id
@@ -604,21 +622,22 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
          ON CONFLICT DO NOTHING
          RETURNING id
        )
-       SELECT (SELECT id FROM d) AS dup_id, (SELECT id FROM m) AS new_id`,
+       SELECT (SELECT id FROM d) AS dup_id, (SELECT folder FROM d) AS dup_folder,
+              (SELECT id FROM m) AS new_id`,
       [
         id, t.id, acc.id, req.user.workspace_id, sentMessageId,
         target ? target.message_id : null, replySubject,
-        '', replyTo, replyCc || '', body_text || '', body_html || '', now,
+        accountFromAddr(acc), replyTo, replyCc || '', body_text || '', body_html || '', now,
         files.length ? 1 : 0, now
       ]
     );
     const row = r.rows[0] || {};
     if (row.new_id) return null;
-    if (row.dup_id) return { id: row.dup_id };
+    if (row.dup_id) return { id: row.dup_id, folder: row.dup_folder };
     // Conflicted with a row d couldn't see (committed after this statement
     // began) — a fresh statement can.
     const ex = await client.query(
-      `SELECT m.id
+      `SELECT m.id, m.folder
          FROM messages m
         WHERE m.account_id = $1 AND m.direction = 'outbound' AND m.message_id = $2
         ORDER BY m.sent_at, m.id
@@ -674,8 +693,12 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
   await query('DELETE FROM drafts WHERE user_id = $1 AND thread_id = $2', [req.user.id, t.id]);
 
   // account_id on the wire scopes DD's per-user SSE filter to the
-  // workers who can see this mailbox.
-  emitToWorkspace(req.user.workspace_id, 'message:new', { thread_id: t.id, message_id: id, account_id: acc.id });
+  // workers who can see this mailbox. direction and folder (the stored row's
+  // label) match what ingest sends.
+  const msgFolder = (existing && existing.folder) || 'Sent';
+  emitToWorkspace(req.user.workspace_id, 'message:new', {
+    thread_id: t.id, message_id: id, account_id: acc.id, direction: 'outbound', folder: msgFolder
+  });
   emitToWorkspace(req.user.workspace_id, 'thread:updated', { thread_id: t.id, account_id: acc.id });
   // Also push to DD via the HMAC webhook so the redundant push path
   // covers replies too. Symmetric with ingestMessage on the inbound side.
@@ -683,7 +706,9 @@ router.post('/:id/reply', upload.array('files', 10), wrap(async (req, res) => {
     workspace_id: req.user.workspace_id,
     account_id: acc.id,
     thread_id: t.id,
-    message_id: id
+    message_id: id,
+    direction: 'outbound',
+    folder: msgFolder
   });
   res.json({ ok: true, message_id: id });
 }));

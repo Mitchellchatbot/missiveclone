@@ -1,12 +1,15 @@
 const express = require('express');
 const { v4: uuid } = require('uuid');
-const { one, many, query } = require('../db');
+const { one, many, query, tx, isSchemaReady } = require('../db');
 // (one is used below for team_space lookup)
 const { requireAuth } = require('../auth');
 const { encrypt } = require('../crypto');
 const { syncAccount, startWatching, stopWatching } = require('../email/imap');
 const wrap = require('../util/wrap');
 const { relinkOrphanMessages } = require('../util/relink_orphans');
+const {
+  validateExtraFolders, parseStoredExtraFolders, extraFolderKey, FOLDER_ID_RE
+} = require('../util/extra_folders');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -201,6 +204,130 @@ router.post('/rescan-all', wrap(async (req, res) => {
   }
 
   res.json({ ok: true, accounts: accs.length, account_ids: accs.map(a => a.id) });
+}));
+
+// Per-account rescan. Requests one walk of this account through syncAccount's
+// wrapper — `rerun` makes a running walk chain exactly one follow-up instead of
+// the call just coalescing onto it — and returns at once.
+//
+// { fresh: true } also forgets the account's cursors right before that walk (as
+// /rescan-all does for every account): the walk re-reads every synced folder
+// from scratch, which is how a mailbox stored before graph ids existed gets
+// them, plus its read signals and Outlook links. Known messages are refreshed in
+// place and cost no attachment download when their attachments are already
+// stored. A fresh walk holds back this mailbox's new mail until the inbox
+// snapshot finishes, so run it off-hours; see the CL1 notes in the PR.
+//
+// Microsoft accounts only: on IMAP, clearing cursors re-downloads every full
+// message.
+//
+// The rescan re-delivers every message: whatever dedup can't match — mail
+// without a Message-ID, and mail purge-by-sender deleted that is still in the
+// mailbox — is stored again AND announced as new mail (socket message:new; the
+// DD webhook when inbound and not junk), however old. Only extra-folder walks
+// are quiet for old mail. Size it first: scripts/mark_absent_after_rescan.sql §0b.
+//
+// 503 until init has completed: a walk on a half-migrated schema fails on every
+// message (safely, before anything commits — see CL1_COLUMN_GROUPS in db.js),
+// and { fresh: true } would have cleared the cursors for nothing.
+router.post('/:id/rescan', wrap(async (req, res) => {
+  if (!isSchemaReady()) return res.status(503).json({ error: 'database not ready yet; retry shortly' });
+  const acc = await one(
+    'SELECT id, email, provider FROM email_accounts WHERE id = $1 AND workspace_id = $2',
+    [req.params.id, req.user.workspace_id]
+  );
+  if (!acc) return res.status(404).json({ error: 'not found' });
+  if (acc.provider !== 'microsoft') return res.status(400).json({ error: 'not a microsoft account' });
+  const body = req.body || {};
+  if (body.fresh !== undefined && typeof body.fresh !== 'boolean') {
+    return res.status(400).json({ error: 'fresh must be a boolean' });
+  }
+  const fresh = body.fresh === true;
+  syncAccount(acc.id, { rerun: true, fresh }).catch((err) => {
+    console.warn(`[rescan] sync failed for ${acc.email}: ${err && err.message}`);
+  });
+  res.status(202).json({ ok: true, account_id: acc.id, fresh });
+}));
+
+// The mailbox's Graph folders, for picking extra folders: top level, or the
+// children of ?parent_id=<folder id> (childFolderCount says which have any).
+// Read-only.
+router.get('/:id/mail-folders', wrap(async (req, res) => {
+  const acc = await one(
+    'SELECT * FROM email_accounts WHERE id = $1 AND workspace_id = $2',
+    [req.params.id, req.user.workspace_id]
+  );
+  if (!acc) return res.status(404).json({ error: 'not found' });
+  if (acc.provider !== 'microsoft') return res.status(400).json({ error: 'not a microsoft account' });
+  const parentId = req.query.parent_id;
+  if (parentId !== undefined && (typeof parentId !== 'string' || !FOLDER_ID_RE.test(parentId))) {
+    return res.status(400).json({ error: 'parent_id is not a valid Graph folder id' });
+  }
+  const { listMailFolders } = require('../email/graph');
+  let folders;
+  try {
+    folders = await listMailFolders(acc, parentId || null);
+  } catch (e) {
+    return res.status(502).json({ error: `Graph: ${e.message}` });
+  }
+  res.json({ folders });
+}));
+
+// The extra folders this account syncs (see util/extra_folders.js).
+router.get('/:id/sync-folders', wrap(async (req, res) => {
+  if (!isSchemaReady()) return res.status(503).json({ error: 'database not ready yet; retry shortly' });
+  const acc = await one(
+    'SELECT id, extra_sync_folders FROM email_accounts WHERE id = $1 AND workspace_id = $2',
+    [req.params.id, req.user.workspace_id]
+  );
+  if (!acc) return res.status(404).json({ error: 'not found' });
+  res.json({ folders: parseStoredExtraFolders(acc.extra_sync_folders) });
+}));
+
+// Replace the account's extra folders with body.folders = [{ id, label }].
+// Validates every rule in util/extra_folders.js, then resolves each id against
+// the mailbox: an unknown folder, a built-in one passed by its real id, or two
+// entries naming the same folder are refused. The canonical Graph id is stored.
+//
+// A folder that is removed, or whose label changes, loses its cursor row (its
+// key embeds the label — see extraFolderKey), so a relabelled folder is walked
+// afresh and its mail moves to the new label. No message is ever deleted here.
+// A walk running right now may still save the old key when it ends; nothing
+// reads that key any more.
+router.patch('/:id/sync-folders', wrap(async (req, res) => {
+  if (!isSchemaReady()) return res.status(503).json({ error: 'database not ready yet; retry shortly' });
+  const acc = await one(
+    'SELECT * FROM email_accounts WHERE id = $1 AND workspace_id = $2',
+    [req.params.id, req.user.workspace_id]
+  );
+  if (!acc) return res.status(404).json({ error: 'not found' });
+  if (acc.provider !== 'microsoft') return res.status(400).json({ error: 'not a microsoft account' });
+  const checked = validateExtraFolders((req.body || {}).folders);
+  if (checked.error) return res.status(400).json({ error: checked.error });
+
+  const { resolveExtraFolders } = require('../email/graph');
+  let resolved;
+  try {
+    resolved = await resolveExtraFolders(acc, checked.folders);
+  } catch (e) {
+    return res.status(502).json({ error: `Graph: ${e.message}` });
+  }
+  if (resolved.error) return res.status(400).json({ error: resolved.error });
+
+  const keys = resolved.folders.map(extraFolderKey);
+  await tx(async (client) => {
+    await client.query(
+      'UPDATE email_accounts SET extra_sync_folders = $1::jsonb WHERE id = $2',
+      // Stringified: pg would send a JS array as a Postgres array literal.
+      [JSON.stringify(resolved.folders), acc.id]
+    );
+    await client.query(
+      `DELETE FROM folder_sync_state
+        WHERE account_id = $1 AND left(folder, 2) = 'x:' AND NOT (folder = ANY($2::text[]))`,
+      [acc.id, keys]
+    );
+  });
+  res.json({ ok: true, folders: resolved.folders });
 }));
 
 router.post('/:id/sync', wrap(async (req, res) => {

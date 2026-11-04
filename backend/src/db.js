@@ -439,37 +439,265 @@ const MIGRATIONS = [
   // util/relink_orphans.js.)
 ];
 
+// The pure-DDL shapes in MIGRATIONS, and the catalog test that says one is
+// already in place. Postgres takes the table lock BEFORE it checks: ALTER TABLE
+// ... ADD COLUMN IF NOT EXISTS / DROP COLUMN IF EXISTS / ALTER COLUMN ... DROP NOT
+// NULL take ACCESS EXCLUSIVE, CREATE INDEX IF NOT EXISTS takes SHARE, and none
+// has a lock_timeout. Queued behind any open transaction on its table, each one
+// waits up to the 15s statement_timeout, and every new read (behind ACCESS
+// EXCLUSIVE) or write (behind SHARE) of that table queues behind the waiter. That
+// was 5 statements on messages, 4 on threads, 13 on email_accounts and 2 on
+// folder_sync_state on every boot, for columns that have existed for months — and
+// on every init retry too (see init()). An entry whose effect the catalog already
+// shows is skipped: that is the no-op its IF [NOT] EXISTS would have reached
+// after taking the lock. Everything else (the data fixes, any shape not listed
+// here) runs exactly as before.
+const LEGACY_DDL = [
+  { re: /^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)\s/i,
+    applied: (cat, [table, col]) => cat.columns.has(`${table}.${col}`) },
+  { re: /^\s*ALTER\s+TABLE\s+(\w+)\s+DROP\s+COLUMN\s+IF\s+EXISTS\s+(\w+)\s*$/i,
+    applied: (cat, [table, col]) => cat.relations.has(table) && !cat.columns.has(`${table}.${col}`) },
+  { re: /^\s*ALTER\s+TABLE\s+(\w+)\s+ALTER\s+COLUMN\s+(\w+)\s+DROP\s+NOT\s+NULL\s*$/i,
+    applied: (cat, [table, col]) => cat.columns.get(`${table}.${col}`) === false },
+  { re: /^\s*CREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)\s+ON\s+(\w+)\s*\(/i,
+    applied: (cat, [name]) => cat.relations.has(name) },
+];
+
+function legacyDdlApplied(sql, catalog) {
+  for (const { re, applied } of LEGACY_DDL) {
+    const m = re.exec(sql);
+    if (m) return applied(catalog, m.slice(1).map((s) => s.toLowerCase()));
+  }
+  return false;
+}
+
+// Every relation in the schema, and every column of its tables with whether it
+// is NOT NULL. One round trip, from pg_catalog (information_schema's views are
+// slow, and this lists the whole schema).
+async function catalogSnapshot() {
+  const rows = await many(
+    `SELECT c.relname AS rel, a.attname AS col, a.attnotnull AS notnull
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND c.relkind IN ('r', 'p')
+                               AND a.attnum > 0 AND NOT a.attisdropped
+      WHERE n.nspname = $1`,
+    [DB_SCHEMA]
+  );
+  const relations = new Set();
+  const columns = new Map(); // 'table.column' -> NOT NULL?
+  for (const r of rows) {
+    relations.add(r.rel);
+    if (r.col != null) columns.set(`${r.rel}.${r.col}`, r.notnull === true);
+  }
+  return { relations, columns };
+}
+
+// What init() has already applied in THIS process. initDbWithRetry (index.js)
+// calls init() again after every failure — e.g. a CL1 column group that lost to
+// lock contention on the first CL1 boot — and repeating the rest repeated its
+// locks: SCHEMA's CREATE INDEX IF NOT EXISTS statements (SHARE on each table,
+// held until the whole string commits) and any legacy DDL, on every retry, for as
+// long as the contention lasted. So a retry re-runs only what has not gone
+// through yet: SCHEMA until it has succeeded once, and the MIGRATIONS entries
+// that threw (a failed provider_conversation_id ALTER is still retried). The CL1
+// groups look at the catalog on every call anyway.
+let schemaApplied = false;
+const migrationsApplied = new Set(); // indexes into MIGRATIONS
+
+async function runMigrations() {
+  if (migrationsApplied.size === MIGRATIONS.length) return;
+  let catalog = null;
+  try {
+    catalog = await catalogSnapshot();
+  } catch (e) {
+    // Never worse than before: without the snapshot every pending entry runs.
+    console.warn(`[db] could not read the catalog before MIGRATIONS (${e.message}) — running every pending entry`);
+  }
+  for (let i = 0; i < MIGRATIONS.length; i++) {
+    if (migrationsApplied.has(i)) continue;
+    const m = MIGRATIONS[i];
+    if (catalog && legacyDdlApplied(m, catalog)) {
+      migrationsApplied.add(i);
+      continue;
+    }
+    try {
+      await pool.query(m);
+      migrationsApplied.add(i);
+    } catch (e) {
+      console.warn('migration warning:', m, '-', e.message);
+    }
+  }
+}
+
+// Columns for the "read signals" work (CL1): Graph ids, Outlook links, read/flag
+// state, removals, the inbound high-water mark on threads, per-account extra
+// folders and the id type a delta cursor was minted with.
+//
+// They are added on boot like MIGRATIONS, but NOT as plain MIGRATIONS entries.
+// ALTER TABLE ... ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE on the table
+// BEFORE it looks for the column (LEGACY_DDL above now spares the old entries
+// that once their column exists, but a missing one still waits out the full
+// statement_timeout). Queued behind any open transaction on `messages` (an ingest
+// insert can run up to 15s, a post-send copy up to 50s), the waiting ALTER blocks
+// every new read and write of the table on both instances — DD's inbox lists,
+// thread opens and ingest. So each table is one guarded step instead:
+//   - look the columns up in the catalog first and issue NO DDL when they are all
+//     there, which is every boot after the first;
+//   - otherwise add the missing ones in ONE ALTER (atomic: all or none) on a
+//     dedicated connection with a short lock_timeout, and retry a few times with
+//     jitter rather than sitting in the lock queue.
+// Every column is nullable or has a constant default, so the ALTER is a
+// catalog-only change (no rewrite of `messages`).
+//
+// The first boot of this build does need that ACCESS EXCLUSIVE on `messages`.
+// Any session that holds the table longer than the guarded window (a report
+// query, an idle-in-transaction psql, a CREATE INDEX CONCURRENTLY started
+// early) fails init until it ends, and with it mail sync, the watchers and the
+// scheduled dispatcher — each retry costing only the guarded attempts (see
+// schemaApplied). So deploy it off-hours, after ending or waiting out
+// transactions older than ~30s (the pg_stat_activity check at the top of
+// scripts/create_message_feed_index.sql).
+//
+// Order matters. A sync walk reads folder_sync_state.id_type first, and ingest
+// writes messages.* and then threads.last_inbound_at. A walk can be started by an
+// HTTP route while init is still running, or while it keeps failing (POST
+// /:id/sync, /rescan-all, POST /api/accounts and the OAuth callback don't wait
+// for it), so `messages` goes last: whenever its new columns exist, the ones the
+// same walk needs elsewhere exist too. init() enforces that by stopping at the
+// first group it could not add. If a later group went ahead anyway, the walk's
+// INSERT would commit and its post-commit thread update would then fail on the
+// missing column: the message stored but silent (no thread bump, no events),
+// and mail without a Message-ID stored again on every retry. With messages held
+// back, every message write fails BEFORE it commits and the walk keeps its
+// cursor.
+//
+// All times are BIGINT epoch-ms, like every other timestamp in this schema (pg
+// hands them to DD as digit strings, which its normalizers expect).
+const CL1_COLUMN_GROUPS = [
+  { table: 'folder_sync_state', columns: [
+    // 'immutable' when the cursor was minted with Prefer: IdType="ImmutableId";
+    // NULL for cursors minted before that header existed. See graph.js.
+    ['id_type', 'TEXT'],
+  ] },
+  { table: 'email_accounts', columns: [
+    // [{ id: <Graph folder id>, label }] — see util/extra_folders.js.
+    ['extra_sync_folders', `JSONB NOT NULL DEFAULT '[]'::jsonb`],
+  ] },
+  { table: 'threads', columns: [
+    // Newest sent_at of any inbound, non-junk message not From the mailbox's own
+    // address ever ingested into the thread. A high-water mark: never lowered
+    // when mail is later junked/removed.
+    ['last_inbound_at', 'BIGINT'],
+  ] },
+  { table: 'messages', columns: [
+    ['graph_id', 'TEXT'],
+    ['web_link', 'TEXT'],
+    ['is_read', 'BOOLEAN'],
+    ['importance', 'TEXT'],
+    ['flag_status', 'TEXT'],
+    ['categories', 'TEXT[]'],
+    ['parent_folder_id', 'TEXT'],
+    ['inference_classification', 'TEXT'],
+    ['change_key', 'TEXT'],
+    // Set when a delta walk reports the message gone from the folder its label
+    // names (deleted OR moved to a folder this clone doesn't sync — Graph's
+    // per-folder delta does not tell the two apart). Cleared on re-delivery.
+    ['removed_at', 'BIGINT'],
+    ['removed_reason', 'TEXT'],
+    // Last time any visible field above (or folder / from_addr / removed_*)
+    // changed. Equals created_at for rows ingested with signals.
+    ['signals_updated_at', 'BIGINT'],
+  ] },
+];
+
+const GUARDED_DDL_ATTEMPTS = 5;
+
+async function missingColumns(table, columns) {
+  const rows = await many(
+    `SELECT column_name FROM information_schema.columns
+      WHERE table_schema = $1 AND table_name = $2 AND column_name = ANY($3::text[])`,
+    [DB_SCHEMA, table, columns.map(([name]) => name)]
+  );
+  const have = new Set(rows.map((r) => r.column_name));
+  return columns.filter(([name]) => !have.has(name));
+}
+
+// One guarded step of CL1_COLUMN_GROUPS. Resolves true once every column of the
+// group exists, false when it gave up. Never throws for lock contention — it
+// gives up after GUARDED_DDL_ATTEMPTS and leaves the verdict to
+// assertRequiredColumns, which fails init (and initDbWithRetry tries again later).
+async function addColumnsGuarded({ table, columns }) {
+  for (let attempt = 1; ; attempt++) {
+    const missing = await missingColumns(table, columns);
+    if (!missing.length) return true;
+    const names = missing.map(([name]) => `${table}.${name}`).join(', ');
+    // Identifiers come from the constant list above, never from input.
+    const ddl = `ALTER TABLE ${QUOTED_SCHEMA}.${table} ` +
+      missing.map(([name, type]) => `ADD COLUMN IF NOT EXISTS ${name} ${type}`).join(', ');
+    const client = await pool.connect();
+    let broken;
+    try {
+      // SET LOCAL, on a connection we hold for the whole transaction: the 15s
+      // statement_timeout from pool.on('connect') is session state a transaction
+      // pooler doesn't guarantee, and there is no lock_timeout at all otherwise.
+      // 3s bounds how long the queued ALTER can stall other sessions' access.
+      await client.query(
+        `BEGIN; SET LOCAL lock_timeout = '3s'; SET LOCAL statement_timeout = '10s'; ${ddl}; COMMIT`
+      );
+      console.log(`[db] added ${names}`);
+      return true;
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (rbErr) { broken = rbErr; }
+      if (attempt >= GUARDED_DDL_ATTEMPTS) {
+        console.warn(`[db] could not add ${names} after ${attempt} attempts: ${e.message}`);
+        return false;
+      }
+      console.warn(`[db] adding ${names} failed (attempt ${attempt}, ${e.code || e.message}) — retrying`);
+    } finally {
+      client.release(broken);
+    }
+    await new Promise((r) => setTimeout(r, 500 + Math.floor(Math.random() * 1500)));
+  }
+}
+
 function ensurePool() {
   if (!pool) throw new Error('DATABASE_URL is not set; database is unavailable');
 }
 
-// Columns that ingest writes UNCONDITIONALLY. If one of these is missing the app
-// still boots perfectly happily — and then every single INSERT in ingestMessage
-// throws "column ... does not exist", which the Graph walk catches per message
-// and moves past while still advancing the delta cursor. That combination loses
-// mail permanently and reports nothing but warn lines.
+// Columns that ingest or sync writes UNCONDITIONALLY. If one of these is missing
+// the app still boots perfectly happily — and then every single INSERT in
+// ingestMessage throws "column ... does not exist", which the Graph walk catches
+// per message and moves past while still advancing the delta cursor. That
+// combination loses mail permanently and reports nothing but warn lines.
 //
 // Swallowing migration failures is right for the backfills and the best-effort
 // UPDATEs in MIGRATIONS. It is NOT right for a column ingest depends on: ADD
-// COLUMN needs an ACCESS EXCLUSIVE lock, every pooled connection carries
-// statement_timeout = 15s, and during a rolling deploy the old instance is still
-// ingesting — so the ALTER can genuinely be cancelled by lock contention on a
-// perfectly healthy database. Better to fail the boot and let the deploy roll
-// back than to serve traffic that silently drops email.
+// COLUMN needs an ACCESS EXCLUSIVE lock and during a rolling deploy the old
+// instance is still ingesting, so the ALTER can genuinely lose to lock contention
+// on a perfectly healthy database. So init() throws instead.
+//
+// What that does NOT do is roll the deploy back: /api/health answers 200 before
+// init even starts and initDbWithRetry (index.js) retries forever, so the new
+// instance is promoted anyway. While init keeps failing, HTTP stays green but
+// mail sync and the scheduled-send dispatcher never start. After every deploy,
+// check GET /api/status for db_ready: true and db_init_error: null.
 const REQUIRED_COLUMNS = [
   ['messages', 'provider_conversation_id'],
+  ...CL1_COLUMN_GROUPS.flatMap(({ table, columns }) => columns.map(([name]) => [table, name])),
 ];
 
 async function assertRequiredColumns() {
-  const missing = [];
-  for (const [table, column] of REQUIRED_COLUMNS) {
-    const row = await one(
-      `SELECT 1 AS ok FROM information_schema.columns
-        WHERE table_schema = $1 AND table_name = $2 AND column_name = $3`,
-      [DB_SCHEMA, table, column]
-    );
-    if (!row) missing.push(`${table}.${column}`);
-  }
+  // One round trip for the whole list (it is long now, and boot runs it over the
+  // ocean link).
+  const rows = await many(
+    `SELECT r.t || '.' || r.c AS missing
+       FROM unnest($2::text[], $3::text[]) AS r(t, c)
+      WHERE NOT EXISTS (SELECT 1 FROM information_schema.columns ic
+                         WHERE ic.table_schema = $1 AND ic.table_name = r.t AND ic.column_name = r.c)`,
+    [DB_SCHEMA, REQUIRED_COLUMNS.map(([t]) => t), REQUIRED_COLUMNS.map(([, c]) => c)]
+  );
+  const missing = rows.map((r) => r.missing);
   if (missing.length) {
     throw new Error(
       `schema incomplete after migrations: missing ${missing.join(', ')}. ` +
@@ -546,17 +774,69 @@ async function warnIfUniqueMsgIndexMissing() {
   }
 }
 
+// Advisory only, like the two above: these indexes are built out of band and the
+// code behaves the same without them, just slower. They are the CL1 ones:
+//   - idx_messages_feed / idx_messages_feed_changed back GET /api/messages
+//     (routes/messages.js). Without them each feed page scans the account's rows,
+//     bodies inline, and can hit statement_timeout.
+//   - idx_messages_graph_id backs the per-page @removed UPDATE in graph.js.
+//     Without it a removal batch scans the account's rows; a timeout there is
+//     logged and skipped (a missed removal marker), never a stalled walk.
+async function warnIfIndexMissing(name, script, why) {
+  try {
+    const row = await one(
+      `SELECT i.indisvalid FROM pg_class c
+         JOIN pg_index i ON i.indexrelid = c.oid
+        WHERE c.relname = $1`,
+      [name]
+    );
+    if (!row) {
+      console.warn(`[db] ${name} is MISSING. ${why} Run backend/scripts/${script}`);
+    } else if (row.indisvalid === false) {
+      console.warn(
+        `[db] ${name} exists but is INVALID (a cancelled CREATE INDEX CONCURRENTLY). ` +
+        `The planner ignores it and IF NOT EXISTS will match it forever. ` +
+        `DROP INDEX CONCURRENTLY it and re-run backend/scripts/${script}`
+      );
+    }
+  } catch (e) {
+    console.warn(`[db] could not check ${name}:`, e.message);
+  }
+}
+
+// True once init() has completed in this process: every REQUIRED_COLUMNS column
+// exists. HTTP serves before init finishes (and keeps serving while it fails), so
+// read paths that existing clients depend on only reference CL1 columns once this
+// is true — a request that names a column the boot hasn't added yet fails with
+// 42703, and GET /api/threads failing would take DD's inbox down with it.
+let schemaReady = false;
+function isSchemaReady() { return schemaReady; }
+
 async function init() {
   ensurePool();
-  await pool.query(SCHEMA);
-  for (const m of MIGRATIONS) {
-    try { await pool.query(m); }
-    catch (e) { console.warn('migration warning:', m, '-', e.message); }
+  // Once per process: a retry after a later failure must not take SCHEMA's
+  // locks again (see schemaApplied).
+  if (!schemaApplied) {
+    await pool.query(SCHEMA);
+    schemaApplied = true;
+  }
+  await runMigrations();
+  // In order, stopping at the first group that couldn't be added: the groups
+  // after it (messages last) must not exist without it. See CL1_COLUMN_GROUPS.
+  for (const group of CL1_COLUMN_GROUPS) {
+    if (!(await addColumnsGuarded(group))) break;
   }
   // Throws — deliberately fatal. See REQUIRED_COLUMNS.
   await assertRequiredColumns();
+  schemaReady = true;
   await warnIfConversationIndexMissing();
   await warnIfUniqueMsgIndexMissing();
+  await warnIfIndexMissing('idx_messages_feed', 'create_message_feed_index.sql',
+    'GET /api/messages pages will scan the account and can hit statement_timeout.');
+  await warnIfIndexMissing('idx_messages_feed_changed', 'create_message_feed_index.sql',
+    'GET /api/messages?order=changed pages will scan the account and can hit statement_timeout.');
+  await warnIfIndexMissing('idx_messages_graph_id', 'create_message_graph_id_index.sql',
+    'Graph @removed batches will scan the account; a timeout there skips the removal markers.');
 }
 
 async function ping() {
@@ -686,4 +966,9 @@ async function txLockedAfterSend(key, fn, tag = '[db]') {
   }
 }
 
-module.exports = { pool, init, ping, query, one, many, tx, txLocked, txLockedAfterSend, HAS_DB };
+module.exports = {
+  pool, init, ping, query, one, many, tx, txLocked, txLockedAfterSend, HAS_DB,
+  isSchemaReady,
+  // Exposed for verification (which columns boot guarantees), not for callers.
+  REQUIRED_COLUMNS, CL1_COLUMN_GROUPS
+};
