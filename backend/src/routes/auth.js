@@ -4,6 +4,7 @@ const { v4: uuid } = require('uuid');
 const { one, many, tx } = require('../db');
 const { sign, requireAuth } = require('../auth');
 const wrap = require('../util/wrap');
+const { sendEnabledFor } = require('../util/scope');
 
 const router = express.Router();
 
@@ -51,10 +52,31 @@ router.post('/login', wrap(async (req, res) => {
   res.json({ token: sign(user), user });
 }));
 
+// For an account-scoped token (CL2) the answer also says what that token may
+// do, so its holder can check it is the token it meant to configure:
+//   auth: { kind: 'scoped', scopes, accounts (both sorted), jti,
+//           expiresAt (ISO, when it stops working), sendEnabled }
+// sendEnabled: whether EA_SEND_ENABLED currently allows sending for all of its
+// accounts. A token without a scope claim gets exactly the answer it always got.
 router.get('/me', requireAuth, wrap(async (req, res) => {
   const u = await one('SELECT id, workspace_id, email, name FROM users WHERE id = $1', [req.user.id]);
   if (!u) return res.status(404).json({ error: 'not found' });
   const ws = await one('SELECT id, name FROM workspaces WHERE id = $1', [u.workspace_id]);
+  if (req.auth && req.auth.kind === 'scoped') {
+    const a = req.auth;
+    return res.json({
+      user: u,
+      workspace: ws,
+      auth: {
+        kind: 'scoped',
+        scopes: [...a.scopes],
+        accounts: [...a.accounts],
+        jti: a.jti,
+        expiresAt: new Date(a.expiresAt).toISOString(),
+        sendEnabled: sendEnabledFor(a.accounts)
+      }
+    });
+  }
   res.json({ user: u, workspace: ws });
 }));
 

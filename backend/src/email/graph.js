@@ -459,7 +459,22 @@ async function assertGraphOk(res, expectedStatus, op) {
   } else if (res.status === 429) {
     hint = ' Rate-limited by Graph. Try again in a minute.';
   }
+  // The error also carries Graph's HTTP status, its error code and Retry-After,
+  // so a caller can tell a throttle from a failure without parsing the message.
+  // The message (and every 500 body built from it) is unchanged: the throw below
+  // is kept exactly as it was, unindented on purpose, and the properties are
+  // added on the way out.
+  const errorStatus = res.status;
+  const errorCode = (parsed && parsed.error && parsed.error.code) || null;
+  const errorRetryAfter = (res.headers && typeof res.headers.get === 'function' && res.headers.get('retry-after')) || null;
+  try {
   throw new Error(`Graph ${op} failed: ${detail}${hint}`);
+  } catch (err) {
+    err.status = errorStatus;
+    err.graphCode = errorCode;
+    err.retryAfter = errorRetryAfter;
+    throw err;
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────

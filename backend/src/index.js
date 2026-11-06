@@ -39,6 +39,13 @@ const composeRoutes = require('./routes/compose');
 const labelRoutes = require('./routes/labels');
 const scheduledRoutes = require('./routes/scheduled');
 const oauthMicrosoftRoutes = require('./routes/oauth_microsoft');
+// CL2: Outlook drafts and send-by-id (one router for the six routes), and the
+// one check every request carrying an account-scoped token goes through.
+const outlookDraftRoutes = require('./routes/outlook_drafts');
+const { scopeGate } = require('./auth');
+const { routerPath, isCl2RouteKey } = require('./util/allow_list');
+const { cl2BodyErrors } = require('./util/api_errors');
+const { sendFlagSummary } = require('./util/scope');
 const { initSockets } = require('./sockets');
 const { startAllWatchers, startWatchdog, syncAccount } = require('./email/imap');
 
@@ -47,7 +54,24 @@ app.set('trust proxy', 1);
 
 const corsOrigin = process.env.CLIENT_ORIGIN || true;
 app.use(cors({ origin: corsOrigin, credentials: true }));
-app.use(express.json({ limit: '5mb' }));
+// The choke point for account-scoped tokens: ahead of every body parser and
+// router, /api/health and /api/status included, so a scoped token reaches only
+// the routes allow-listed for its scopes and a request it is refused on is
+// answered before its body is read. A request without a scoped token passes
+// through untouched. (CORS preflight never gets here: cors() answers it.)
+app.use('/api', scopeGate);
+// The app-wide JSON parser, except on the six CL2 paths. The CL2 router parses
+// those itself, after its auth check, and answers a body it can't read with a
+// 400. Parsed here, the same failure would go to the app error handler below,
+// which logs the whole error object (body-parser attaches the raw body to it:
+// recipients, HTML) and answers 500 with the parser's own text. Every other
+// path is parsed exactly as before.
+const jsonBody = express.json({ limit: '5mb' });
+app.use((req, res, next) => (isCl2RouteKey(routerPath(req)) ? next() : jsonBody(req, res, next)));
+// Second line for the same rule: a body error on a CL2 path, or for a
+// scoped-token request, is answered 400 here and never reaches the app error
+// handler. Every other error passes through to it unchanged.
+app.use(cl2BodyErrors);
 
 // Healthcheck must always succeed so platforms can detect "container is alive"
 // even before DB init finishes.
@@ -70,9 +94,19 @@ app.get('/api/status', async (_req, res) => {
       configured: !!(process.env.MICROSOFT_CLIENT_ID && process.env.MICROSOFT_CLIENT_SECRET && process.env.MICROSOFT_REDIRECT_URI),
       tenant: process.env.MICROSOFT_TENANT || 'common',
       redirect_uri: process.env.MICROSOFT_REDIRECT_URI || null
-    }
+    },
+    // CL2: whether its schema is in place (it is created in the background
+    // after boot; until then the CL2 routes answer 503), and whether sending is
+    // 'off', on for 'all' accounts or for 'some'. Never which accounts.
+    cl2: { ready: db.isCl2Ready(), send: sendFlagSummary() }
   });
 });
+
+// The six CL2 routes (/api/threads/:id/outlook-draft, /api/compose/outlook-draft
+// and /api/outlook-drafts/...). Mounted ahead of the legacy routers so these
+// paths are matched here, before the threads and compose routers' requireAuth.
+// No legacy path matches one of them, so nothing else changes handler.
+app.use('/api', outlookDraftRoutes);
 
 app.use('/api/auth', authRoutes);
 app.use('/api/accounts', accountRoutes);
@@ -186,6 +220,16 @@ server.listen(PORT, '0.0.0.0', () => {
       await initDbWithRetry();
       dbReady = true;
       console.log('[boot] DB ready');
+
+      // CL2's tables in the background, never awaited: a slow or failing CL2
+      // DDL can't hold up the watchers, the poll loop or the dispatcher below.
+      // Until it completes the CL2 routes and scoped tokens answer 503
+      // not_ready; the sweep below retries it every 5 minutes.
+      db.ensureCl2Schema().catch(() => {});
+      // The CL2 draft sweep: orphaned creates, stale and unknown sends,
+      // post-send verification, retention. It guards against overlapping ticks
+      // itself and never throws.
+      setInterval(() => { require('./email/outlook_drafts').runOutlookDraftSweep().catch(() => {}); }, 30 * 1000);
 
       try { await startAllWatchers(); } catch (e) { console.error('[boot] watchers failed', e.message); }
       try { startWatchdog(); } catch (e) { console.error('[boot] watchdog failed', e.message); }

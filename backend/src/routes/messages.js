@@ -2,6 +2,7 @@ const express = require('express');
 const { one, many, isSchemaReady } = require('../db');
 const { requireAuth } = require('../auth');
 const wrap = require('../util/wrap');
+const { scopedAccounts } = require('../util/scope');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -152,9 +153,14 @@ router.get('/', wrap(async (req, res) => {
   // would only fail with "column does not exist".
   if (!isSchemaReady()) return res.status(503).json({ error: 'database not ready yet; retry shortly' });
 
+  // An account-scoped token may follow only its own accounts: any other account
+  // answers the same 404 as one that doesn't exist. The page query below is
+  // keyed by this one account, so every row it returns is one of the token's;
+  // it needs no second filter and keeps the exact shape the feed indexes serve.
+  const allow = scopedAccounts(req);
   const acc = await one(
-    'SELECT id FROM email_accounts WHERE id = $1 AND workspace_id = $2',
-    [q.account_id, req.user.workspace_id]
+    `SELECT id FROM email_accounts WHERE id = $1 AND workspace_id = $2${allow ? ' AND id = ANY($3::text[])' : ''}`,
+    allow ? [q.account_id, req.user.workspace_id, allow] : [q.account_id, req.user.workspace_id]
   );
   if (!acc) return res.status(404).json({ error: 'not found' });
 
@@ -200,10 +206,15 @@ router.get('/', wrap(async (req, res) => {
 // route: the service token is workspace-wide, so the id is filtered by
 // req.user.workspace_id. The DD proxy layers the per-user thread-visibility
 // check on top before ever calling this.
+//
+// An account-scoped token reads only its own accounts' messages: any other
+// message, including one whose account was deleted, answers the same 404 as an
+// id that doesn't exist.
 router.get('/:id/body', wrap(async (req, res) => {
+  const allow = scopedAccounts(req);
   const m = await one(
-    'SELECT id, body_html, body_text FROM messages WHERE id = $1 AND workspace_id = $2',
-    [req.params.id, req.user.workspace_id]
+    `SELECT id, body_html, body_text FROM messages WHERE id = $1 AND workspace_id = $2${allow ? ' AND account_id = ANY($3::text[])' : ''}`,
+    allow ? [req.params.id, req.user.workspace_id, allow] : [req.params.id, req.user.workspace_id]
   );
   if (!m) return res.status(404).json({ error: 'not found' });
   res.json({ id: m.id, body_html: m.body_html, body_text: m.body_text });

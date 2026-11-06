@@ -1706,5 +1706,8 @@ module.exports = {
   // Orphan relink waits for the account's walk to finish before it runs.
   waitForIdle,
   // graph.js reports per-page progress to the stuck-walk test.
-  noteWalkProgress
+  noteWalkProgress,
+  // The thread routes narrow a thread's participants to the addresses in an
+  // account-scoped token's own mail, read the same way ingest reads them.
+  addressesOf
 };
