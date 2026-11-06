@@ -1,7 +1,16 @@
 const { Server } = require('socket.io');
-const { verify } = require('./auth');
+const { verifySession, logNonSessionToken } = require('./auth');
 
 let io = null;
+
+// The client's address the way Express works out req.ip under `trust proxy` 1
+// (index.js): the right-most X-Forwarded-For hop, which the proxy in front of
+// us appended, else the peer address. Only used to log a rejected token.
+function handshakeIp(handshake) {
+  const xff = handshake.headers && handshake.headers['x-forwarded-for'];
+  const hops = typeof xff === 'string' ? xff.split(',').map((s) => s.trim()).filter(Boolean) : [];
+  return hops.length ? hops[hops.length - 1] : handshake.address;
+}
 
 // workspace_id -> Map(user_id -> { name, email, count })
 const presence = new Map();
@@ -28,10 +37,13 @@ function initSockets(httpServer) {
     const token = socket.handshake.auth && socket.handshake.auth.token;
     if (!token) return next(new Error('no token'));
     try {
-      const payload = verify(token);
+      // Same session check as requireAuth: an OAuth state or any other
+      // non-session JWT is refused here too, not just on HTTP.
+      const payload = verifySession(token);
       socket.data.user = payload;
       next();
-    } catch {
+    } catch (e) {
+      logNonSessionToken(e, token, { via: 'socket', ip: handshakeIp(socket.handshake) });
       next(new Error('invalid token'));
     }
   });
