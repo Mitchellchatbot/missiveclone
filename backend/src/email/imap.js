@@ -472,6 +472,32 @@ function isAttachmentRejected(e) {
   return e.code.startsWith('22') || (e.code === '57014' && !e.lockPhase);
 }
 
+// A statement timeout doesn't prove the attachments can never be written: the
+// database may only have been slow for a moment, and a later walk would store
+// the message with them. Storing it without them at the first timeout would
+// lose them for good, because nothing fetches them again unless Graph
+// re-delivers the message. So a 57014 on the combined insert is rethrown (the
+// walk stops without advancing its cursor: Graph treats 57014 as structural,
+// IMAP fails the folder) and the next poll retries, until the same message has
+// timed out ATTACHMENT_TIMEOUT_STRIKES times; only then is it stored without
+// them. A class-22 rejection can never succeed, so it still falls back at once.
+// The count lives in this process (a restart starts it over) and is capped.
+const ATTACHMENT_TIMEOUT_STRIKES = 3;
+const attachmentTimeouts = new Map(); // strike key -> timeouts so far
+function giveUpOnAttachments(e, key, what) {
+  if (!isAttachmentRejected(e)) return false;
+  if (e.code !== '57014') return true;
+  const n = (attachmentTimeouts.get(key) || 0) + 1;
+  if (n >= ATTACHMENT_TIMEOUT_STRIKES) {
+    attachmentTimeouts.delete(key);
+    return true;
+  }
+  if (attachmentTimeouts.size >= 5000) attachmentTimeouts.clear();
+  attachmentTimeouts.set(key, n);
+  console.warn(`[ingest] statement timeout storing ${what} (strike ${n}/${ATTACHMENT_TIMEOUT_STRIKES}) — leaving it for the next walk`);
+  return false;
+}
+
 async function ingestMessage(acc, uid, folder, parsed, direction) {
   const messageId = (parsed.messageId || '').replace(/[<>]/g, '');
   const fromAddr = parsed.from ? parsed.from.text : '';
@@ -681,9 +707,15 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
   const store = (withAtt) => messageId
     ? txLocked(ingestLockKey(acc.id, dir, messageId), runWith(withAtt))
     : tx(runWith(withAtt));
+  // Timeout strikes (giveUpOnAttachments) are counted per message: by its dedup
+  // identity, or for mail without a Message-ID by where this walk found it.
+  const strikeKey = messageId
+    ? ingestLockKey(acc.id, dir, messageId)
+    : `${acc.id}|${dir}|${folder}|${uid}|${sentAt}`;
   let result;
   try {
     result = await store(!!attValues);
+    attachmentTimeouts.delete(strikeKey);
   } catch (e) {
     // Message and attachments share one statement, so a bad attachment row (a
     // data exception, class 22 — e.g. a NUL byte in a filename or content id)
@@ -691,10 +723,12 @@ async function ingestMessage(acc, uid, folder, parsed, direction) {
     // the message back too. Graph skips a non-structural failure and its saved
     // delta link then covers the message, so it would be lost for good; a
     // timeout (structural) would instead stall the walk on it every poll.
-    // Store the message alone instead; has_attachments stays set and the
-    // dup-backfill branch above retries the attachments on a later rescan. If
-    // the database itself is timing out, this retry fails too and throws.
-    if (!attValues || !isAttachmentRejected(e)) throw e;
+    // Store the message alone instead (after a timeout, only once the message
+    // has used up its strikes: giveUpOnAttachments); has_attachments stays set
+    // and the dup-backfill branch above retries the attachments on a later
+    // rescan. If the database itself is timing out, this retry fails too and
+    // throws.
+    if (!attValues || !giveUpOnAttachments(e, strikeKey, `${messageId || '(no Message-ID)'} (${acc.email})`)) throw e;
     console.warn(`[ingest] attachments rejected for ${messageId || '(no Message-ID)'} (${acc.email}) — storing message without them: ${e.message}`);
     result = await store(false);
   }
