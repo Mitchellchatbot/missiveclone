@@ -846,15 +846,30 @@ async function fetchAttachmentsForMessage(token, messageGraphId, { immutable = f
 // The server ending the session mid-statement says nothing about the message,
 // and its wording ("terminating connection due to administrator command") is
 // not node-pg's "Connection terminated" that the message fallback below knows.
+//   23503 foreign_key_violation: the thread (or account) the message was being
+//   stored under was deleted meanwhile — a hand-run merge or cleanup script,
+//   purge-by-sender, an account removal. Nothing is wrong with the message: the
+//   next poll stores it under a thread that exists.
 const STRUCTURAL_PG_CODES = new Set([
   '42703', '42P01', '42883', '42P07', '53300', '57014', '55P03', '40P01',
-  '42804', '42P18', '42601'
+  '42804', '42P18', '42601', '23503'
+]);
+
+// A lost connection to the database is reported by node-pg with the socket's
+// errno code instead of a SQLSTATE (and a client that hit one answers "... is
+// not queryable"). It says nothing about the message being stored. Graph
+// requests use fetch, whose network errors carry such a code only on .cause,
+// so a code here comes from the database.
+const NETWORK_ERROR_CODES = new Set([
+  'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ECONNREFUSED', 'ECONNABORTED',
+  'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN'
 ]);
 
 function isStructuralDbError(e) {
   const code = e && e.code;
   if (typeof code === 'string' &&
-      (STRUCTURAL_PG_CODES.has(code) || code.startsWith('08') || code.startsWith('57P'))) {
+      (STRUCTURAL_PG_CODES.has(code) || NETWORK_ERROR_CODES.has(code) ||
+       code.startsWith('08') || code.startsWith('57P'))) {
     return true;
   }
   // The pg pool surfaces some failures without a SQLSTATE (pool exhausted,
@@ -865,21 +880,26 @@ function isStructuralDbError(e) {
     msg.includes('timeout exceeded when trying to connect') ||
     msg.includes('canceling statement due to statement timeout') ||
     msg.includes('connection terminated') ||
+    msg.includes('not queryable') ||
     msg.includes('database is unavailable')
   );
 }
 
 // Narrower than isStructuralDbError: "the database can't be reached at all"
 // (connection exceptions, too many connections, the server ending sessions —
-// 57Pxx, see above — pool exhausted). Every folder fails the same way, so a pass
-// stops instead of repeating it for each folder.
+// 57Pxx, see above — a lost socket, pool exhausted). Every folder fails the same
+// way, so a pass stops instead of repeating it for each folder.
 function isDbUnavailable(e) {
   const code = e && e.code;
-  if (typeof code === 'string' && (code.startsWith('08') || code.startsWith('57P') || code === '53300')) return true;
+  if (typeof code === 'string' &&
+      (code.startsWith('08') || code.startsWith('57P') || code === '53300' || NETWORK_ERROR_CODES.has(code))) {
+    return true;
+  }
   const msg = String((e && e.message) || '').toLowerCase();
   return (
     msg.includes('timeout exceeded when trying to connect') ||
     msg.includes('connection terminated') ||
+    msg.includes('not queryable') ||
     msg.includes('database is unavailable')
   );
 }
