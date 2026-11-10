@@ -64,10 +64,9 @@ router.post('/', wrap(async (req, res) => {
     ]
   );
 
-  // Re-link any orphaned messages from a previous connection of this email.
-  // Best-effort (never throws) so a relink failure can't block the sync below.
-  await relinkOrphanMessages(id, req.user.workspace_id, email);
-
+  // No orphan relink here: mail from an earlier connection of a mailbox is
+  // re-attached once its address is confirmed, by the Microsoft OAuth
+  // callback, or by hand through POST /:id/relink-orphans.
   syncAccount(id).then(() => startWatching(id)).catch(err => console.error('initial sync error', err));
   res.json({ id });
 }));
@@ -214,8 +213,9 @@ router.post('/:id/sync', wrap(async (req, res) => {
 }));
 
 // One-shot: re-link any messages whose account_id is NULL (from a previous
-// disconnect-then-reconnect) to this account if their headers mention this
-// email. Safe to call multiple times.
+// disconnect-then-reconnect) to this account if their To, From or CC carries
+// this account's address (see util/relink_orphans.js). Safe to call multiple
+// times.
 router.post('/:id/relink-orphans', wrap(async (req, res) => {
   const acc = await one(
     'SELECT id, email FROM email_accounts WHERE id = $1 AND workspace_id = $2',

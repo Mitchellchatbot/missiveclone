@@ -434,8 +434,8 @@ const MIGRATIONS = [
   // nondeterministically when several matched, and it relinked every copy of a
   // message onto the same account — which recreates exactly the duplicate
   // (account_id, direction, message_id) rows uq_messages_acct_dir_msgid forbids.
-  // The reconnect paths (POST /accounts, /accounts/:id/relink-orphans and the
-  // Microsoft OAuth callback) already relink, one row per key, via
+  // The reconnect paths (the Microsoft OAuth callback and
+  // POST /accounts/:id/relink-orphans) relink instead, one row per key, via
   // util/relink_orphans.js.)
 ];
 

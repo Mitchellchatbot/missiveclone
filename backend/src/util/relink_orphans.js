@@ -6,6 +6,13 @@ const { query } = require('../db');
 // account_id — so reconnecting would otherwise show an empty inbox until a full
 // re-sync re-imported everything.
 //
+// An orphan belongs to this mailbox when its To, From or CC carries the
+// mailbox's address as a whole address, compared case-insensitively: not as
+// part of a longer one (bo@example.com is not jumbo@example.com or
+// bo@example.com.au), and with every character in it matching only itself.
+// So the address is matched as an escaped regex between address boundaries,
+// never as a LIKE pattern (where '_' and '%' are wildcards).
+//
 // Relinks at most ONE row per (workspace_id, direction, message_id), and skips
 // keys this account already holds. Orphans can include several copies of one
 // email (legacy duplicate rows, or the same message stored for two mailboxes
@@ -26,12 +33,31 @@ const { query } = require('../db');
 // NOT EXISTS skips that key.
 const WALK_WAIT_MS = 30_000;
 
+// One address (local@domain.tld): no spaces, list separators or brackets.
+const ONE_ADDRESS = /^[^\s@<>,;"]+@[^\s@<>,;"]+\.[^\s@<>,;"]+$/;
+
+// A regex for Postgres `~` that finds `addr` only where no address character
+// touches it: on the left nothing that can end a local part (RFC 5322 atext or
+// '.'), on the right nothing that can continue a domain. Regex metacharacters
+// in the address are escaped. Compared against lower(column), so `addr` must
+// already be lowercase.
+function addressBoundaryPattern(addr) {
+  const esc = addr.replace(/[.^$*+?()[\]{}|\\]/g, '\\$&');
+  return `(^|[^a-z0-9!#$%&'*+/=?^_\`{|}~.-])${esc}($|[^a-z0-9.-])`;
+}
+
 // Best-effort by design: relinking is a convenience, and a failure here must
-// not 500 the OAuth callback or add-account request before the initial sync is
-// kicked off. Returns the number of rows relinked, or null if it failed or a
-// walk was still running after waitMs (both logged). Never throws. A caller
-// that doesn't await it (the OAuth callback) can afford a much longer waitMs.
-async function relinkOrphanMessages(accountId, workspaceId, email, { waitMs = WALK_WAIT_MS } = {}) {
+// not 500 the OAuth callback or keep it from starting the initial sync. Returns
+// the number of rows relinked (0 if the account's email isn't one address), or
+// null if it failed or a walk was still running after waitMs (both logged).
+// Never throws. A caller that doesn't await it (the OAuth callback) can afford
+// a much longer waitMs.
+async function relinkOrphanMessages(accountId, workspaceId, rawEmail, { waitMs = WALK_WAIT_MS } = {}) {
+  const email = String(rawEmail || '').trim().toLowerCase();
+  if (!ONE_ADDRESS.test(email)) {
+    console.warn(`[relink] skipped for account ${accountId}: its email is not one address`);
+    return 0;
+  }
   // Lazy: imap.js pulls in the whole sync stack.
   const { waitForIdle } = require('../email/imap');
   if (!(await waitForIdle(accountId, waitMs))) {
@@ -53,7 +79,7 @@ async function relinkOnce(accountId, workspaceId, email) {
   const r = await query(
     `UPDATE messages m SET account_id = $1
       WHERE m.workspace_id = $2 AND m.account_id IS NULL
-        AND (m.to_addrs ILIKE $3 OR m.from_addr ILIKE $3 OR m.cc_addrs ILIKE $3)
+        AND (lower(m.to_addrs) ~ $3 OR lower(m.from_addr) ~ $3 OR lower(m.cc_addrs) ~ $3)
         AND (
           NULLIF(m.message_id, '') IS NULL
           OR (
@@ -62,7 +88,7 @@ async function relinkOnce(accountId, workspaceId, email) {
                 FROM messages x
                WHERE x.workspace_id = $2 AND x.account_id IS NULL
                  AND NULLIF(x.message_id, '') IS NOT NULL
-                 AND (x.to_addrs ILIKE $3 OR x.from_addr ILIKE $3 OR x.cc_addrs ILIKE $3)
+                 AND (lower(x.to_addrs) ~ $3 OR lower(x.from_addr) ~ $3 OR lower(x.cc_addrs) ~ $3)
                ORDER BY x.workspace_id, x.direction, x.message_id, x.sent_at, x.id
             )
             AND NOT EXISTS (
@@ -73,7 +99,7 @@ async function relinkOnce(accountId, workspaceId, email) {
             )
           )
         )`,
-    [accountId, workspaceId, `%${email}%`]
+    [accountId, workspaceId, addressBoundaryPattern(email)]
   );
   return r.rowCount || 0;
 }
