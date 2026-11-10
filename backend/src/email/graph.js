@@ -732,7 +732,7 @@ function isStructuralDbError(e) {
 // queries against), e.g. 'INBOX' uppercase. The two diverge because
 // Graph URLs are lowercase but DD's UI filter is IMAP-flavored.
 async function syncFolderViaGraph(account, folderPath, direction, folderLabel) {
-  const { ingestMessage } = require('./imap');
+  const { ingestMessage, noteWalkProgress } = require('./imap');
   const db = require('../db');
 
   // Refresh the token once at the top of the folder walk. A walk may
@@ -850,6 +850,9 @@ async function syncFolderViaGraph(account, folderPath, direction, folderLabel) {
         console.warn(`[graph] ingest failed for ${m.id} (${account.email}): ${e.message}`);
       }
     }
+    // One page done: the walk is making progress (imap.js syncAccount's
+    // stuck-walk test).
+    noteWalkProgress(account.id);
 
     if (page['@odata.nextLink']) {
       url = page['@odata.nextLink'];

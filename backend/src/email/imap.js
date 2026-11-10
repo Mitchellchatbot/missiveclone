@@ -973,21 +973,32 @@ async function syncFolder(client, acc, folder, direction) {
 // it finishes — clearing the cursors first if fresh was asked for. Clearing
 // them mid-walk would be undone: the running walk saves its own cursor at the
 // end. A long first sync is exactly when overlap does the most damage, so a
-// running walk is logged after 15 minutes but left alone — until STUCK_WALK_MS.
-// Nothing guarantees a walk settles (a query on a silently dead socket, a Graph
-// fetch that never ends), and without an escape one hung await would stop this
-// mailbox syncing until a restart. Past the cap, the next call presumes the walk
-// stuck and starts a new one alongside it. That overlap is duplicate-safe now
-// (the per-message ingest lock and its locked re-check); if the old walk does
-// finish and save its older cursor, the next walk just replays stored mail.
-const inflight = new Map(); // accountId -> { p, startedAt, again, fresh, warnedMin }
+// running walk is logged after 15 minutes but left alone while it makes
+// progress. Nothing guarantees a walk settles (a query on a silently dead
+// socket, a Graph fetch that never ends), and without an escape one hung await
+// would stop this mailbox syncing until a restart. So once a walk has gone
+// STUCK_WALK_MS without progress, the next call presumes it stuck and starts a
+// new one alongside it. Progress is reported by noteWalkProgress: a Graph walk
+// reports each delta page; an IMAP walk reports nothing, so for it the time
+// counts from when it started. The overlap is duplicate-safe only for mail
+// with a Message-ID (the per-message ingest lock and its locked re-check); mail
+// without one is stored again. If the old walk does finish and save its older
+// cursor, the next walk just replays stored mail.
+const inflight = new Map(); // accountId -> { p, startedAt, lastProgressAt, again, fresh, warnedMin }
 const STILL_RUNNING_WARN_MS = 15 * 60_000;
 const STUCK_WALK_MS = 45 * 60_000;
 
+// Called by graph.js once per delta page: "stuck" means no page finished for
+// STUCK_WALK_MS, not a walk that has merely run that long.
+function noteWalkProgress(accountId) {
+  const cur = inflight.get(accountId);
+  if (cur) cur.lastProgressAt = Date.now();
+}
+
 function syncAccount(accountId, { rerun = false, fresh = false } = {}) {
   const cur = inflight.get(accountId);
-  if (cur && Date.now() - cur.startedAt >= STUCK_WALK_MS) {
-    console.warn(`[sync] walk for ${accountId} has run ${Math.floor((Date.now() - cur.startedAt) / 60_000)}m — presuming it stuck, starting a new one alongside`);
+  if (cur && Date.now() - (cur.lastProgressAt || cur.startedAt) >= STUCK_WALK_MS) {
+    console.warn(`[sync] walk for ${accountId} has made no progress for ${Math.floor((Date.now() - (cur.lastProgressAt || cur.startedAt)) / 60_000)}m — presuming it stuck, starting a new one alongside`);
     // The new walk takes over the old one's pending requests; the old one,
     // if it ever finishes, must not chain a follow-up or clear the new entry.
     fresh = fresh || cur.fresh;
@@ -1320,5 +1331,7 @@ module.exports = {
   // Compose, reply and scheduled send take the same per-message lock as ingest.
   ingestLockKey,
   // Orphan relink waits for the account's walk to finish before it runs.
-  waitForIdle
+  waitForIdle,
+  // graph.js reports per-page progress to the stuck-walk test.
+  noteWalkProgress
 };
