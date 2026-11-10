@@ -29,8 +29,8 @@ const RESERVED_LABELS = new Set([
 // three already synced (walking one twice relabels its mail, and Sent Items or
 // Junk walked as an extra folder would turn sent mail into inbound twins or push
 // junk through the webhook), drafts/outbox (not mail yet), and system folders.
-// The PATCH route also compares the RESOLVED id against the built-in folders'
-// real ids, which catches the same folders passed by id.
+// The PATCH route also compares the RESOLVED id against these folders' real ids
+// (resolveExtraFolders in graph.js), which catches the same folders passed by id.
 const DENIED_FOLDER_NAMES = new Set([
   'inbox', 'sentitems', 'junkemail', 'drafts', 'outbox', 'deleteditems',
   'msgfolderroot', 'searchfolders', 'syncissues', 'conflicts', 'localfailures',

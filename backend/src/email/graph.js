@@ -1491,6 +1491,10 @@ async function getMailFolder(token, idOrName) {
 // Folders that must never be an extra folder, looked up by their real ids so
 // they are caught when passed by id (validateExtraFolders catches the names).
 const NEVER_EXTRA_FOLDERS = ['inbox', 'sentitems', 'junkemail', 'drafts', 'outbox', 'deleteditems'];
+// System folders validateExtraFolders refuses by name, refused here by real id
+// too, with their children (except msgfolderroot's: every top-level folder).
+const NEVER_EXTRA_SYSTEM_FOLDERS = ['msgfolderroot', 'syncissues', 'conflicts', 'localfailures', 'serverfailures',
+  'recoverableitemsdeletions'];
 
 // A mail search folder (Outlook's Search Folders: a saved search) holds no mail
 // of its own. It lists items that live in other folders, under THEIR ids, so an
@@ -1515,6 +1519,12 @@ async function resolveExtraFolders(account, folders) {
     const f = await getMailFolder(token, name);
     if (f) builtin.add(f.id);
   }
+  const system = new Set();
+  let rootId = null;
+  for (const name of NEVER_EXTRA_SYSTEM_FOLDERS) {
+    const f = await getMailFolder(token, name);
+    if (f) { system.add(f.id); if (name === 'msgfolderroot') rootId = f.id; }
+  }
   // Best-effort: the type annotation alone still catches search folders if
   // this lookup is refused.
   const searchRoot = await getMailFolder(token, 'searchfolders').catch(() => null);
@@ -1526,6 +1536,9 @@ async function resolveExtraFolders(account, folders) {
     const name = g.displayName || f.id;
     if (builtin.has(g.id)) {
       return { error: `"${name}" is a built-in folder (inbox, sent items, junk, drafts, outbox or deleted items) and cannot be an extra folder` };
+    }
+    if (system.has(g.id) || (g.parentFolderId && g.parentFolderId !== rootId && system.has(g.parentFolderId))) {
+      return { error: `"${name}" is a system folder and cannot be an extra folder` };
     }
     if (isSearchFolder(g, searchRoot && searchRoot.id)) {
       return { error: `"${name}" is a search folder (it lists mail stored in other folders) and cannot be an extra folder` };
