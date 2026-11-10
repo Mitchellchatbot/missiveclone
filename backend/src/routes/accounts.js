@@ -185,7 +185,12 @@ router.post('/:id/test-graph', wrap(async (req, res) => {
 // clearCursors), not here. Clearing it here while a walk was already running
 // did nothing: that walk saved its own cursor when it finished, undoing the
 // reset. syncAccount instead clears the cursors just before its next walk.
+//
+// 503 until init has completed, like POST /:id/rescan. The reset commits before
+// the walk starts, so on a half-migrated schema it would clear every mailbox's
+// cursors while each walk then fails on the missing columns.
 router.post('/rescan-all', wrap(async (req, res) => {
+  if (!isSchemaReady()) return res.status(503).json({ error: 'database not ready yet; retry shortly' });
   const accs = await many(
     `SELECT id, email FROM email_accounts
      WHERE workspace_id = $1 AND provider = 'microsoft'`,

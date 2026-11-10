@@ -562,8 +562,9 @@ async function runMigrations() {
 // Order matters. A sync walk reads folder_sync_state.id_type first, and ingest
 // writes messages.* and then threads.last_inbound_at. A walk can be started by an
 // HTTP route while init is still running, or while it keeps failing (POST
-// /:id/sync, /rescan-all, POST /api/accounts and the OAuth callback don't wait
-// for it), so `messages` goes last: whenever its new columns exist, the ones the
+// /:id/sync, POST /api/accounts and the OAuth callback don't wait for it; the
+// two rescan routes do, because their cursor reset commits before the walk
+// runs), so `messages` goes last: whenever its new columns exist, the ones the
 // same walk needs elsewhere exist too. init() enforces that by stopping at the
 // first group it could not add. If a later group went ahead anyway, the walk's
 // INSERT would commit and its post-commit thread update would then fail on the
