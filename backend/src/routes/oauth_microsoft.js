@@ -8,6 +8,7 @@ const { encrypt } = require('../crypto');
 const ms = require('../oauth/microsoft');
 const { syncAccount, startWatching } = require('../email/imap');
 const wrap = require('../util/wrap');
+const { relinkOrphanMessages } = require('../util/relink_orphans');
 
 const router = express.Router();
 
@@ -154,16 +155,15 @@ router.get('/callback', wrap(async (req, res) => {
   // requires a non-null account_id to match through to a user, so without
   // this re-link, the user sees an empty inbox until the next IMAP sync
   // re-imports the messages with new UIDs.
-  const likeEmail = `%${email}%`;
-  await query(
-    `UPDATE messages SET account_id = $1
-     WHERE workspace_id = $2 AND account_id IS NULL
-       AND (to_addrs ILIKE $3 OR from_addr ILIKE $3 OR cc_addrs ILIKE $3)`,
-    [accountId, stateData.workspace_id, likeEmail]
-  );
-
-  // Kick off initial sync (non-blocking).
-  syncAccount(accountId)
+  //
+  // Not awaited: on a re-auth of an existing mailbox the poll may have a walk
+  // running for this account id, and the relink waits for it (the two must not
+  // overlap — see util/relink_orphans.js). The redirect shouldn't wait with it,
+  // so the relink runs in the background with a generous wait, and the initial
+  // sync is chained after it to keep the two apart. relinkOrphanMessages never
+  // throws, so a relink failure still leads to the sync.
+  relinkOrphanMessages(accountId, stateData.workspace_id, email, { waitMs: 10 * 60_000 })
+    .then(() => syncAccount(accountId))
     .then(() => startWatching(accountId))
     .catch(err => console.error('initial sync after oauth', err.message));
 
