@@ -1,5 +1,5 @@
 const { Server } = require('socket.io');
-const { verifySession, logNonSessionToken } = require('./auth');
+const { verifySession, logNonSessionToken, logAuthzDenial, tokenFingerprint } = require('./auth');
 
 let io = null;
 
@@ -43,7 +43,16 @@ function initSockets(httpServer) {
       socket.data.user = payload;
       next();
     } catch (e) {
-      logNonSessionToken(e, token, { via: 'socket', ip: handshakeIp(socket.handshake) });
+      if (e && e.code === 'NOT_SESSION_TOKEN' && e.scoped) {
+        // An account-scoped token (one with a scope claim) never opens a
+        // socket: a socket gets the whole workspace's events, and such a token
+        // may see only its own accounts' mail. Logged as a scoped denial, like
+        // its refusals over HTTP, rather than as a malformed session token.
+        logAuthzDenial({ via: 'socket', status: 'refused', reason: 'socket_scoped', jti: e.jti,
+          fp: tokenFingerprint(token), ip: handshakeIp(socket.handshake) });
+      } else {
+        logNonSessionToken(e, token, { via: 'socket', ip: handshakeIp(socket.handshake) });
+      }
       next(new Error('invalid token'));
     }
   });

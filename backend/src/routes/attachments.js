@@ -2,15 +2,27 @@ const express = require('express');
 const { one } = require('../db');
 const { requireAuth } = require('../auth');
 const wrap = require('../util/wrap');
+const { scopedAccounts } = require('../util/scope');
 
 const router = express.Router();
 router.use(requireAuth);
 
 router.get('/:id', wrap(async (req, res) => {
-  const a = await one(
-    'SELECT * FROM attachments WHERE id = $1 AND workspace_id = $2',
-    [req.params.id, req.user.workspace_id]
-  );
+  // An account-scoped token downloads only attachments of its own accounts'
+  // messages (through the message the file belongs to). Any other attachment,
+  // including one whose message's account was deleted, answers the same 404 as
+  // an id that doesn't exist.
+  const allow = scopedAccounts(req);
+  const a = allow
+    ? await one(
+      `SELECT a.* FROM attachments a JOIN messages m ON m.id = a.message_id
+        WHERE a.id = $1 AND a.workspace_id = $2 AND m.account_id = ANY($3::text[])`,
+      [req.params.id, req.user.workspace_id, allow]
+    )
+    : await one(
+      'SELECT * FROM attachments WHERE id = $1 AND workspace_id = $2',
+      [req.params.id, req.user.workspace_id]
+    );
   if (!a) return res.status(404).json({ error: 'not found' });
 
   // HTTP header values must be Latin-1 (ISO-8859-1). Attachment filenames

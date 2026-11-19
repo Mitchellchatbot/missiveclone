@@ -3,11 +3,12 @@ const { v4: uuid } = require('uuid');
 const { one, many, query, tx, txLockedAfterSend, isSchemaReady } = require('../db');
 const { requireAuth } = require('../auth');
 const { sendEmail } = require('../email/smtp');
-const { appendThreadSearchText, ingestLockKey, accountFromAddr } = require('../email/imap');
+const { appendThreadSearchText, ingestLockKey, accountFromAddr, addressesOf } = require('../email/imap');
 const { emitToWorkspace } = require('../sockets');
 const { fireWebhook } = require('../email/imap');
 const wrap = require('../util/wrap');
 const { attachments } = require('../util/upload');
+const { scopedAccounts } = require('../util/scope');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -31,8 +32,42 @@ const THREAD_COLUMNS = `t.id, t.workspace_id, t.subject, t.participants, t.last_
 // process's boot has confirmed the column exists. HTTP serves before db.init()
 // finishes and keeps serving while it fails; naming a column that isn't there
 // yet would 500 every thread list, which is DD's whole inbox.
-function threadColumns() {
-  return isSchemaReady() ? `${THREAD_COLUMNS}, t.last_inbound_at` : THREAD_COLUMNS;
+//
+// A = the bound account list of an account-scoped token ('$n::text[]'), else
+// null. For such a token the column is worked out from its own accounts'
+// messages instead (scopedLastInboundSql), under the same name and in the same
+// place, so the row has the shape every other caller gets.
+function threadColumns(A = null) {
+  if (!isSchemaReady()) return THREAD_COLUMNS;
+  return A ? `${THREAD_COLUMNS}, ${scopedLastInboundSql(A)} AS last_inbound_at` : `${THREAD_COLUMNS}, t.last_inbound_at`;
+}
+
+// threads.last_inbound_at as an account-scoped token may see it: the newest
+// message of ITS accounts that ingest would have counted. These are ingest's own
+// tests (email/imap.js): inbound, outside junk/spam, and not From the address of
+// the mailbox that holds it (ownMail: the owner's CC-self copy, or a delegate
+// sending as the owner, must not make a thread look unanswered). from_addr is
+// stored as "Name <address>", so the address is taken out of it exactly the way
+// scripts/backfill_last_inbound_at.sql does.
+//
+// Computed on read and never written anywhere: the thread column stays the
+// high-water mark ingest maintains for every other caller.
+function scopedLastInboundSql(A) {
+  return `(SELECT max(mi.sent_at) FROM messages mi
+             JOIN email_accounts eai ON eai.id = mi.account_id
+            WHERE mi.thread_id = t.id AND mi.account_id = ANY(${A}) AND mi.direction = 'inbound'
+              AND COALESCE(mi.folder, '') !~* '(spam|junk)'
+              AND lower(btrim(COALESCE(substring(mi.from_addr from '<([^<>]+)>'), mi.from_addr, '')))
+                  IS DISTINCT FROM lower(eai.email))`;
+}
+
+// The extra predicate that narrows one messages alias to an account-scoped
+// token's accounts (A as above), or '' for every other token, whose SQL then
+// reads exactly as it did. A list bound as = ANY($n::text[]) matches nothing
+// when empty, and never matches a message whose account was deleted
+// (account_id NULL).
+function accountFilter(A) {
+  return (alias) => (A ? ` AND ${alias}.account_id = ANY(${A})` : '');
 }
 
 // Every messages column except body_html / body_text — for ?defer_bodies=1,
@@ -81,6 +116,10 @@ function parseSearch(q) {
 
 // Smart-filter SQL fragments. Each takes no parameters; they're plain
 // pattern matches. Heuristic, not perfect — good enough to cut through noise.
+//
+// newsletters and people look at the thread's messages, so they are functions
+// of the predicate that narrows those messages to an account-scoped token's
+// accounts (accountFilter); '' gives the same SQL as before. See categoryClause.
 const CATEGORY_CLAUSES = {
   codes: `(t.subject ILIKE '%verif%' OR t.subject ILIKE '%verify%'
        OR t.subject ILIKE '%code%' OR t.subject ILIKE '%OTP%'
@@ -91,7 +130,7 @@ const CATEGORY_CLAUSES = {
        OR t.subject ILIKE '%2FA%' OR t.subject ILIKE '%two-factor%'
        OR t.subject ILIKE '%security alert%' OR t.subject ILIKE '%confirm%email%')`,
 
-  newsletters: `EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND (
+  newsletters: (scope) => `EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id${scope} AND (
        mm.from_addr ILIKE '%noreply%' OR mm.from_addr ILIKE '%no-reply%'
        OR mm.from_addr ILIKE '%no_reply%' OR mm.from_addr ILIKE '%donotreply%'
        OR mm.from_addr ILIKE '%do-not-reply%' OR mm.from_addr ILIKE '%newsletter%'
@@ -115,7 +154,7 @@ const CATEGORY_CLAUSES = {
        OR t.subject ILIKE '%zoom meeting%' OR t.subject ILIKE '%google meet%'
        OR t.subject ILIKE '%teams meeting%')`,
 
-  people: `NOT EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND (
+  people: (scope) => `NOT EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id${scope} AND (
        mm.from_addr ILIKE '%noreply%' OR mm.from_addr ILIKE '%no-reply%'
        OR mm.from_addr ILIKE '%donotreply%' OR mm.from_addr ILIKE '%do-not-reply%'
        OR mm.from_addr ILIKE '%newsletter%' OR mm.from_addr ILIKE '%mailer-daemon%'
@@ -127,11 +166,30 @@ const CATEGORY_CLAUSES = {
        OR t.subject ILIKE 'mailer-daemon%' OR t.subject ILIKE '%bounced%')`
 };
 
+// The SQL for ?category=<name>, its messages narrowed by `scope` where it reads
+// any. Only the table's own entries are called: a name the table doesn't define
+// is looked up and interpolated exactly as it always was.
+function categoryClause(category, scope) {
+  const c = CATEGORY_CLAUSES[category];
+  return typeof c === 'function' && Object.prototype.hasOwnProperty.call(CATEGORY_CLAUSES, category) ? c(scope) : c;
+}
+
 router.get('/', wrap(async (req, res) => {
   const { status, assignee, q, folder, team_space_id, snoozed, label_id,
           mine, mailbox_id, mailbox_ids, category, starred } = req.query;
   const params = [req.user.workspace_id];
-  let sql = `SELECT ${threadColumns()}, u.name AS assignee_name,
+  // An account-scoped token sees the workspace's mail only through its own
+  // accounts: a thread is listed only when one of them has a message in it, and
+  // every per-thread value below (account_emails, last_from, last_snippet,
+  // automated, last_outbound_at, last_inbound_at, participants) and every filter
+  // that reads messages is worked out from those accounts' messages alone. Its
+  // account list is bound once, as $2. Every other token gets A = null and the
+  // SQL it always got.
+  const allow = scopedAccounts(req);
+  let A = null;
+  if (allow) { params.push(allow); A = `$${params.length}::text[]`; }
+  const inAllow = accountFilter(A);
+  let sql = `SELECT ${threadColumns(A)}, u.name AS assignee_name,
                     coalesce(
                       (SELECT json_agg(json_build_object('id', l.id, 'name', l.name, 'color', l.color))
                        FROM thread_labels tl JOIN labels l ON l.id = tl.label_id
@@ -140,28 +198,29 @@ router.get('/', wrap(async (req, res) => {
                     coalesce(
                       (SELECT json_agg(DISTINCT jsonb_build_object('email', ea.email, 'name', ea.display_name))
                        FROM messages m JOIN email_accounts ea ON ea.id = m.account_id
-                       WHERE m.thread_id = t.id), '[]'::json
+                       WHERE m.thread_id = t.id${inAllow('m')}), '[]'::json
                     ) AS account_emails,
                     (SELECT m.from_addr FROM messages m
-                      WHERE m.thread_id = t.id
+                      WHERE m.thread_id = t.id${inAllow('m')}
                       ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) AS last_from,
                     (SELECT left(btrim(regexp_replace(
                               regexp_replace(coalesce(m.body_text, m.body_html, ''), '<[^>]+>', ' ', 'g'),
                               '\\s+', ' ', 'g')), 200)
                        FROM messages m
-                      WHERE m.thread_id = t.id
+                      WHERE m.thread_id = t.id${inAllow('m')}
                       ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) AS last_snippet,
                     coalesce((
                       SELECT m2.is_automated FROM messages m2
-                      WHERE m2.thread_id = t.id AND m2.direction = 'outbound'
+                      WHERE m2.thread_id = t.id${inAllow('m2')} AND m2.direction = 'outbound'
                       ORDER BY m2.sent_at DESC LIMIT 1
                     ), 0) AS automated,
                     (SELECT m3.sent_at FROM messages m3
-                      WHERE m3.thread_id = t.id AND m3.direction = 'outbound'
+                      WHERE m3.thread_id = t.id${inAllow('m3')} AND m3.direction = 'outbound'
                       ORDER BY m3.sent_at DESC LIMIT 1) AS last_outbound_at
              FROM threads t
              LEFT JOIN users u ON u.id = t.assignee_id
              WHERE t.workspace_id = $1`;
+  if (A) sql += ` AND EXISTS (SELECT 1 FROM messages ma WHERE ma.thread_id = t.id AND ma.account_id = ANY(${A}))`;
   if (team_space_id) { params.push(team_space_id); sql += ` AND t.team_space_id = $${params.length}`; }
   if (status) { params.push(status); sql += ` AND t.status = $${params.length}`; }
   if (assignee === 'me') { params.push(req.user.id); sql += ` AND t.assignee_id = $${params.length}`; }
@@ -184,13 +243,16 @@ router.get('/', wrap(async (req, res) => {
     params.push(req.user.id);
     sql += ` AND EXISTS (SELECT 1 FROM messages mm
                          JOIN email_accounts ea ON ea.id = mm.account_id
-                         WHERE mm.thread_id = t.id AND ea.user_id = $${params.length})`;
+                         WHERE mm.thread_id = t.id${inAllow('mm')} AND ea.user_id = $${params.length})`;
   }
 
   // mailbox_id: filter to threads touching one specific connected account.
+  // An account-scoped token naming an account that isn't one of its own gets
+  // the same 404 as a thread it can't see, rather than an empty list.
   if (mailbox_id) {
+    if (allow && !allow.includes(mailbox_id)) return res.status(404).json({ error: 'not found' });
     params.push(mailbox_id);
-    sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND mm.account_id = $${params.length})`;
+    sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id${inAllow('mm')} AND mm.account_id = $${params.length})`;
   }
 
   // mailbox_ids: filter to threads touching ANY of a set of connected
@@ -201,21 +263,25 @@ router.get('/', wrap(async (req, res) => {
   if (mailbox_ids) {
     const ids = String(mailbox_ids).split(',').map((s) => s.trim()).filter(Boolean);
     if (ids.length) {
+      // Same rule as mailbox_id: any id outside a scoped token's accounts is a
+      // 404. An empty list adds no filter, which can't widen a scoped list: the
+      // EXISTS on its accounts above still applies.
+      if (allow && ids.some((id) => !allow.includes(id))) return res.status(404).json({ error: 'not found' });
       params.push(ids);
-      sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND mm.account_id = ANY($${params.length}::text[]))`;
+      sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id${inAllow('mm')} AND mm.account_id = ANY($${params.length}::text[]))`;
     }
   }
 
   // category: smart filter (codes / newsletters / receipts / etc.)
   if (category && CATEGORY_CLAUSES[category]) {
-    sql += ` AND ${CATEGORY_CLAUSES[category]}`;
+    sql += ` AND ${categoryClause(category, inAllow('mm'))}`;
   }
 
   if (starred === 'true') {
     sql += ` AND t.starred = 1`;
   }
   if (folder === 'SENT') {
-    sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id AND m.direction = 'outbound')`;
+    sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id${inAllow('m')} AND m.direction = 'outbound')`;
   } else if (folder === 'SPAM') {
     // Spam/Junk isn't a single canonical folder name across providers —
     // IMAP stores the literal path ('Junk', '[Gmail]/Spam', 'Junk Email',
@@ -226,11 +292,11 @@ router.get('/', wrap(async (req, res) => {
     // thread appears here if any of its messages is in junk/spam — no
     // quarantine rule, no sender heuristics. What the provider classified
     // as junk is what the Spam tab shows.
-    sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id
+    sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id${inAllow('m')}
                          AND (m.folder ILIKE '%spam%' OR m.folder ILIKE '%junk%'))`;
   } else if (folder) {
     params.push(folder);
-    sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id AND m.folder = $${params.length})`;
+    sql += ` AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id${inAllow('m')} AND m.folder = $${params.length})`;
   }
   // Parse any operators out of the query. Each operator becomes its own
   // SQL clause; whatever's left is free-text run against tsvector.
@@ -239,18 +305,18 @@ router.get('/', wrap(async (req, res) => {
 
     if (ops.from) {
       params.push(`%${ops.from}%`);
-      sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND mm.from_addr ILIKE $${params.length})`;
+      sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id${inAllow('mm')} AND mm.from_addr ILIKE $${params.length})`;
     }
     if (ops.to) {
       params.push(`%${ops.to}%`);
-      sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND mm.to_addrs ILIKE $${params.length})`;
+      sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id${inAllow('mm')} AND mm.to_addrs ILIKE $${params.length})`;
     }
     if (ops.subject) {
       params.push(`%${ops.subject}%`);
       sql += ` AND t.subject ILIKE $${params.length}`;
     }
     if ((ops.has || '').toLowerCase().startsWith('attach')) {
-      sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id AND mm.has_attachments = 1)`;
+      sql += ` AND EXISTS (SELECT 1 FROM messages mm WHERE mm.thread_id = t.id${inAllow('mm')} AND mm.has_attachments = 1)`;
     }
     const isVal = (ops.is || '').toLowerCase();
     if (isVal === 'starred')  sql += ` AND t.starred = 1`;
@@ -281,6 +347,11 @@ router.get('/', wrap(async (req, res) => {
       }
     }
 
+    // search_text is per thread and holds the identity fields of every
+    // account's copies, so for an account-scoped token free text can still match
+    // a thread through another account's sender or recipients. It never widens
+    // the list (the EXISTS on its accounts still applies); subject, before: and
+    // after: are thread-level the same way.
     if (freeText) {
       params.push(freeText);
       sql += ` AND to_tsvector('simple', coalesce(t.search_text, '')) @@ plainto_tsquery('simple', $${params.length})`;
@@ -298,8 +369,71 @@ router.get('/', wrap(async (req, res) => {
   const offsetIdx = params.length;
   sql += ` ORDER BY t.last_message_at DESC LIMIT $${limitIdx} OFFSET $${offsetIdx}`;
   const rows = await many(sql, params);
+  if (allow) await filterParticipants(rows, allow);
   res.json({ threads: rows, limit, offset, hasMore: rows.length === limit });
 }));
+
+// threads.participants is the text ingest wrote when the thread began, from its
+// FIRST message ("From; To", see email/imap.js), which may be another account's.
+// For an account-scoped token it is narrowed to the entries whose addresses
+// appear in that token's own messages of the thread: one query for the whole
+// page, not one per thread.
+async function filterParticipants(threads, allow) {
+  if (!threads.length) return;
+  const rows = await many(
+    `SELECT thread_id, from_addr, to_addrs, cc_addrs FROM messages
+      WHERE thread_id = ANY($1::text[]) AND account_id = ANY($2::text[])`,
+    [threads.map((t) => t.id), allow]
+  );
+  const seen = new Map(); // thread_id -> Set of lower-cased addresses
+  for (const m of rows) {
+    const s = seen.get(m.thread_id) || new Set();
+    for (const f of [m.from_addr, m.to_addrs, m.cc_addrs]) {
+      for (const a of addressesOf({ text: f || '' })) s.add(a);
+    }
+    seen.set(m.thread_id, s);
+  }
+  for (const t of threads) t.participants = keepParticipants(t.participants, seen.get(t.id) || new Set());
+}
+
+// Anything address-shaped, anywhere in an entry, display name included: the
+// same shape email/imap.js's addressesOf scrapes.
+const ANY_ADDR_RE = /[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+/g;
+
+// The entries of a stored participants text whose addresses are all in `seen`,
+// joined the way ingest joins From and To ('; '). Entries are split on ',' and
+// ';' outside double quotes, so a quoted display name holding a comma stays one
+// entry. An entry is kept when it has an address of its own (its <...> part,
+// else the address in it, as addressesOf reads it) AND every address-shaped
+// string in it is in `seen`: a display name such as "x@y.test via Service"
+// <z@w.test> would otherwise show x@y.test when only z@w.test is in the token's
+// mail. An entry with no address at all (a bare name, "undisclosed-recipients:")
+// says nothing the token's mail confirms, so it is dropped too.
+function keepParticipants(text, seen) {
+  if (text == null) return text;
+  const kept = [];
+  for (const piece of splitOutsideQuotes(String(text))) {
+    const entry = piece.trim();
+    if (!entry) continue;
+    const own = addressesOf({ text: entry });
+    const all = (entry.match(ANY_ADDR_RE) || []).map((a) => a.toLowerCase());
+    if (own.length && own.concat(all).every((a) => seen.has(a))) kept.push(entry);
+  }
+  return kept.join('; ');
+}
+
+function splitOutsideQuotes(s) {
+  const out = [];
+  let cur = '';
+  let quoted = false;
+  for (const ch of s) {
+    if (ch === '"') quoted = !quoted;
+    if (!quoted && (ch === ',' || ch === ';')) { out.push(cur); cur = ''; continue; }
+    cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
 
 // One-line preview of a message body for collapsed rows. Mirrors the
 // list endpoint's `last_snippet` SQL (prefer plaintext, else tag-strip the
@@ -315,8 +449,16 @@ function snippetOf(text, html) {
 
 router.get('/:id', wrap(async (req, res) => {
   const deferBodies = req.query.defer_bodies === '1' || req.query.defer_bodies === 'true';
+  // An account-scoped token sees a thread only when one of its accounts has a
+  // message in it (anything else is the same 404 as a thread that doesn't
+  // exist), and then only those accounts' messages, their attachments, values
+  // and participants, and none of the team's comments. Its account list is bound
+  // as $3 here and $2 in the messages query; every other token's SQL is as it was.
+  const allow = scopedAccounts(req);
+  const A = allow ? '$3::text[]' : null;
+  const inAllow = accountFilter(A);
   const t = await one(
-    `SELECT ${threadColumns()}, u.name AS assignee_name,
+    `SELECT ${threadColumns(A)}, u.name AS assignee_name,
             coalesce(
               (SELECT json_agg(json_build_object('id', l.id, 'name', l.name, 'color', l.color))
                FROM thread_labels tl JOIN labels l ON l.id = tl.label_id
@@ -325,19 +467,20 @@ router.get('/:id', wrap(async (req, res) => {
             coalesce(
               (SELECT json_agg(DISTINCT jsonb_build_object('email', ea.email, 'name', ea.display_name))
                FROM messages m JOIN email_accounts ea ON ea.id = m.account_id
-               WHERE m.thread_id = t.id), '[]'::json
+               WHERE m.thread_id = t.id${inAllow('m')}), '[]'::json
             ) AS account_emails,
             coalesce((
               SELECT m2.is_automated FROM messages m2
-              WHERE m2.thread_id = t.id AND m2.direction = 'outbound'
+              WHERE m2.thread_id = t.id${inAllow('m2')} AND m2.direction = 'outbound'
               ORDER BY m2.sent_at DESC LIMIT 1
             ), 0) AS automated,
             (SELECT m3.sent_at FROM messages m3
-              WHERE m3.thread_id = t.id AND m3.direction = 'outbound'
+              WHERE m3.thread_id = t.id${inAllow('m3')} AND m3.direction = 'outbound'
               ORDER BY m3.sent_at DESC LIMIT 1) AS last_outbound_at
      FROM threads t LEFT JOIN users u ON u.id = t.assignee_id
-     WHERE t.id = $1 AND t.workspace_id = $2`,
-    [req.params.id, req.user.workspace_id]
+     WHERE t.id = $1 AND t.workspace_id = $2${A ? `
+       AND EXISTS (SELECT 1 FROM messages mx WHERE mx.thread_id = t.id AND mx.account_id = ANY(${A}))` : ''}`,
+    allow ? [req.params.id, req.user.workspace_id, allow] : [req.params.id, req.user.workspace_id]
   );
   if (!t) return res.status(404).json({ error: 'not found' });
   // With defer_bodies the bodies never leave Postgres — only a snippet per
@@ -355,9 +498,11 @@ router.get('/:id', wrap(async (req, res) => {
      -- to several connected inboxes) share a sent_at, and without a tiebreaker
      -- Postgres may return them in a different order per request — which the
      -- reading pane notices, since it treats the last element as "the latest".
-     WHERE m.thread_id = $1 ORDER BY m.sent_at ASC, m.id ASC`,
-    [t.id]
+     WHERE m.thread_id = $1${allow ? ' AND m.account_id = ANY($2::text[])' : ''} ORDER BY m.sent_at ASC, m.id ASC`,
+    allow ? [t.id, allow] : [t.id]
   );
+  // Attachments and the defer_bodies "latest" below follow from this list, so
+  // for a scoped token they are its accounts' too.
   const messageIds = messages.map(m => m.id);
   let attRows = [];
   if (messageIds.length) {
@@ -381,7 +526,11 @@ router.get('/:id', wrap(async (req, res) => {
   // response is byte-for-byte unchanged (full bodies) — backward compatible.
   if (deferBodies && messages.length) {
     const latest = messages[messages.length - 1]; // ORDER BY sent_at ASC → last is latest
-    const body = await one('SELECT body_html, body_text FROM messages WHERE id = $1', [latest.id]);
+    // latest is already one of a scoped token's messages; its body read carries
+    // the same account filter anyway, like every other messages read on its path.
+    const body = allow
+      ? await one('SELECT body_html, body_text FROM messages WHERE id = $1 AND account_id = ANY($2::text[])', [latest.id, allow])
+      : await one('SELECT body_html, body_text FROM messages WHERE id = $1', [latest.id]);
     latest.body_html = body ? body.body_html : null;
     latest.body_text = body ? body.body_text : null;
     latest.snippet = snippetOf(latest.body_text, latest.body_html);
@@ -396,12 +545,15 @@ router.get('/:id', wrap(async (req, res) => {
     }
   }
 
-  const comments = await many(
+  // Comments are the team's notes on the thread, not any account's mail: an
+  // account-scoped token gets none, and they aren't read at all.
+  const comments = allow ? [] : await many(
     `SELECT c.*, u.name AS user_name FROM comments c
      JOIN users u ON u.id = c.user_id
      WHERE c.thread_id = $1 ORDER BY c.created_at ASC`,
     [t.id]
   );
+  if (allow) await filterParticipants([t], allow);
   res.json({ thread: t, messages, comments });
 }));
 
