@@ -840,6 +840,281 @@ async function init() {
     'Graph @removed batches will scan the account; a timeout there skips the removal markers.');
 }
 
+// ---------------------------------------------------------------------------
+// CL2: Outlook drafts, idempotency keys and account-scoped tokens.
+//
+// Separate from CL1_COLUMN_GROUPS and never in REQUIRED_COLUMNS. These tables
+// are written only by the CL2 routes, the CL2 sweep and the token scripts, so a
+// CL2 DDL that cannot run (lock contention on email_accounts, a permissions
+// problem) must leave mail sync, the watchers and the scheduled dispatcher
+// running and only answer 503 not_ready on the CL2 paths. So it is not part of
+// init() at all: index.js starts ensureCl2Schema() in the background once init()
+// has resolved and never waits for it, the CL2 sweep retries it every 5 minutes
+// until it succeeds, and isCl2Ready() is the flag the CL2 code checks.
+//
+// Same conventions as the rest of this schema: TEXT ids (uuid v4 from JS),
+// BIGINT epoch-ms times. No foreign keys: a REFERENCES email_accounts would take
+// a SHARE ROW EXCLUSIVE lock on a table every poll updates, so the code keeps
+// the links instead. Identifiers below are constants, never input, and every
+// statement is schema-qualified like addColumnsGuarded's.
+//
+// Per table: `statements` create it with its constraints and indexes (each IF
+// NOT EXISTS, so two instances racing is harmless); `columnDefs` lists every
+// column with the definition used to add it to an existing table that lacks it
+// (only a later build adding a column can cause that): nullable or a constant
+// default, so the ADD is catalog-only and never fails on existing rows;
+// `columns` is the list of names; `indexes` the index names.
+const CL2_TABLES = [
+  {
+    name: 'outlook_drafts',
+    statements: [
+      `CREATE TABLE IF NOT EXISTS ${QUOTED_SCHEMA}.outlook_drafts (
+        id                         TEXT PRIMARY KEY,
+        workspace_id               TEXT NOT NULL,
+        account_id                 TEXT NOT NULL,
+        graph_id                   TEXT,
+        kind                       TEXT NOT NULL,
+        status                     TEXT NOT NULL,
+        thread_id                  TEXT,
+        parent_message_id          TEXT,
+        parent_internet_message_id TEXT,
+        content_hash               TEXT,
+        verify_hash                TEXT,
+        confirm_hash               TEXT,
+        change_key                 TEXT,
+        internet_message_id        TEXT,
+        conversation_id            TEXT,
+        drafts_folder_id           TEXT,
+        web_link                   TEXT,
+        replaces_id                TEXT,
+        replaced_by_id             TEXT,
+        created_by_jti             TEXT NOT NULL,
+        idempotency_key            TEXT,
+        flags                      TEXT[] NOT NULL DEFAULT '{}',
+        last_error                 TEXT,
+        op_lock                    TEXT,
+        op_lock_until              BIGINT,
+        send_started_at            BIGINT,
+        send_accepted_at           BIGINT,
+        verified_at                BIGINT,
+        next_check_at              BIGINT,
+        check_count                INTEGER NOT NULL DEFAULT 0,
+        created_at                 BIGINT NOT NULL,
+        updated_at                 BIGINT NOT NULL,
+        CONSTRAINT outlook_drafts_kind_chk CHECK (kind IN ('reply','new')),
+        CONSTRAINT outlook_drafts_status_chk CHECK (status IN ('creating','saved','sending',
+          'sent_pending_verification','sent','sent_mismatch','sent_external','unknown','gone','deleted')),
+        CONSTRAINT outlook_drafts_graph_id_chk CHECK (graph_id IS NOT NULL OR status IN ('creating','deleted')),
+        CONSTRAINT outlook_drafts_reply_chk CHECK (kind = 'new' OR (thread_id IS NOT NULL AND parent_message_id IS NOT NULL))
+      )`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS uq_outlook_drafts_account_graph
+         ON ${QUOTED_SCHEMA}.outlook_drafts (account_id, graph_id) WHERE graph_id IS NOT NULL`,
+      `CREATE INDEX IF NOT EXISTS idx_outlook_drafts_due
+         ON ${QUOTED_SCHEMA}.outlook_drafts (next_check_at) WHERE next_check_at IS NOT NULL`
+    ],
+    columnDefs: [
+      ['id', 'TEXT'], ['workspace_id', 'TEXT'], ['account_id', 'TEXT'], ['graph_id', 'TEXT'],
+      ['kind', 'TEXT'], ['status', 'TEXT'], ['thread_id', 'TEXT'], ['parent_message_id', 'TEXT'],
+      ['parent_internet_message_id', 'TEXT'], ['content_hash', 'TEXT'], ['verify_hash', 'TEXT'],
+      ['confirm_hash', 'TEXT'], ['change_key', 'TEXT'], ['internet_message_id', 'TEXT'],
+      ['conversation_id', 'TEXT'], ['drafts_folder_id', 'TEXT'], ['web_link', 'TEXT'],
+      ['replaces_id', 'TEXT'], ['replaced_by_id', 'TEXT'], ['created_by_jti', 'TEXT'],
+      ['idempotency_key', 'TEXT'], ['flags', `TEXT[] NOT NULL DEFAULT '{}'`], ['last_error', 'TEXT'],
+      ['op_lock', 'TEXT'], ['op_lock_until', 'BIGINT'], ['send_started_at', 'BIGINT'],
+      ['send_accepted_at', 'BIGINT'], ['verified_at', 'BIGINT'], ['next_check_at', 'BIGINT'],
+      ['check_count', 'INTEGER NOT NULL DEFAULT 0'], ['created_at', 'BIGINT'], ['updated_at', 'BIGINT']
+    ],
+    indexes: ['uq_outlook_drafts_account_graph', 'idx_outlook_drafts_due']
+  },
+  {
+    name: 'idempotency_keys',
+    statements: [
+      `CREATE TABLE IF NOT EXISTS ${QUOTED_SCHEMA}.idempotency_keys (
+        jti             TEXT NOT NULL,
+        route           TEXT NOT NULL,
+        idem_key        TEXT NOT NULL,
+        request_hash    TEXT NOT NULL,
+        status          TEXT NOT NULL,
+        claim_token     TEXT NOT NULL,
+        response_status INTEGER,
+        response_body   JSONB,
+        retry_after_sec INTEGER,
+        created_at      BIGINT NOT NULL,
+        updated_at      BIGINT NOT NULL,
+        expires_at      BIGINT NOT NULL,
+        PRIMARY KEY (jti, route, idem_key),
+        CONSTRAINT idempotency_keys_status_chk CHECK (status IN ('in_progress','completed'))
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_idempotency_keys_expires
+         ON ${QUOTED_SCHEMA}.idempotency_keys (expires_at)`
+    ],
+    columnDefs: [
+      ['jti', 'TEXT'], ['route', 'TEXT'], ['idem_key', 'TEXT'], ['request_hash', 'TEXT'],
+      ['status', 'TEXT'], ['claim_token', 'TEXT'], ['response_status', 'INTEGER'],
+      ['response_body', 'JSONB'], ['retry_after_sec', 'INTEGER'], ['created_at', 'BIGINT'],
+      ['updated_at', 'BIGINT'], ['expires_at', 'BIGINT']
+    ],
+    indexes: ['idx_idempotency_keys_expires']
+  },
+  {
+    // The registry of minted scoped tokens. The token itself is never stored.
+    name: 'scoped_tokens',
+    statements: [
+      `CREATE TABLE IF NOT EXISTS ${QUOTED_SCHEMA}.scoped_tokens (
+        jti            TEXT PRIMARY KEY,
+        user_id        TEXT NOT NULL,
+        workspace_id   TEXT NOT NULL,
+        scopes         TEXT[] NOT NULL,
+        accounts       TEXT[] NOT NULL,
+        label          TEXT,
+        created_at     BIGINT NOT NULL,
+        expires_at     BIGINT NOT NULL,
+        revoked_at     BIGINT,
+        revoked_reason TEXT,
+        CONSTRAINT scoped_tokens_scopes_chk CHECK (cardinality(scopes) > 0 AND scopes <@ ARRAY['read','draft','send']::text[]),
+        CONSTRAINT scoped_tokens_accounts_chk CHECK (cardinality(accounts) > 0)
+      )`
+    ],
+    columnDefs: [
+      ['jti', 'TEXT'], ['user_id', 'TEXT'], ['workspace_id', 'TEXT'], ['scopes', 'TEXT[]'],
+      ['accounts', 'TEXT[]'], ['label', 'TEXT'], ['created_at', 'BIGINT'], ['expires_at', 'BIGINT'],
+      ['revoked_at', 'BIGINT'], ['revoked_reason', 'TEXT']
+    ],
+    indexes: []
+  }
+];
+for (const t of CL2_TABLES) t.columns = t.columnDefs.map(([name]) => name);
+
+// Columns CL2 adds to existing tables, through the same guarded step as the CL1
+// groups. A constant default makes the ADD catalog-only. No route writes it; it
+// is set per account by SQL.
+const CL2_COLUMN_GROUPS = [
+  { table: 'email_accounts', columns: [
+    // Append the account's stored signature_html to the drafts CL2 creates.
+    ['ea_append_signature', 'BOOLEAN NOT NULL DEFAULT true'],
+  ] },
+];
+
+let cl2Ready = false;
+let cl2Attempt = null;       // the attempt in flight, so concurrent callers share one
+let cl2LastAttemptAt = 0;    // epoch ms the last attempt started (the sweep's retry gate)
+function isCl2Ready() { return cl2Ready; }
+function cl2SchemaLastAttemptAt() { return cl2LastAttemptAt; }
+
+// Whether one CL2 table exists and which of its indexes don't, through `q` (the
+// pool, or a client inside a transaction).
+async function cl2TablePresence(q, t) {
+  const { rows } = await q.query(
+    `SELECT to_regclass($1) IS NOT NULL AS present,
+            ARRAY(SELECT i FROM unnest($2::text[]) AS i
+                   WHERE to_regclass($3 || '.' || quote_ident(i)) IS NULL) AS missing_indexes`,
+    [`${QUOTED_SCHEMA}.${t.name}`, t.indexes, QUOTED_SCHEMA]
+  );
+  return { present: rows[0].present, missingIndexes: rows[0].missing_indexes };
+}
+
+// One guarded step per table, shaped like addColumnsGuarded: look in the catalog
+// first and issue NO DDL when everything is there (every boot after the first);
+// otherwise run the table's statements as one transaction on a held connection,
+// with a short lock_timeout, retrying a few times with jitter. Inside it an
+// advisory lock is taken first and the catalog read again, so a second instance
+// waits for the first one's commit and then finds nothing left to do, instead
+// of racing it into a duplicate-name error. Resolves true once the table, its
+// columns and its indexes exist, false when it gave up; never throws for lock
+// contention.
+async function ensureCl2Table(t) {
+  for (let attempt = 1; ; attempt++) {
+    const state = await cl2TablePresence(pool, t);
+    const missingCols = state.present ? await missingColumns(t.name, t.columnDefs) : [];
+    if (state.present && !missingCols.length && !state.missingIndexes.length) return true;
+    if (missingCols.length) {
+      // CREATE TABLE IF NOT EXISTS would not add them to an existing table.
+      if (!(await addColumnsGuarded({ table: t.name, columns: missingCols }))) return false;
+      if (!state.missingIndexes.length) return true;
+    }
+    const client = await pool.connect();
+    let broken;
+    try {
+      await client.query(
+        `BEGIN; SET LOCAL lock_timeout = '3s'; SET LOCAL statement_timeout = '10s'; ` +
+        `SELECT pg_advisory_xact_lock('${advisoryKey('cl2-schema')}'::bigint)`
+      );
+      const held = await cl2TablePresence(client, t);
+      if (held.present && !held.missingIndexes.length) {
+        await client.query('COMMIT');
+        return true;
+      }
+      await client.query(`${t.statements.join(';\n')}; COMMIT`);
+      console.log(held.present ? `[cl2] created the missing indexes of ${t.name}` : `[cl2] created ${t.name}`);
+      return true;
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (rbErr) { broken = rbErr; }
+      if (attempt >= GUARDED_DDL_ATTEMPTS) {
+        console.warn(`[cl2] could not create ${t.name} after ${attempt} attempts: ${e.code || e.message}`);
+        return false;
+      }
+      console.warn(`[cl2] creating ${t.name} failed (attempt ${attempt}, ${e.code || e.message}) — retrying`);
+    } finally {
+      client.release(broken);
+    }
+    await new Promise((r) => setTimeout(r, 500 + Math.floor(Math.random() * 1500)));
+  }
+}
+
+// Every CL2 table column, CL2 column and CL2 index that does not exist, in one
+// round trip ('table.column' or the index name).
+async function missingCl2Objects() {
+  const cols = [
+    ...CL2_TABLES.flatMap((t) => t.columns.map((c) => [t.name, c])),
+    ...CL2_COLUMN_GROUPS.flatMap((g) => g.columns.map(([c]) => [g.table, c]))
+  ];
+  const rows = await many(
+    `SELECT r.t || '.' || r.c AS missing
+       FROM unnest($2::text[], $3::text[]) AS r(t, c)
+      WHERE NOT EXISTS (SELECT 1 FROM information_schema.columns ic
+                         WHERE ic.table_schema = $1 AND ic.table_name = r.t AND ic.column_name = r.c)
+     UNION ALL
+     SELECT i FROM unnest($4::text[]) AS i
+      WHERE NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                         WHERE n.nspname = $1 AND c.relname = i AND c.relkind = 'i')`,
+    [DB_SCHEMA, cols.map(([t]) => t), cols.map(([, c]) => c), CL2_TABLES.flatMap((t) => t.indexes)]
+  );
+  return rows.map((r) => r.missing);
+}
+
+async function applyCl2Schema() {
+  try {
+    // Each step gives up on its own (logging why); the final check decides.
+    for (const t of CL2_TABLES) await ensureCl2Table(t);
+    for (const group of CL2_COLUMN_GROUPS) await addColumnsGuarded(group);
+    const missing = await missingCl2Objects();
+    if (missing.length) {
+      const list = missing.slice(0, 5).join(', ') + (missing.length > 5 ? ` and ${missing.length - 5} more` : '');
+      console.warn(`[cl2] schema not ready: missing ${list}`);
+      return false;
+    }
+    cl2Ready = true;
+    console.log('[cl2] schema ready');
+    return true;
+  } catch (e) {
+    console.warn(`[cl2] schema not ready: ${(e && (e.code || e.message)) || e}`);
+    return false;
+  }
+}
+
+// Creates whatever of the CL2 schema is missing. Resolves to isCl2Ready() and
+// never throws. A no-op once ready, and before init() has completed in this
+// process (CL2's DDL never runs ahead of the schema mail sync needs).
+async function ensureCl2Schema() {
+  if (cl2Ready) return true;
+  if (!pool || !schemaReady) return false;
+  if (!cl2Attempt) {
+    cl2LastAttemptAt = Date.now();
+    cl2Attempt = applyCl2Schema().finally(() => { cl2Attempt = null; });
+  }
+  return cl2Attempt;
+}
+
 async function ping() {
   if (!pool) return { ok: false, error: 'DATABASE_URL not set' };
   try {
@@ -970,6 +1245,10 @@ async function txLockedAfterSend(key, fn, tag = '[db]') {
 module.exports = {
   pool, init, ping, query, one, many, tx, txLocked, txLockedAfterSend, HAS_DB,
   isSchemaReady,
+  // CL2: its schema is created in the background (see CL2_TABLES).
+  ensureCl2Schema, isCl2Ready, cl2SchemaLastAttemptAt,
   // Exposed for verification (which columns boot guarantees), not for callers.
-  REQUIRED_COLUMNS, CL1_COLUMN_GROUPS
+  REQUIRED_COLUMNS, CL1_COLUMN_GROUPS,
+  // Exposed for verification (what the CL2 schema consists of), not for callers.
+  CL2_TABLES, CL2_COLUMN_GROUPS
 };

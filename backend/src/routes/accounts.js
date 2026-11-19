@@ -10,17 +10,21 @@ const { relinkOrphanMessages } = require('../util/relink_orphans');
 const {
   validateExtraFolders, parseStoredExtraFolders, extraFolderKey, FOLDER_ID_RE
 } = require('../util/extra_folders');
+const { scopedAccounts } = require('../util/scope');
 
 const router = express.Router();
 router.use(requireAuth);
 
+// An account-scoped token lists only its own accounts; every other token, the
+// whole workspace's.
 router.get('/', wrap(async (req, res) => {
+  const allow = scopedAccounts(req);
   const rows = await many(
     `SELECT id, email, display_name, imap_host, smtp_host, last_synced_at,
             last_sync_error, last_sync_error_at,
             team_space_id, user_id, provider
-     FROM email_accounts WHERE workspace_id = $1`,
-    [req.user.workspace_id]
+     FROM email_accounts WHERE workspace_id = $1${allow ? ' AND id = ANY($2::text[])' : ''}`,
+    allow ? [req.user.workspace_id, allow] : [req.user.workspace_id]
   );
   res.json({ accounts: rows });
 }));
